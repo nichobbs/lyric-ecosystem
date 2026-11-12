@@ -74,7 +74,7 @@ pub union RedisError {
   case TlsFailed(message: String)
   /// The server refused the credentials (`AUTH` / `HELLO`).
   case AuthFailed(message: String)
-  /// The connection broke (closed, reset or timed acc) during a command. The
+  /// The connection broke (closed, reset or timed out) during a command. The
   /// command may or may not have run.
   case ConnectionLost(message: String)
   /// The server sent bytes that are not RESP.
