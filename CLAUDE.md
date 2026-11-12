@@ -72,8 +72,10 @@ That is expected and legitimate. Handle it as follows.
 - Therefore a backend package `pub use`s its interface package (`pub use Lyric.Jobs`), so
   applications can name `JobScheduler` through it. An application that wires several backends, or
   that names interface types itself, should also declare and import the interface directly.
-- A backend's `[dependencies]` entry for the interface carries the SemVer range described under
-  "Stability and versioning".
+- A backend's `[dependencies]` entry for the interface is `{ workspace = true }` while the pre-release
+  route (see "Stability and versioning") is in use, and the SemVer range described there once the
+  interface is consumed from the registry. A new interface package needs an entry in the root
+  `[workspace.overrides]`, together with every package it depends on.
 
 ## Kernels and FFI
 
@@ -112,8 +114,14 @@ Same bar as `lyric-lang`: nothing here is bootstrap-grade.
   that range and also run against the newest release in it (Q-ECO-002). Bump deliberately.
 - Interface packages must follow SemVer strictly: any change that breaks an implementor (new required
   method, changed signature, tightened conformance behaviour) is a major bump.
-- The compiler is a build input, not a compatibility axis: CI uses a pinned `lyric` release recorded in
-  one place (`.lyric-version` at the repo root), bumped in its own PR. Do not encode compiler versions
+- The compiler is a build input, not a compatibility axis: CI uses one pinned toolchain, bumped in
+  its own PR. Today that pin is a `lyric-lang` commit in `.lyric-lang-rev`: CI checks `lyric-lang` out
+  at that commit next to this repository, builds the compiler from it, and the root `lyric.toml`
+  `[workspace.overrides]` resolve the interface packages and conformance suites against the same
+  checkout (packages declare them as `{ workspace = true }`). This is the pre-release route, needed
+  because git dependencies are not linked by `lyric build` (lyric-lang#9037) and the latest release
+  predates the conformance suites. Once a release carries them, the pin becomes a release in
+  `.lyric-version` and the interface dependencies become registry ranges. Do not encode compiler versions
   in package manifests unless a package needs a specific language feature, in which case state the
   minimum and why in the README.
 - Publishing flows through `lyric publish` to the registry (docs/39). Do not hand-roll release scripts.

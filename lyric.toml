@@ -1,0 +1,23 @@
+# lyric.toml: workspace root. Members are auto-discovered (one package per backend).
+#
+# The interface packages and conformance suites live in nichobbs/lyric-lang. Until
+# they are consumed from the registry (docs/39 in lyric-lang), backends declare them
+# as `{ workspace = true }` and the overrides below resolve them against a lyric-lang
+# checkout that sits next to this repository (`../lyric-lang`), at the commit recorded
+# in `.lyric-lang-rev`. `lyric publish` substitutes registry versions for workspace
+# dependencies, so nothing here leaks into a published manifest.
+[workspace]
+
+[workspace.overrides]
+"Lyric.Testing"    = "../lyric-lang/lyric-testing"
+"Lyric.Cache"      = "../lyric-lang/lyric-cache"
+"Lyric.Mail"       = "../lyric-lang/lyric-mail"
+"Lyric.Storage"    = "../lyric-lang/lyric-storage"
+"Lyric.Mq"         = "../lyric-lang/lyric-mq"
+"Lyric.Session"    = "../lyric-lang/lyric-session"
+"Lyric.Flags"      = "../lyric-lang/lyric-feature-flags"
+"Lyric.Db"         = "../lyric-lang/lyric-db"
+"Lyric.Jobs"       = "../lyric-lang/lyric-jobs"
+"Lyric.Search"     = "../lyric-lang/lyric-search"
+"Lyric.I18n"       = "../lyric-lang/lyric-i18n"
+"Lyric.Resilience" = "../lyric-lang/lyric-resilience"

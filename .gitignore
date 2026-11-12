@@ -1,0 +1,10 @@
+# Lyric build, test and restore output
+bin/
+target/
+.lyric/
+.lyric-run/
+.lyric-test/
+.lyric-bench/
+.lyric-check/
+.lyric-release/
+lyric.lock
