@@ -13,9 +13,12 @@
 //! layers an `SSLSocket` over the connected socket. The host name is checked
 //! by the JDK (`SSLParameters.setEndpointIdentificationAlgorithm("HTTPS")`).
 //! An `SSLSocket` is a `Socket`: reads, read timeouts and writes are the same
-//! code as for plain TCP. Certificates and keys are loaded from PEM by the
-//! standard library's `Std.TlsHost`. The server side (`sockAcceptTls`) exists
-//! for the in-process broker of the hermetic tests.
+//! code as for plain TCP. A socket has no write timeout, so a bounded write
+//! (`sockWriteWithin`) runs on a thread of its own, which the caller watches
+//! and, when no chunk gets through in time, ends by closing the socket.
+//! Certificates and keys are loaded from PEM by the standard library's
+//! `Std.TlsHost`. The server side (`sockAcceptTls`) exists for the in-process
+//! broker of the hermetic tests.
 //!
 //! A few JDK calls go through `java.lang.reflect` (the idiom of the standard
 //! library's `_kernel_jvm/http_host.l`): the auto-FFI cannot pass a typed
@@ -58,6 +61,10 @@ extern type JThread = "java.lang.Thread"
 extern type JSystem = "java.lang.System"
 
 extern type JReentrantLock = "java.util.concurrent.locks.ReentrantLock"
+
+extern type JTimeUnit = "java.util.concurrent.TimeUnit"
+
+extern type JAtomicLong = "java.util.concurrent.atomic.AtomicLong"
 
 extern type JObject = "java.lang.Object"
 
@@ -143,8 +150,9 @@ pub record Background {
   thread: JThread
 }
 
-/// A reentrant mutual-exclusion lock.
-pub record Lock {
+/// A reentrant mutual-exclusion lock. A `ref record`, so each lock is its own
+/// instance.
+pub ref record Lock {
   inner: JReentrantLock
 }
 
@@ -244,14 +252,91 @@ func writeAll(output: in JOutputStream, bytes: in slice[Byte]): Unit {
   output.flush()
 }
 
-/// Write all of `bytes` and flush.
-pub func sockWrite(s: in Sock, bytes: in slice[Byte]): Result[Unit, String] {
+val writeChunkBytes: Int = 65536
+
+// One bounded write, on its own thread. `progress` counts the chunks written,
+// so the caller can tell a slow peer from one that accepts nothing.
+ref record WriteJob {
+  output: JOutputStream
+  bytes: slice[Byte]
+  progress: JAtomicLong
+  var failure: String
+}
+
+func writeChunks(job: in WriteJob): Unit {
+  val total = job.bytes.length
+  if total <= writeChunkBytes {
+    job.output.write(job.bytes)
+  } else {
+    var offset = 0
+    while offset < total {
+      val stop = if total - offset < writeChunkBytes { total } else { offset + writeChunkBytes }
+      job.output.write(job.bytes.slice(offset, stop))
+      val _ = job.progress.incrementAndGet()
+      offset = stop
+    }
+  }
+  job.output.flush()
+}
+
+impl JRunnable for WriteJob {
+  func run(): Unit {
+    try {
+      writeChunks(self)
+    } catch Bug as b {
+      self.failure = if b.message.length > 0 { b.message } else { "the write failed" }
+    }
+  }
+}
+
+// Wait for the writer; false when a whole `timeoutMs` passed without a chunk
+// getting through.
+func writerFinished(writer: in JThread, job: in WriteJob, timeoutMs: in Int): Bool {
+  var seen = 0i64
+  while true {
+    writer.join(timeoutMs.toLong())
+    if not writer.isAlive() {
+      return true
+    }
+    val now = job.progress.get()
+    if now == seen {
+      return false
+    }
+    seen = now
+  }
+  true
+}
+
+/// Write all of `bytes` and flush. The write is given up, with an `Err`, when
+/// the peer accepts no data for `timeoutMs` milliseconds (`0` = no limit);
+/// the socket is closed then, because how much was written is unknown.
+pub func sockWriteWithin(s: in Sock, bytes: in slice[Byte], timeoutMs: in Int): Result[Unit, String]
+  requires: timeoutMs >= 0
+{
   try {
-    writeAll(s.output, bytes)
-    Ok(())
+    if timeoutMs == 0 {
+      writeAll(s.output, bytes)
+      return Ok(())
+    }
+    val job = WriteJob(output = s.output, bytes = bytes, progress = JAtomicLong.new(), failure = "")
+    val writer: JThread = JThread.startVirtualThread(job)
+    if not writerFinished(writer, job, timeoutMs) {
+      closeQuietly(s.socket)
+      return Err("the write timed out: the peer accepted no data for " + timeoutMs.toString() + " ms")
+    }
+    if job.failure.length > 0 {
+      Err(job.failure)
+    } else {
+      Ok(())
+    }
   } catch Bug as b {
     Err(b.message)
   }
+}
+
+/// Write all of `bytes` and flush, however long the peer takes to accept them.
+pub func sockWrite(s: in Sock, bytes: in slice[Byte]): Result[Unit, String] {
+  sockWriteWithin(s, bytes, 0)
 }
 
 /// Close the connection. Closing twice is harmless.
@@ -613,11 +698,18 @@ func startThread(t: in JThread): Unit {
   t.start()
 }
 
-/// Run `work` on another thread.
+/// Run `work` on a thread of its own.
 pub func startBackground(work: in () -> Unit): Background {
   val t: JThread = JThread.new(BackgroundJob(work = work))
   startThread(t)
   Background(thread = t)
+}
+
+/// On dotnet this queues `work` to the runtime's shared thread pool, for tests
+/// that keep the pool busy. The JVM kernel uses no shared pool, so here it is
+/// `startBackground`.
+pub func startPoolWork(work: in () -> Unit): Background {
+  startBackground(work)
 }
 
 /// Block until `b` has finished.
@@ -655,6 +747,18 @@ pub func newLock(): Lock {
 
 pub func lockEnter(l: in Lock): Unit {
   l.inner.lock()
+}
+
+/// Take the lock if it becomes free within `timeoutMs` milliseconds (`0` =
+/// only if it is free now). False when it did not.
+pub func lockTryEnter(l: in Lock, timeoutMs: in Int): Bool
+  requires: timeoutMs >= 0
+{
+  try {
+    l.inner.tryLock(timeoutMs.toLong(), JTimeUnit.MILLISECONDS)
+  } catch Bug as _ {
+    false
+  }
 }
 
 pub func lockExit(l: in Lock): Unit {

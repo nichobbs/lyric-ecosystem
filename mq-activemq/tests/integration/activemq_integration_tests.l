@@ -199,10 +199,72 @@ test "bad credentials are refused by the broker" {
       q.close()
       assertTrue(false, "the broker accepted a wrong passcode; it must enforce authentication for this suite")
     }
-    case Err(e) -> {
-      expectContains(e, "activemq: broker error:", "an ERROR frame")
-      assertTrue(not Str.contains(e, "definitely-not-the-passcode"), "the passcode is not echoed")
+    case Err(e) -> expectLoginRefused(e, "plain TCP")
+  }
+}
+
+// ActiveMQ answers a wrong passcode with an ERROR frame and closes the
+// connection at once. Now and then the close overtakes the frame (a bare
+// close on plain TCP, a failed read on TLS), so the refusal is either the
+// broker's error or a connection lost during login; never anything else, and
+// never with the passcode in it.
+func expectLoginRefused(e: in String, label: in String): Unit {
+  val refused = Str.startsWith(e, "activemq: broker error:")
+  val closed = Str.startsWith(e, "activemq: connection lost:") and Str.contains(e, "ended the connection during login")
+  assertTrue(refused or closed, label + ": a refused login, got \"" + e + "\"")
+  assertTrue(not Str.contains(e, "definitely-not-the-passcode"), label + ": the passcode is not echoed")
+}
+
+test "a wrong passcode is always refused, as the broker's error or as a close during login" {
+  val plain = optionsFor(Extras.queueDestination(unique("lyric.it")))
+  val secured = tlsOptionsFor(tlsQueueName())
+  var n = 0
+  var errors = 0
+  while n < 150 {
+    match ActiveMq.connectWith(plain.copy(passcode = "definitely-not-the-passcode")) {
+      case Ok(q) -> {
+        q.close()
+        assertTrue(false, "the broker accepted a wrong passcode")
+      }
+      case Err(e) -> {
+        expectLoginRefused(e, "plain TCP")
+        if Str.startsWith(e, "activemq: broker error:") {
+          errors += 1
+        }
+      }
     }
+    match ActiveMq.connectWith(secured.copy(passcode = "definitely-not-the-passcode")) {
+      case Ok(q) -> {
+        q.close()
+        assertTrue(false, "the broker accepted a wrong passcode over TLS")
+      }
+      case Err(e) -> {
+        expectLoginRefused(e, "TLS")
+        if Str.startsWith(e, "activemq: broker error:") {
+          errors += 1
+        }
+      }
+    }
+    n += 1
+  }
+  assertTrue(errors > 150, "the ERROR frame is what usually arrives: " + errors.toString() + " of 300")
+}
+
+test "a broken selector is always reported as the broker's error, and the connection survives" {
+  var n = 0
+  while n < 40 {
+    val options = if n % 2 == 0 {
+      optionsFor(Extras.queueDestination(unique("lyric.it")))
+    } else {
+      tlsOptionsFor(tlsQueueName())
+    }
+    val q = open(options.copy(selector = "color = = 'red' ("))
+    val e = errorOf(q.consume(1000, { m -> Ok(()) }), "subscribe with a broken selector")
+    expectContains(e, "activemq: broker error:", "an ERROR frame carrying the SUBSCRIBE's receipt-id")
+    assertTrue(ActiveMq.isOpen(q), "a refused SUBSCRIBE leaves the connection usable")
+    mustPublish(q, message("s-" + n.toString(), "still publishing"))
+    q.close()
+    n += 1
   }
 }
 
@@ -329,7 +391,7 @@ test "a rejected non-persistent message is discarded" {
   val q = openQueue()
   val id = unique("dlq.np")
   val options = Extras.defaultSendOptions()
-  mustPublishWith(q, message(id, "transient"), options.copy(persistent = false))
+  mustPublishWith(q, message(id, "transient"), options.withPersistent(false))
   val got = mustTake(q)
   assertTrue(isOk(q.nack(got.id, false)), "reject")
   expectNothing(q, 300, "not redelivered")
@@ -467,19 +529,209 @@ test "a text message from another STOMP producer is delivered with its broker id
   q.close()
 }
 
-test "a binary message is rejected to the dead-letter queue and does not block the queue" {
+func rejecting(options: in ActiveMq.ConnectOptions): ActiveMq.ConnectOptions {
+  options.copy(onUndeliverable = ActiveMq.UndeliverablePolicy.RejectToBroker)
+}
+
+// The broker id an "activemq: message ID cannot be delivered: ..." error names.
+func brokerIdIn(e: in String): String {
+  val stop = Str.indexOfRaw(e, " cannot be delivered")
+  if stop < 18 {
+    panic("not an undeliverable-message error: " + e)
+  }
+  Str.substring(e, 18, stop - 18)
+}
+
+test "a binary message is left on the queue by default and does not block the connection" {
   val destination = Extras.queueDestination(unique("lyric.it"))
   val binary: slice[Byte] = [255u8, 254u8, 0u8, 1u8]
   rawSend(destination, [Stomp.Header(name = "persistent", value = "true")], binary)
   val q = open(optionsFor(destination))
   val e = errorOf(q.consume(5000, { m -> Ok(()) }), "consume a binary message")
   expectContains(e, "cannot be delivered: its body is not UTF-8 text", "reason")
+  expectContains(e, "left unacknowledged on the broker", "outcome")
+  assertEqualInt(ActiveMq.unsettledCount(q), 1, "tracked under its broker id")
+  mustPublish(q, message("next", "fine"))
+  val got = mustTake(q)
+  assertEqual(got.id, "next", "the connection goes on delivering")
+  assertTrue(isOk(q.ack(got.id)), "ack")
+  q.close()
+
+  // Still there for another consumer; this one settles it by its broker id.
+  val second = open(optionsFor(destination))
+  val again = errorOf(second.consume(5000, { m -> Ok(()) }), "the binary message again")
+  expectContains(again, "its body is not UTF-8 text", "the message was not destroyed")
+  match second.ack(brokerIdIn(again)) {
+    case Ok(_) -> ()
+    case Err(problem) -> assertTrue(false, "ack by broker id: " + problem)
+  }
+  assertEqualInt(ActiveMq.unsettledCount(second), 0, "settled")
+  second.close()
+  val third = open(optionsFor(destination))
+  expectNothing(third, 500, "acknowledged for good")
+  third.close()
+}
+
+test "with RejectToBroker a binary message is rejected to the dead-letter queue" {
+  val destination = Extras.queueDestination(unique("lyric.it"))
+  val binary: slice[Byte] = [255u8, 254u8, 0u8, 1u8]
+  rawSend(destination, [Stomp.Header(name = "persistent", value = "true")], binary)
+  val q = open(rejecting(optionsFor(destination)))
+  val e = errorOf(q.consume(5000, { m -> Ok(()) }), "consume a binary message")
+  expectContains(e, "cannot be delivered: its body is not UTF-8 text", "reason")
   expectContains(e, "rejected to the broker's dead-letter handling", "outcome")
+  assertEqualInt(ActiveMq.unsettledCount(q), 0, "not in flight")
   mustPublish(q, message("next", "fine"))
   val got = mustTake(q)
   assertEqual(got.id, "next", "the queue is not blocked")
   assertTrue(isOk(q.ack(got.id)), "ack")
   q.close()
+  val check = open(optionsFor(destination))
+  expectNothing(check, 500, "the rejected message left the queue")
+  check.close()
+}
+
+func bodyOf(size: in Int): String {
+  var text = "0123456789"
+  while text.length < size {
+    text = text + text
+  }
+  Str.substring(text, 0, size)
+}
+
+test "a body over maxFrameBytes does not break the connection, and stays on the queue by default" {
+  val destination = Extras.queueDestination(unique("lyric.it"))
+  val id = unique("big")
+  val publisher = open(optionsFor(destination))
+  mustPublish(publisher, message(id, bodyOf(200000)))
+  mustPublish(publisher, message("small", "fits"))
+  val base = optionsFor(destination)
+  val limited = base.copy(maxFrameBytes = 65536)
+  val q = open(limited)
+  val e = errorOf(q.consume(5000, { m -> Ok(()) }), "an oversize body")
+  expectContains(e, "its body of 200000 bytes exceeds the limit of 65536 bytes", "the reason")
+  expectContains(e, "left unacknowledged on the broker", "the default policy")
+  assertTrue(ActiveMq.isOpen(q), "the connection is still usable")
+  val next = mustTake(q)
+  assertEqual(next.id, "small", "the next message arrives on the same connection")
+  assertTrue(isOk(q.ack(next.id)), "ack")
+  expectContains(
+    errorOf(q.nack(brokerIdIn(e), true), "requeue of a message that was not read"),
+    "nothing to requeue",
+    "requeue"
+  )
+  q.close()
+
+  // Not lost: a consumer with room for it reads it, flagged as redelivered.
+  val roomy = open(base)
+  val whole = mustTake(roomy)
+  assertEqual(whole.id, id, "the large message is still on the queue")
+  assertEqualInt(whole.body.length, 200000, "intact")
+  assertEqualInt(whole.deliveryCount, 1, "redelivered")
+  assertTrue(isOk(roomy.nack(whole.id, true)), "put it back")
+  roomy.close()
+
+  // RejectToBroker dead-letters it, and the connection survives that too.
+  val strict = open(rejecting(limited))
+  val rejected = errorOf(strict.consume(5000, { m -> Ok(()) }), "the oversize body, rejecting")
+  expectContains(rejected, "exceeds the limit of 65536 bytes", "the reason")
+  expectContains(rejected, "rejected to the broker's dead-letter handling", "the outcome")
+  assertTrue(ActiveMq.isOpen(strict), "the connection is still usable")
+  mustPublish(strict, message("after", "x"))
+  assertEqual(mustTake(strict).id, "after", "and delivers what follows")
+  assertTrue(isOk(strict.ack("after")), "ack")
+  strict.close()
+  val dlq = deadLetterConsumer(id)
+  val dead = mustTake(dlq)
+  assertEqual(dead.id, id, "the persistent message is in the dead-letter queue")
+  assertTrue(isOk(dlq.ack(dead.id)), "remove it")
+  dlq.close()
+  publisher.close()
+}
+
+test "a header section over 64 KiB does not break the connection" {
+  val destination = Extras.queueDestination(unique("lyric.it"))
+  val publisher = open(optionsFor(destination))
+  val wide: List[Stomp.Header] = newList()
+  var n = 0
+  while n < 9 {
+    wide.add(Stomp.Header(name = "pad" + n.toString(), value = bodyOf(9000)))
+    n += 1
+  }
+  match ActiveMq.publishWithHeaders(publisher, message("wide", "x"), wide.toArray()) {
+    case Ok(_) -> ()
+    case Err(e) -> assertTrue(false, "publishing 81 KiB of headers: " + e)
+  }
+  mustPublish(publisher, message("small", "fits"))
+  val q = open(rejecting(optionsFor(destination)))
+  val e = errorOf(q.consume(5000, { m -> Ok(()) }), "oversize headers")
+  expectContains(e, "its headers exceed 65536 bytes", "the reason")
+  expectContains(e, "rejected to the broker's dead-letter handling", "the ack id was read from beyond the limit")
+  assertTrue(ActiveMq.isOpen(q), "the connection is still usable")
+  val next = mustTake(q)
+  assertEqual(next.id, "small", "the next message arrives on the same connection")
+  assertTrue(isOk(q.ack(next.id)), "ack")
+  q.close()
+  val dlq = open(optionsFor("/queue/ActiveMQ.DLQ").copy(selector = "lyric_id = 'wide' AND pad0 IS NOT NULL"))
+  val dead = errorOf(dlq.consume(5000, { m -> Ok(()) }), "the dead letter is as wide")
+  expectContains(dead, "its headers exceed 65536 bytes", "it reached the dead-letter queue")
+  match dlq.ack(brokerIdIn(dead)) {
+    case Ok(_) -> ()
+    case Err(problem) -> assertTrue(false, "remove the dead letter: " + problem)
+  }
+  dlq.close()
+  publisher.close()
+}
+
+test "a negative deliveryCount is refused on publish" {
+  val q = openQueue()
+  val negative = Mq.Message(id = "n", body = "x", headers = [], deliveryCount = -1)
+  expectContains(errorOf(q.publish(negative), "publish"), "negative deliveryCount", "publish")
+  expectContains(errorOf(q.publishBatch([message("ok", "x"), negative]), "batch"), "negative deliveryCount", "batch")
+  expectNothing(q, 300, "nothing was published")
+  q.close()
+}
+
+test "publishWith with default options keeps the connection's persistence" {
+  val destination = Extras.queueDestination(unique("lyric.it"))
+  val base = optionsFor(destination)
+  val transient = open(base.copy(persistent = false))
+  mustPublishWith(transient, message("inherits", "1"), Extras.defaultSendOptions())
+  mustPublishWith(transient, message("raised", "2"), Extras.defaultSendOptions().withPersistent(true))
+  assertEqual(
+    takeSelected(destination, "JMSDeliveryMode = 'NON_PERSISTENT'", "the inherited mode"),
+    "inherits",
+    "default send options on a non-persistent connection"
+  )
+  assertEqual(
+    takeSelected(destination, "JMSDeliveryMode = 'PERSISTENT'", "the explicit mode"),
+    "raised",
+    "an explicit option wins"
+  )
+  transient.close()
+}
+
+test "the first consume(0) returns at once and the subscription completes afterwards" {
+  val q = openQueue()
+  mustPublish(q, message("first", "x"))
+  val started = K.monotonicMillis()
+  val polled = q.consume(0, { m -> keepNothing(m) })
+  val elapsed = K.monotonicMillis() - started
+  assertTrue(elapsed < 3000i64, "consume(0) returned after " + elapsed.toString() + " ms")
+  match polled {
+    case Ok(_) -> assertTrue(isOk(q.ack("first")), "ack")
+    case Err(e) -> {
+      assertEqual(e, "timeout", "a first poll may come before the broker's dispatch")
+      val got = mustTake(q)
+      assertEqual(got.id, "first", "the message arrives once the subscription is confirmed")
+      assertTrue(isOk(q.ack(got.id)), "ack")
+    }
+  }
+  q.close()
+}
+
+func keepNothing(m: in Mq.Message): Result[Unit, String] {
+  Ok(())
 }
 
 // ─── Extras: delivery options, selectors, topics ─────────────────────────────
@@ -537,7 +789,7 @@ test "priority, correlation id, type and delivery mode reach the broker" {
   mustPublishWith(publisher, message("urgent", "1"), base.copy(priority = 9))
   mustPublishWith(publisher, message("correlated", "2"), base.copy(correlationId = "corr-42"))
   mustPublishWith(publisher, message("typed", "3"), base.copy(jmsType = "invoice"))
-  mustPublishWith(publisher, message("transient", "4"), base.copy(persistent = false))
+  mustPublishWith(publisher, message("transient", "4"), base.withPersistent(false))
   assertEqual(takeSelected(destination, "JMSPriority = 9", "priority"), "urgent", "JMSPriority")
   assertEqual(
     takeSelected(destination, "JMSCorrelationID = 'corr-42'", "correlation"),
@@ -556,7 +808,7 @@ test "priority, correlation id, type and delivery mode reach the broker" {
 test "a message past its time to live is not delivered" {
   val q = openQueue()
   val base = Extras.defaultSendOptions()
-  mustPublishWith(q, message("short-lived", "x"), base.copy(timeToLiveMs = 200i64, persistent = false))
+  mustPublishWith(q, message("short-lived", "x"), base.withPersistent(false).copy(timeToLiveMs = 200i64))
   mustPublishWith(q, message("long-lived", "y"), base.copy(timeToLiveMs = 60000i64))
   K.sleepMs(700)
   val got = mustTake(q)
@@ -899,10 +1151,7 @@ test "TLS: consume timeouts, receipts, transactions and broker errors behave as 
       bad.close()
       assertTrue(false, "the broker accepted a wrong passcode over TLS")
     }
-    case Err(e) -> {
-      expectContains(e, "activemq: broker error:", "an ERROR frame on CONNECT")
-      assertTrue(not Str.contains(e, "definitely-not-the-passcode"), "the passcode is not echoed")
-    }
+    case Err(e) -> expectLoginRefused(e, "TLS")
   }
   val broken = open(tlsOptionsFor(tlsQueueName()).copy(selector = "color = = 'red' ("))
   val e = errorOf(broken.consume(1000, { m -> Ok(()) }), "subscribe with a broken selector")

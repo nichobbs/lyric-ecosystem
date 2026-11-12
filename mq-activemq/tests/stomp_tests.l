@@ -215,24 +215,163 @@ test "malformed frames are errors" {
   expectDecodeError("MESSAGE\ncontent-length:abc\n\n\u{0000}", "a non-numeric content-length")
   expectDecodeError("MESSAGE\ncontent-length:-1\n\n\u{0000}", "a negative content-length")
   expectDecodeError("MESSAGE\ncontent-length:2\n\nabc\u{0000}", "a body longer than its content-length")
-  expectDecodeError("MESSAGE\ncontent-length:5000\n\n", "a content-length over the frame limit")
 }
 
-test "an unterminated body over the frame limit is an error" {
+func nextItem(d: in Stomp.Decoder): Option[Stomp.Decoded] {
+  match Stomp.nextDecoded(d) {
+    case Ok(item) -> item
+    case Err(e) -> panic("decode failed: " + e)
+  }
+}
+
+func expectSkipped(d: in Stomp.Decoder, label: in String): Stomp.Skipped {
+  match nextItem(d) {
+    case Some(TooLarge(skipped)) -> skipped
+    case Some(Complete(_)) -> panic(label + ": the frame was not skipped")
+    case None -> panic(label + ": nothing was produced")
+  }
+}
+
+func expectWhole(d: in Stomp.Decoder, label: in String): Stomp.Frame {
+  match nextItem(d) {
+    case Some(Complete(frame)) -> frame
+    case Some(TooLarge(_)) -> panic(label + ": the frame was skipped")
+    case None -> panic(label + ": nothing was produced")
+  }
+}
+
+func skippedHeader(skipped: in Stomp.Skipped, name: in String): String {
+  Stomp.headerOr(Stomp.bareFrame(skipped.command, skipped.headers), name, "<absent>")
+}
+
+test "a body over the limit with a content-length is skipped, and the next frame decodes" {
   val d = Stomp.newDecoder(16)
-  Stomp.feed(d, bytesOf("MESSAGE\n\n0123456789012345678901234567890123456789"))
-  assertTrue(isErr(Stomp.nextFrame(d)), "body exceeds the limit")
+  Stomp.feed(d, bytesOf("MESSAGE\nack:a-1\ncontent-length:40\n\n0123456789012345"))
+  assertTrue(isNone(nextItem(d)), "the body has not ended")
+  assertEqualInt(Stomp.buffered(d), 0, "what was read of it is not kept")
+  Stomp.feed(d, bytesOf("678901234567\u{0000}89ab"))
+  assertTrue(isNone(nextItem(d)), "a NUL inside the counted body does not end it")
+  Stomp.feed(d, bytesOf("cdefghi\u{0000}RECEIPT\nreceipt-id:r\n\n\u{0000}"))
+  val skipped = expectSkipped(d, "the oversize frame")
+  assertEqual(skipped.command, "MESSAGE", "command")
+  assertEqual(skippedHeader(skipped, "ack"), "a-1", "its headers are kept")
+  assertEqual(skipped.reason, "its body of 40 bytes exceeds the limit of 16 bytes", "reason")
+  assertEqual(expectWhole(d, "the next frame").command, "RECEIPT", "the stream is still in step")
+  assertTrue(isNone(nextItem(d)), "nothing else")
 }
 
-test "a header section over the limit is an error" {
+test "a body over the limit without a content-length is skipped up to its NUL" {
+  val d = Stomp.newDecoder(16)
+  Stomp.feed(d, bytesOf("MESSAGE\nack:a-2\n\n0123456789012345678901234567890123456789"))
+  assertTrue(isNone(nextItem(d)), "no NUL yet")
+  assertEqualInt(Stomp.buffered(d), 0, "nothing is kept")
+  Stomp.feed(d, bytesOf("more and more"))
+  assertTrue(isNone(nextItem(d)), "still no NUL")
+  Stomp.feed(d, bytesOf("the end\u{0000}\nMESSAGE\nack:a-3\n\nshort\u{0000}"))
+  val skipped = expectSkipped(d, "the oversize frame")
+  assertEqual(skippedHeader(skipped, "ack"), "a-2", "its headers are kept")
+  assertEqual(skipped.reason, "its body exceeds the limit of 16 bytes", "reason")
+  val next = expectWhole(d, "the next frame")
+  assertEqual(Stomp.headerOr(next, "ack", ""), "a-3", "the following frame")
+  assertEqual(textOf(next.body), "short", "its body")
+  // The same frame in one feed: the NUL is there, the body is still too long.
+  Stomp.feed(d, bytesOf("MESSAGE\nack:a-4\n\n01234567890123456789\u{0000}"))
+  assertEqual(skippedHeader(expectSkipped(d, "in one feed"), "ack"), "a-4", "skipped whole")
+  // A body of exactly the limit is delivered.
+  Stomp.feed(d, bytesOf("MESSAGE\ncontent-length:16\n\n0123456789012345\u{0000}"))
+  assertEqualInt(expectWhole(d, "at the limit").body.length, 16, "the limit is inclusive")
+}
+
+func wideFrame(tail: in String): String {
   val parts: List[String] = newList()
-  parts.add("MESSAGE\n")
+  parts.add("MESSAGE\nsubscription:s-0\n")
   var n = 0
   while n < 7000 {
     parts.add("k:0123456789\n")
     n += 1
   }
+  parts.add(tail)
+  Str.joinList("", parts)
+}
+
+test "a header section over the limit is skipped, keeping the headers that settle the frame" {
+  var long = "x"
+  while long.length < 5000 {
+    long = long + long
+  }
+  val wire = wideFrame(
+    "padding:" + long +
+      "\r\nack:a-9\nmessage-id:ID\\cbroker-1\ncontent-length:5\nack:second\n\nhello\u{0000}" +
+      "RECEIPT\nreceipt-id:r\n\n\u{0000}"
+  )
+  // In one feed, and a few bytes at a time.
+  for step in [wire.length, 4099, 13] {
+    val d = Stomp.newDecoder(1024)
+    val bytes = bytesOf(wire)
+    var at = 0
+    var skipped: Option[Stomp.Skipped] = None
+    var after = ""
+    while at < bytes.length {
+      val stop = if at + step > bytes.length { bytes.length } else { at + step }
+      Stomp.feed(d, bytes.slice(at, stop))
+      at = stop
+      var more = true
+      while more {
+        match nextItem(d) {
+          case Some(TooLarge(s)) -> {
+            skipped = Some(value = s)
+          }
+          case Some(Complete(frame)) -> {
+            after = after + frame.command
+          }
+          case None -> {
+            more = false
+          }
+        }
+      }
+      assertTrue(Stomp.buffered(d) <= 65536 + step, "memory stays bounded: " + Stomp.buffered(d).toString())
+    }
+    val label = "in steps of " + step.toString()
+    match skipped {
+      case None -> assertTrue(false, label + ": the wide frame was not reported")
+      case Some(s) -> {
+        assertEqual(s.command, "MESSAGE", label + ": command")
+        assertEqual(s.reason, "its headers exceed 65536 bytes", label + ": reason")
+        assertEqual(skippedHeader(s, "subscription"), "s-0", label + ": a header from within the limit")
+        assertEqual(skippedHeader(s, "ack"), "a-9", label + ": ack from beyond the limit, first occurrence")
+        assertEqual(skippedHeader(s, "message-id"), "ID:broker-1", label + ": message-id, unescaped")
+        assertEqual(skippedHeader(s, "padding"), "<absent>", label + ": other late headers are dropped")
+      }
+    }
+    assertEqual(after, "RECEIPT", label + ": the frame after it decodes")
+  }
+}
+
+test "nextFrame reports a skipped frame as an error" {
+  val d = Stomp.newDecoder(16)
+  Stomp.feed(d, bytesOf("MESSAGE\n\n0123456789012345678901234567890123456789\u{0000}"))
+  match Stomp.nextFrame(d) {
+    case Err(e) -> assertEqual(
+      e,
+      "a STOMP MESSAGE frame was skipped: its body exceeds the limit of 16 bytes",
+      "the error names the frame"
+    )
+    case Ok(_) -> assertTrue(false, "expected an Err")
+  }
+}
+
+test "limits that cannot be skipped are errors" {
+  var long = "X"
+  while long.length < 70000 {
+    long = long + long
+  }
   val d = Stomp.newDecoder(1024)
-  Stomp.feed(d, bytesOf(Str.joinList("", parts)))
-  assertTrue(isErr(Stomp.nextFrame(d)), "headers exceed the limit")
+  Stomp.feed(d, bytesOf(long))
+  assertTrue(isErr(Stomp.nextDecoded(d)), "a command line over the header limit")
+  val wide = Stomp.newDecoder(1024)
+  Stomp.feed(wide, bytesOf(wideFrame("content-length:many\n\n")))
+  assertTrue(isErr(Stomp.nextDecoded(wide)), "a content-length beyond the limit that is not a number")
+  val unended = Stomp.newDecoder(8)
+  Stomp.feed(unended, bytesOf("MESSAGE\ncontent-length:12\n\n0123456789abX"))
+  assertTrue(isErr(Stomp.nextDecoded(unended)), "a skipped body not followed by NUL")
 }

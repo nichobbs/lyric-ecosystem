@@ -16,6 +16,13 @@
 //!   /queue/fail.drop              SEND makes the broker close the socket
 //!   /queue/fail.silent            SEND is accepted but never receipted
 //!   /queue/fail.dropconsume       SUBSCRIBE is receipted, then the socket closes
+//!   /queue/fail.stray             SEND is answered with an ERROR frame without a receipt-id
+//!   /queue/slow.send              SEND is receipted after 2.5 s, and not stored
+//!   /queue/slow.subscribe.*       SUBSCRIBE is receipted after 2.5 s
+//!   /queue/flaky.*                the first ACK, NACK or COMMIT of an ACK is refused with an
+//!                                 ERROR frame; the delivery stays unsettled
+//!   login `stall`                 CONNECTED, then nothing is read for 8 s, then the socket closes
+//!   header `fake-pad:N`           the MESSAGE carries a `padding` header of N characters
 //!
 //! The broker is started three times: on plain TCP, behind TLS, and behind
 //! TLS with a required client certificate. The TLS ones use the TEST-ONLY
@@ -30,6 +37,7 @@ import Std.Core
 import Std.Collections
 import Std.Testing
 import Std.Encoding
+import Std.Parse
 import Std.String as Str
 import Std.Environment as Env
 import Std.File as File
@@ -43,6 +51,12 @@ import Mq.ActiveMq.Kernel as K
 import Mq.ActiveMq.Stomp as Stomp
 
 // ─── The fake broker ─────────────────────────────────────────────────────────
+// How long the slow destinations delay their answer, and how long a stalled
+// connection stays open without being read.
+val SLOW_MS: Int = 2500
+
+val STALL_MS: Int = 8000
+
 record Stored {
   headers: slice[Stomp.Header]
   body: slice[Byte]
@@ -68,6 +82,8 @@ ref record Session {
   var unackedOrder: List[String]
   var txSends: Map[String, List[Stomp.Frame]]
   var txAcks: Map[String, List[String]]
+  // Settlements still to be refused with an ERROR frame (`/queue/flaky.*`).
+  var refuseLeft: Int
 }
 
 func h(name: in String, value: in String): Stomp.Header {
@@ -122,6 +138,25 @@ func enqueue(b: in FakeBroker, frame: in Stomp.Frame): Unit {
   K.lockExit(b.lock)
 }
 
+// `count` characters of text.
+func filler(count: in Int): String {
+  var text = "x"
+  while text.length < count {
+    text = text + text
+  }
+  Str.substring(text, 0, count)
+}
+
+// The size a `fake-pad` header asks for, 0 without one.
+func padOf(stored: in Stored): Int {
+  for header in stored.headers {
+    if header.name == "fake-pad" {
+      return match parseOptInt(header.value) { case Some(n) -> n; case None -> 0 }
+    }
+  }
+  0
+}
+
 // Dispatch everything waiting on the session's subscribed destination.
 func pump(s: in Session): Unit {
   if s.subscriptionId.length == 0 {
@@ -142,6 +177,10 @@ func pump(s: in Session): Unit {
     headers.add(h("ack", ackId))
     headers.add(h("subscription", s.subscriptionId))
     headers.add(h("message-id", "ID:fake:" + b.counter.toString()))
+    val pad = padOf(stored)
+    if pad > 0 {
+      headers.add(h("padding", filler(pad)))
+    }
     if stored.redelivered {
       headers.add(h("redelivered", "true"))
     }
@@ -189,6 +228,16 @@ func settleFake(s: in Session, frame: in Stomp.Frame, ackId: in String): Bool {
   false
 }
 
+// Refuse a settlement of a `/queue/flaky.*` subscription, once.
+func refuses(s: in Session, frame: in Stomp.Frame): Bool {
+  if s.refuseLeft < 1 {
+    return false
+  }
+  s.refuseLeft = s.refuseLeft - 1
+  brokerError(s, frame, "simulated settlement failure")
+  true
+}
+
 // Handle one frame. False ends the connection.
 func handle(s: in Session, frame: in Stomp.Frame): Bool {
   val command = frame.command
@@ -205,6 +254,10 @@ func handle(s: in Session, frame: in Stomp.Frame): Bool {
     }
     val version = if Stomp.headerOr(frame, "login", "") == "ancient" { "1.0" } else { "1.2" }
     reply(s, "CONNECTED", [h("server", "FakeMQ/1.0"), h("version", version), h("heart-beat", "0,0")], "")
+    if Stomp.headerOr(frame, "login", "") == "stall" {
+      K.sleepMs(STALL_MS)
+      return false
+    }
     return true
   }
   if command == "SEND" {
@@ -219,6 +272,15 @@ func handle(s: in Session, frame: in Stomp.Frame): Bool {
     if destination == "/queue/fail.silent" {
       return true
     }
+    if destination == "/queue/fail.stray" {
+      reply(s, "ERROR", [h("message", "stray failure")], "")
+      return true
+    }
+    if destination == "/queue/slow.send" {
+      K.sleepMs(SLOW_MS)
+      receipt(s, frame)
+      return true
+    }
     if tx.length > 0 {
       s.txSends[tx].add(frame)
     } else {
@@ -230,6 +292,12 @@ func handle(s: in Session, frame: in Stomp.Frame): Bool {
   if command == "SUBSCRIBE" {
     s.subscriptionId = Stomp.headerOr(frame, "id", "")
     s.destination = Stomp.headerOr(frame, "destination", "")
+    if Str.startsWith(s.destination, "/queue/slow.subscribe.") {
+      K.sleepMs(SLOW_MS)
+    }
+    if Str.startsWith(s.destination, "/queue/flaky.") {
+      s.refuseLeft = 1
+    }
     receipt(s, frame)
     return s.destination != "/queue/fail.dropconsume"
   }
@@ -245,12 +313,18 @@ func handle(s: in Session, frame: in Stomp.Frame): Bool {
       s.txAcks[tx].add(ackId)
       return true
     }
+    if refuses(s, frame) {
+      return true
+    }
     if settleFake(s, frame, ackId) {
       receipt(s, frame)
     }
     return true
   }
   if command == "NACK" {
+    if refuses(s, frame) {
+      return true
+    }
     if settleFake(s, frame, Stomp.headerOr(frame, "id", "")) {
       receipt(s, frame)
     }
@@ -264,6 +338,11 @@ func handle(s: in Session, frame: in Stomp.Frame): Bool {
     return true
   }
   if command == "COMMIT" {
+    if s.txAcks[tx].count > 0 and refuses(s, frame) {
+      s.txSends.remove(tx)
+      s.txAcks.remove(tx)
+      return true
+    }
     for sent in s.txSends[tx].toArray() {
       enqueue(s.broker, sent)
     }
@@ -298,7 +377,8 @@ func serve(b: in FakeBroker, sock: in K.Sock): Unit {
     unacked = newMap(),
     unackedOrder = newList(),
     txSends = newMap(),
-    txAcks = newMap()
+    txAcks = newMap(),
+    refuseLeft = 0
   )
   val decoder = Stomp.newDecoder(1048576)
   var open = true
@@ -787,8 +867,7 @@ test "a message id that cannot travel in a header is refused, and the connection
 test "publishWith sends the message and refuses invalid options" {
   val q = openFresh()
   val base = Extras.defaultSendOptions()
-  val full = base.copy(
-    persistent = false,
+  val full = base.withPersistent(false).copy(
     priority = 7,
     timeToLiveMs = 60000i64,
     correlationId = "corr",
@@ -946,12 +1025,16 @@ test "a message from another producer is delivered with its broker id and header
   q.close()
 }
 
-test "a body that is not UTF-8 is rejected to the broker and reported" {
+func rejecting(options: in ActiveMq.ConnectOptions): ActiveMq.ConnectOptions {
+  options.copy(onUndeliverable = ActiveMq.UndeliverablePolicy.RejectToBroker)
+}
+
+test "with RejectToBroker a body that is not UTF-8 is rejected to the broker and reported" {
   val destination = freshName()
   val binary: slice[Byte] = [255u8, 254u8, 0u8, 1u8]
   val none: slice[Stomp.Header] = []
   rawSend(destination, none, binary)
-  val q = open(optionsFor(destination))
+  val q = open(rejecting(optionsFor(destination)))
   val e = errorOf(q.consume(2000, { m -> Ok(()) }), "consume a binary message")
   expectContains(e, "cannot be delivered: its body is not UTF-8 text", "reason")
   expectContains(e, "rejected to the broker's dead-letter handling", "outcome")
@@ -962,11 +1045,11 @@ test "a body that is not UTF-8 is rejected to the broker and reported" {
   q.close()
 }
 
-test "malformed lyric headers are rejected to the broker and reported" {
+test "with RejectToBroker malformed lyric headers are rejected to the broker and reported" {
   val destination = freshName()
   rawSend(destination, [h("lyric_id", "x"), h("lyric_headers", "not json")], encodeUtf8("body"))
   rawSend(destination, [h("lyric_id", "y"), h("lyric_delivery_count", "many")], encodeUtf8("body"))
-  val q = open(optionsFor(destination))
+  val q = open(rejecting(optionsFor(destination)))
   expectContains(
     errorOf(q.consume(2000, { m -> Ok(()) }), "bad lyric_headers"),
     "lyric_headers header is malformed",
@@ -979,6 +1062,552 @@ test "malformed lyric headers are rejected to the broker and reported" {
   )
   expectTimeout(q, "both were rejected")
   q.close()
+}
+
+// ─── Regression tests of the README audit ────────────────────────────────────
+func freshFlaky(): String {
+  slot.names = slot.names + 1
+  "/queue/flaky." + slot.names.toString()
+}
+
+func mustOk(r: in Result[Unit, String], label: in String): Unit {
+  match r {
+    case Ok(_) -> ()
+    case Err(e) -> assertTrue(false, label + ": " + e)
+  }
+}
+
+test "an ack, a reject and a requeue the broker refuses can be repeated" {
+  val acked = open(optionsFor(freshFlaky()))
+  mustPublish(acked, message("f-1", "x"))
+  val first = mustTake(acked)
+  expectContains(errorOf(acked.ack(first.id), "refused ack"), "broker error: simulated settlement failure", "ack")
+  assertTrue(ActiveMq.isOpen(acked), "the connection survives the ERROR frame")
+  assertEqualInt(ActiveMq.unsettledCount(acked), 1, "the delivery is still unsettled after a refused ack")
+  mustOk(acked.ack(first.id), "the second ack")
+  assertEqualInt(ActiveMq.unsettledCount(acked), 0, "settled by the second ack")
+  expectTimeout(acked, "acknowledged")
+  acked.close()
+
+  val rejected = open(optionsFor(freshFlaky()))
+  mustPublish(rejected, message("f-2", "x"))
+  val second = mustTake(rejected)
+  expectContains(errorOf(rejected.nack(second.id, false), "refused reject"), "simulated settlement failure", "nack")
+  assertEqualInt(ActiveMq.unsettledCount(rejected), 1, "the delivery is still unsettled after a refused reject")
+  mustOk(rejected.nack(second.id, false), "the second reject")
+  expectTimeout(rejected, "rejected")
+  rejected.close()
+
+  val requeued = open(optionsFor(freshFlaky()))
+  mustPublish(requeued, message("f-3", "x"))
+  val third = mustTake(requeued)
+  expectContains(errorOf(requeued.nack(third.id, true), "refused requeue"), "simulated settlement failure", "requeue")
+  assertEqualInt(ActiveMq.unsettledCount(requeued), 1, "the delivery is still unsettled after a refused requeue")
+  mustOk(requeued.nack(third.id, true), "the second requeue")
+  val again = mustTake(requeued)
+  assertEqualInt(again.deliveryCount, 1, "requeued once: the refused transaction left no copy")
+  mustOk(requeued.ack(again.id), "ack")
+  expectTimeout(requeued, "exactly one copy")
+  requeued.close()
+}
+
+// A handler that accepts. Not written `{ m -> Ok(()) }`: on dotnet that lambda
+// builds a `Result` of the wrong instantiation, and a `consume` that calls it
+// fails with an invalid cast (see the README's known gaps).
+func accept(m: in Mq.Message): Result[Unit, String] {
+  Ok(())
+}
+
+test "Auto mode: a settlement the broker refuses leaves the delivery settleable" {
+  val base = optionsFor(freshFlaky())
+  val q = open(base.copy(ackMode = Mq.AckMode.Auto))
+  mustPublish(q, message("a-1", "x"))
+  expectContains(
+    errorOf(q.consume(2000, { m -> accept(m) }), "the automatic ack is refused"),
+    "simulated settlement failure",
+    "auto ack"
+  )
+  assertEqualInt(ActiveMq.unsettledCount(q), 1, "the delivery is still unsettled after the refused automatic ack")
+  mustOk(q.ack("a-1"), "ack by hand")
+  assertEqualInt(ActiveMq.unsettledCount(q), 0, "settled by hand")
+  mustOk(q.ack("a-1"), "with nothing unsettled, ack is a no-op again")
+  expectTimeout(q, "acknowledged")
+  q.close()
+
+  val otherBase = optionsFor(freshFlaky())
+  val other = open(otherBase.copy(ackMode = Mq.AckMode.Auto))
+  mustPublish(other, message("a-2", "x"))
+  val e = errorOf(other.consume(2000, { m -> Err("not now") }), "the automatic requeue is refused")
+  expectContains(e, "not now (and requeueing the message failed:", "auto requeue")
+  assertEqualInt(
+    ActiveMq.unsettledCount(other),
+    1,
+    "the delivery is still unsettled after the refused automatic requeue"
+  )
+  mustOk(other.nack("a-2", true), "requeue by hand")
+  val again = mustTake(other)
+  assertEqualInt(again.deliveryCount, 1, "requeued once")
+  expectTimeout(other, "exactly one copy")
+  other.close()
+}
+
+// The value of header `name` on the oldest message stored for `destination`,
+// "" when it has none.
+func storedHeader(destination: in String, name: in String): String {
+  val b = match slot.broker { case Some(found) -> found; case None -> panic("no broker") }
+  K.lockEnter(b.lock)
+  val waiting = queueOf(b, destination)
+  val value = if waiting.count == 0 {
+    "<nothing stored>"
+  } else {
+    Stomp.headerOr(Stomp.bareFrame("SEND", waiting[0].headers), name, "")
+  }
+  K.lockExit(b.lock)
+  value
+}
+
+test "publishWith inherits the connection's persistence unless the options set it" {
+  val transient = optionsFor(freshName())
+  val q = open(transient.copy(persistent = false))
+  match Extras.publishWith(q, message("p-1", "x"), Extras.defaultSendOptions()) {
+    case Ok(_) -> ()
+    case Err(e) -> assertTrue(false, e)
+  }
+  assertEqual(
+    storedHeader(ActiveMq.destination(q), "persistent"),
+    "",
+    "default send options on a non-persistent connection send no persistent header"
+  )
+  q.close()
+  val durable = open(optionsFor(freshName()))
+  match Extras.publishWith(durable, message("p-2", "x"), Extras.defaultSendOptions()) {
+    case Ok(_) -> ()
+    case Err(e) -> assertTrue(false, e)
+  }
+  assertEqual(storedHeader(ActiveMq.destination(durable), "persistent"), "true", "a persistent connection")
+  durable.close()
+  val explicit = open(optionsFor(freshName()))
+  mustOk(
+    Extras.publishWith(explicit, message("p-3", "x"), Extras.defaultSendOptions().withPersistent(false)),
+    "an explicit non-persistent send"
+  )
+  assertEqual(storedHeader(ActiveMq.destination(explicit), "persistent"), "false", "the option wins when it is set")
+  explicit.close()
+  val raised = open(transient.copy(persistent = false, destination = freshName()))
+  mustOk(
+    Extras.publishWith(raised, message("p-4", "x"), Extras.defaultSendOptions().withPersistent(true)),
+    "an explicit persistent send"
+  )
+  assertEqual(storedHeader(ActiveMq.destination(raised), "persistent"), "true", "also on a non-persistent connection")
+  raised.close()
+}
+
+test "a body over maxFrameBytes is skipped and the connection stays usable" {
+  val destination = freshName()
+  val publisher = open(optionsFor(destination))
+  mustPublish(publisher, message("big", filler(5000)))
+  mustPublish(publisher, message("small", "fits"))
+  val base = optionsFor(destination)
+  val q = open(base.copy(maxFrameBytes = 1024))
+  val e = errorOf(q.consume(2000, { m -> Ok(()) }), "an oversize body")
+  expectContains(e, "5000 bytes exceeds", "the reason")
+  assertTrue(ActiveMq.isOpen(q), "an oversize message does not break the connection: " + e)
+  expectContains(e, "left unacknowledged", "the default policy")
+  val next = mustTake(q)
+  assertEqual(next.id, "small", "the next message is delivered on the same connection")
+  mustOk(q.ack(next.id), "ack")
+  val bigId = Str.substring(e, 18, Str.indexOfRaw(e, " cannot be delivered") - 18)
+  expectContains(errorOf(q.nack(bigId, true), "requeue a message that was not read"), "nothing to requeue", "requeue")
+  assertEqualInt(ActiveMq.unsettledCount(q), 1, "still unsettled")
+  q.close()
+
+  // It went back to the queue. A connection that rejects takes it off, and a
+  // connection with a higher limit would have read it.
+  val strict = open(rejecting(base.copy(maxFrameBytes = 1024)))
+  val again = errorOf(strict.consume(2000, { m -> Ok(()) }), "the oversize body again")
+  expectContains(again, "5000 bytes exceeds the limit of 1024 bytes", "the reason")
+  expectContains(again, "rejected to the broker's dead-letter handling", "RejectToBroker")
+  assertTrue(ActiveMq.isOpen(strict), "the connection survives the rejection too")
+  assertEqualInt(ActiveMq.unsettledCount(strict), 0, "nothing is in flight")
+  expectTimeout(strict, "the rejected message is gone")
+  strict.close()
+  publisher.close()
+}
+
+test "an oversize message that arrives while a publish waits for its receipt is kept for consume" {
+  val destination = freshName()
+  val base = optionsFor(destination)
+  val q = open(base.copy(maxFrameBytes = 1024))
+  expectTimeout(q, "subscribe")
+  mustPublish(q, message("big", filler(3000)))
+  mustPublish(q, message("small", "fits"))
+  val e = errorOf(q.consume(2000, { m -> Ok(()) }), "the oversize body")
+  expectContains(e, "3000 bytes exceeds", "reported by consume, not by the publish")
+  assertEqual(mustTake(q).id, "small", "then the next message")
+  q.close()
+}
+
+test "a header section over 64 KiB is skipped and the connection stays usable" {
+  val destination = freshName()
+  val publisher = open(optionsFor(destination))
+  mustOk(
+    ActiveMq.publishWithHeaders(publisher, message("wide", "x"), [h("fake-pad", "70000")]),
+    "publish the message with the padded header"
+  )
+  mustPublish(publisher, message("small", "fits"))
+  val q = open(optionsFor(destination))
+  val e = errorOf(q.consume(2000, { m -> Ok(()) }), "oversize headers")
+  expectContains(e, "65536 bytes", "the reason")
+  assertTrue(ActiveMq.isOpen(q), "oversize headers do not break the connection: " + e)
+  val next = mustTake(q)
+  assertEqual(next.id, "small", "the next message is delivered on the same connection")
+  mustOk(q.ack(next.id), "ack")
+  q.close()
+  publisher.close()
+}
+
+test "a negative deliveryCount is refused on publish" {
+  val q = openFresh()
+  val negative = Mq.Message(id = "n", body = "x", headers = [], deliveryCount = -1)
+  expectContains(errorOf(q.publish(negative), "publish"), "deliveryCount", "publish")
+  expectContains(errorOf(q.publishBatch([message("ok", "x"), negative]), "publishBatch"), "deliveryCount", "batch")
+  assertTrue(ActiveMq.isOpen(q), "nothing was written")
+  expectTimeout(q, "nothing was published, not even the valid message of the batch")
+  q.close()
+}
+
+test "an ERROR frame without a receipt-id is a lost connection, not the current request's failure" {
+  val q = openFresh()
+  val e = errorOf(
+    ActiveMq.publishWithHeaders(q, message("m", "x"), [h("destination", "/queue/fail.stray")]),
+    "publish answered by an uncorrelated ERROR"
+  )
+  expectContains(e, "activemq: connection lost:", "an uncorrelated ERROR is connection-level")
+  expectContains(e, "stray failure", "the broker's text is kept")
+  assertTrue(not ActiveMq.isOpen(q), "the connection is unusable afterwards")
+  q.close()
+}
+
+test "consume(0) does not wait for the SUBSCRIBE receipt" {
+  slot.names = slot.names + 1
+  val base = optionsFor("/queue/slow.subscribe." + slot.names.toString())
+  val q = open(base.copy(requestTimeoutMs = 10000))
+  val started = K.monotonicMillis()
+  val e = errorOf(q.consume(0, { m -> Ok(()) }), "a poll while the subscription is being opened")
+  val elapsed = K.monotonicMillis() - started
+  assertEqual(e, "timeout", "the poll times out")
+  assertTrue(elapsed < 1500i64, "consume(0) returned after " + elapsed.toString() + " ms")
+  mustPublish(q, message("s-1", "after the subscription"))
+  val got = mustTake(q)
+  assertEqual(got.id, "s-1", "the subscription was completed by the later calls")
+  mustOk(q.ack(got.id), "ack")
+  q.close()
+}
+
+func publishSlowly(q: in ActiveMq.ActiveMqQueue): Unit {
+  val _ = ActiveMq.publishWithHeaders(q, message("slow", "x"), [h("destination", "/queue/slow.send")])
+}
+
+test "consume does not wait past its timeout for the connection's lock" {
+  val base = optionsFor(freshName())
+  val q = open(base.copy(requestTimeoutMs = 10000))
+  expectTimeout(q, "subscribe")
+  val publisher = K.startBackground({ -> publishSlowly(q) })
+  K.sleepMs(300)
+  val started = K.monotonicMillis()
+  val e = errorOf(q.consume(100, { m -> Ok(()) }), "a consume while a publish holds the connection")
+  val elapsed = K.monotonicMillis() - started
+  assertEqual(e, "timeout", "the consume times out")
+  assertTrue(elapsed < 1500i64, "consume(100) returned after " + elapsed.toString() + " ms")
+  K.waitBackground(publisher)
+  q.close()
+}
+
+test "a publish to a broker that stops reading ends with the request timeout" {
+  val base = optionsFor(freshName())
+  val q = open(base.copy(login = "stall", requestTimeoutMs = 1000))
+  val body = filler(33554432)
+  val started = K.monotonicMillis()
+  val e = errorOf(q.publish(message("huge", body)), "a publish nobody reads")
+  val elapsed = K.monotonicMillis() - started
+  expectContains(e, "activemq: connection lost:", "a write that cannot finish loses the connection")
+  assertTrue(elapsed < 6000i64, "the publish returned after " + elapsed.toString() + " ms")
+  assertTrue(not ActiveMq.isOpen(q), "the connection is unusable afterwards")
+  q.close()
+}
+
+test "a message this client cannot represent is left on the broker by default" {
+  val destination = freshName()
+  val binary: slice[Byte] = [255u8, 254u8, 0u8, 1u8]
+  val none: slice[Stomp.Header] = []
+  rawSend(destination, none, binary)
+  val q = open(optionsFor(destination))
+  val e = errorOf(q.consume(2000, { m -> Ok(()) }), "consume a binary message")
+  expectContains(e, "cannot be delivered: its body is not UTF-8 text", "reason")
+  expectContains(e, "left unacknowledged", "outcome")
+  assertTrue(ActiveMq.isOpen(q), "the connection stays usable")
+  assertEqualInt(ActiveMq.unsettledCount(q), 1, "it is tracked as unsettled")
+  mustPublish(q, message("next", "fine"))
+  val next = mustTake(q)
+  assertEqual(next.id, "next", "later messages are delivered")
+  mustOk(q.ack(next.id), "ack")
+  q.close()
+  val second = open(optionsFor(destination))
+  val again = errorOf(second.consume(2000, { m -> Ok(()) }), "the binary message is still on the broker")
+  expectContains(again, "its body is not UTF-8 text", "it was not destroyed")
+  // The error names the broker id under which the application may settle it.
+  val marker = "cannot be delivered"
+  val brokerId = Str.substring(again, 18, Str.indexOfRaw(again, " " + marker) - 18)
+  assertTrue(Str.startsWith(brokerId, "ID:"), "the broker id in the error: " + again)
+  mustOk(second.nack(brokerId, true), "a small undeliverable message can be requeued as it is")
+  val third = errorOf(second.consume(2000, { m -> Ok(()) }), "the requeued copy")
+  expectContains(third, "its body is not UTF-8 text", "the copy is as undeliverable")
+  assertEqualInt(ActiveMq.unsettledCount(second), 1, "only the copy is unsettled")
+  val copyId = Str.substring(third, 18, Str.indexOfRaw(third, " " + marker) - 18)
+  mustOk(second.nack(copyId, false), "the application rejects it itself")
+  assertEqualInt(ActiveMq.unsettledCount(second), 0, "settled")
+  expectTimeout(second, "gone")
+  second.close()
+}
+
+test "an undeliverable message in Auto mode is left for ack or nack" {
+  val destination = freshName()
+  rawSend(destination, [h("lyric_id", "x"), h("lyric_headers", "not json")], encodeUtf8("body"))
+  val base = optionsFor(destination)
+  val q = open(base.copy(ackMode = Mq.AckMode.Auto))
+  val e = errorOf(q.consume(2000, { m -> Ok(()) }), "malformed headers")
+  expectContains(e, "lyric_headers header is malformed", "reason")
+  expectContains(e, "left unacknowledged", "outcome")
+  val brokerId = Str.substring(e, 18, Str.indexOfRaw(e, " cannot be delivered") - 18)
+  assertEqualInt(ActiveMq.unsettledCount(q), 1, "tracked")
+  mustOk(q.ack(brokerId), "ack acts on it even in Auto mode")
+  assertEqualInt(ActiveMq.unsettledCount(q), 0, "settled")
+  q.close()
+}
+
+test "connectFromEnv reads the undeliverable policy" {
+  val prefix = "LYRIC_CONFIG_MQ_ACTIVEMQ_"
+  val destination = freshName()
+  val binary: slice[Byte] = [255u8, 254u8]
+  val none: slice[Stomp.Header] = []
+  rawSend(destination, none, binary)
+  Env.setVar(prefix + "URL", "stomp://lyric:secret@127.0.0.1:" + brokerPort().toString())
+  Env.setVar(prefix + "QUEUENAME", destination)
+  Env.setVar(prefix + "ONUNDELIVERABLE", "sometimes")
+  match ActiveMq.connectFromEnv() {
+    case Ok(_) -> assertTrue(false, "an unknown policy")
+    case Err(e) -> expectContains(e, "ONUNDELIVERABLE must be Leave or Reject", "a bad policy")
+  }
+  Env.setVar(prefix + "ONUNDELIVERABLE", "Reject")
+  match ActiveMq.connectFromEnv() {
+    case Err(e) -> assertTrue(false, e)
+    case Ok(q) -> {
+      expectContains(
+        errorOf(q.consume(2000, { m -> Ok(()) }), "a binary message"),
+        "rejected to the broker's dead-letter handling",
+        "Reject"
+      )
+      q.close()
+    }
+  }
+  Env.setVar(prefix + "URL", "")
+  Env.setVar(prefix + "QUEUENAME", "")
+  Env.setVar(prefix + "ONUNDELIVERABLE", "")
+}
+
+// A peer that sends `text` in `pieces` writes, `pauseMs` apart.
+func dribble(server: in K.ServerSock, secured: in Bool, text: in String, pieces: in Int, pauseMs: in Int): Unit {
+  val accepted = match K.serverAccept(server) { case Ok(s) -> s; case Err(_) -> return }
+  val sock = if secured {
+    match K.sockAcceptTls(accepted, serverTls(""), 5000) {
+      case Ok(s) -> s
+      case Err(_) -> return
+    }
+  } else {
+    accepted
+  }
+  val bytes = encodeUtf8(text)
+  val step = bytes.length / pieces
+  var n = 0
+  while n < pieces {
+    val stop = if n == pieces - 1 { bytes.length } else { (n + 1) * step }
+    val _ = K.sockWrite(sock, bytes.slice(n * step, stop))
+    K.sleepMs(pauseMs)
+    n += 1
+  }
+  K.sockClose(sock)
+}
+
+// Read with `waitMs` per call until the peer closes; every byte must come
+// through, in order, whatever the read timeouts cut across.
+func readDribble(secured: in Bool, waitMs: in Int, pauseMs: in Int, label: in String): Unit {
+  val polling = waitMs < pauseMs / 2
+  val server = match K.serverListen("127.0.0.1", 0) { case Ok(s) -> s; case Err(e) -> panic(e) }
+  val text = filler(40) + "|" + filler(700) + "|end"
+  val peer = K.startBackground({ -> dribble(server, secured, text, 12, pauseMs) })
+  val plain = match K.sockConnect("127.0.0.1", K.serverPort(server), 5000) { case Ok(s) -> s; case Err(e) -> panic(e) }
+  val sock = if secured {
+    val tls = K.ClientTls(
+      serverName = "localhost",
+      caPem = TEST_ONLY_CA,
+      exclusiveCa = true,
+      certPem = "",
+      keyPem = "",
+      tls13Only = false,
+      skipVerify = false
+    )
+    match K.sockStartTls(plain, tls, 5000) {
+      case Ok(s) -> s
+      case Err(e) -> panic(label + ": handshake: " + e)
+    }
+  } else {
+    plain
+  }
+  val got: List[Byte] = newList()
+  var timeouts = 0
+  var open = true
+  val giveUp = K.monotonicMillis() + 30000i64
+  while open and K.monotonicMillis() < giveUp {
+    match K.sockRead(sock, 7, waitMs) {
+      case Ok(Data(bytes)) -> {
+        for b in bytes {
+          got.add(b)
+        }
+      }
+      case Ok(TimedOut) -> {
+        timeouts += 1
+      }
+      case Ok(Eof) -> {
+        open = false
+      }
+      case Err(e) -> {
+        assertTrue(false, label + ": read failed: " + e)
+        open = false
+      }
+    }
+  }
+  assertTrue(not open, label + ": the peer's close was seen")
+  val received = match tryDecodeUtf8(got.toArray()) { case Some(t) -> t; case None -> "<not UTF-8>" }
+  assertTrue(
+    received == text,
+    label + ": " + got.count.toString() + " bytes after " + timeouts.toString() + " timeouts"
+  )
+  if polling {
+    assertTrue(timeouts > 0, label + ": the reads did time out between the pieces")
+  }
+  match K.sockRead(sock, 7, waitMs) {
+    case Ok(Eof) -> ()
+    case _ -> assertTrue(false, label + ": the end of the stream is reported again")
+  }
+  K.sockClose(sock)
+  K.waitBackground(peer)
+  K.serverClose(server)
+}
+
+test "bytes sent in pieces across read timeouts all arrive, in order, over plain TCP and TLS" {
+  // Waits shorter than, equal to and longer than the pause between pieces,
+  // so reads expire before, while and after a piece arrives.
+  readDribble(false, 1, 30, "plain, polling")
+  readDribble(false, 30, 30, "plain, wait equal to the pause")
+  readDribble(false, 45, 30, "plain, wait longer than the pause")
+  readDribble(true, 1, 30, "TLS, polling")
+  readDribble(true, 30, 30, "TLS, wait equal to the pause")
+  readDribble(true, 45, 30, "TLS, wait longer than the pause")
+}
+
+// A peer that sends `first`, then closes the connection at once, without a
+// TLS shutdown when it is TLS.
+func sayAndHangUp(server: in K.ServerSock, secured: in Bool, first: in slice[Byte]): Unit {
+  val accepted = match K.serverAccept(server) { case Ok(s) -> s; case Err(_) -> return }
+  val sock = if secured {
+    match K.sockAcceptTls(accepted, serverTls(""), 5000) {
+      case Ok(s) -> s
+      case Err(_) -> return
+    }
+  } else {
+    accepted
+  }
+  // Wait for the CONNECT frame, as a broker does.
+  val _ = K.sockRead(sock, 4096, 5000)
+  if first.length > 0 {
+    val _ = K.sockWrite(sock, first)
+  }
+  K.sockClose(sock)
+}
+
+func loginAgainst(secured: in Bool, first: in slice[Byte]): String {
+  val server = match K.serverListen("127.0.0.1", 0) { case Ok(s) -> s; case Err(e) -> panic(e) }
+  val peer = K.startBackground({ -> sayAndHangUp(server, secured, first) })
+  val base = ActiveMq.defaultOptions("127.0.0.1", K.serverPort(server), "/queue/a")
+  val options = base.copy(login = "lyric", passcode = "hunter2", requestTimeoutMs = 5000)
+  val e = errorOfConnect(if secured { options.withTls().withExclusiveCaCertificate(TEST_ONLY_CA) } else { options })
+  K.waitBackground(peer)
+  K.serverClose(server)
+  assertTrue(not Str.contains(e, "hunter2"), "the passcode is not echoed: " + e)
+  e
+}
+
+test "an ERROR frame followed at once by the broker's close is still read" {
+  val refusal = match Stomp.encodeFrame(Stomp.textFrame("ERROR", [h("message", "password is invalid")], "")) {
+    case Ok(bytes) -> bytes
+    case Err(e) -> panic(e)
+  }
+  var n = 0
+  while n < 20 {
+    assertEqual(loginAgainst(false, refusal), "activemq: broker error: password is invalid", "plain TCP")
+    assertEqual(loginAgainst(true, refusal), "activemq: broker error: password is invalid", "TLS")
+    n += 1
+  }
+}
+
+test "a broker that closes the connection during login without an answer" {
+  val nothing: slice[Byte] = []
+  for secured in [false, true] {
+    val e = loginAgainst(secured, nothing)
+    expectContains(e, "activemq: connection lost:", "a loss")
+    expectContains(e, "ended the connection during login", "what happened")
+    expectContains(e, "refuses the login or passcode", "the usual cause")
+  }
+  // Half an ERROR frame is no answer either.
+  val e = loginAgainst(false, encodeUtf8("ERROR\nmessage:password is inv"))
+  expectContains(e, "ended the connection during login", "a truncated ERROR frame")
+}
+
+ref record Flag {
+  var done: Bool
+}
+
+func idleUntil(flag: in Flag): Unit {
+  while not flag.done {
+    K.sleepMs(20)
+  }
+}
+
+func roundTripUnderLoad(options: in ActiveMq.ConnectOptions, label: in String): Unit {
+  match ActiveMq.connectWith(options) {
+    case Err(e) -> assertTrue(false, label + ": connect: " + e)
+    case Ok(q) -> {
+      mustOk(q.publish(message("busy", label)), label + ": publish")
+      val got = Got(messages = newList())
+      mustOk(q.consume(1000, { m -> keep(got, m) }), label + ": consume(1000)")
+      q.close()
+    }
+  }
+}
+
+test "a busy thread pool does not delay connecting, publishing or consuming" {
+  val plain = optionsFor(freshName())
+  val secured = tlsOptionsFor(freshName())
+  val flag = Flag(done = false)
+  var n = 0
+  while n < 64 {
+    val _ = K.startPoolWork({ -> idleUntil(flag) })
+    n += 1
+  }
+  K.sleepMs(200)
+  roundTripUnderLoad(plain, "plain TCP")
+  roundTripUnderLoad(secured, "TLS")
+  flag.done = true
 }
 
 // ─── Threads ─────────────────────────────────────────────────────────────────

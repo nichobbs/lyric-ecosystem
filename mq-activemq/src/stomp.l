@@ -9,6 +9,12 @@
 //! otherwise. Lines may end in LF or CRLF, and any number of bare line ends
 //! between frames (heart-beats) are skipped. When a header repeats, the first
 //! occurrence is the one `headerValue` reports, as the specification requires.
+//!
+//! Limits. A header section (command line included) may hold `MAX_HEADER_BYTES`
+//! bytes and a body the decoder's `maxFrameBytes`. A frame over either limit is
+//! not an error of the stream: the decoder reads it to its end without keeping
+//! it, reports it as `TooLarge` with its command and the headers it kept, and
+//! goes on with the next frame. Memory stays bounded while it does.
 @runtime_checked
 package Mq.ActiveMq.Stomp
 
@@ -211,8 +217,44 @@ pub func encodeFrame(frame: in Frame): Result[slice[Byte], String] {
   Ok(head.concat(frame.body).concat(terminator))
 }
 
+/// A frame the decoder read past without keeping, because its header section
+/// or its body was over the limit.
+pub record Skipped {
+  command: String
+  /// For an oversize body: all of the frame's headers. For an oversize header
+  /// section: the headers that ended within the first `MAX_HEADER_BYTES`
+  /// bytes, and of the later ones only `ack`, `message-id`, `subscription`,
+  /// `destination` and `content-length` (those no longer than
+  /// `SKIPPED_LINE_BYTES`).
+  headers: slice[Header]
+  /// Which limit the frame was over, as the end of a sentence about it: "its
+  /// body of 5000 bytes exceeds the limit of 1024 bytes".
+  reason: String
+}
+
+/// What `nextDecoded` produced.
+pub union Decoded {
+  case Complete(frame: Frame)
+  case TooLarge(skipped: Skipped)
+}
+
+/// The longest header line kept from the part of a header section beyond
+/// `MAX_HEADER_BYTES`.
+pub val SKIPPED_LINE_BYTES: Int = 1024
+
+val SKIP_NONE: Int = 0
+
+// Reading header lines beyond `MAX_HEADER_BYTES`.
+val SKIP_HEADERS: Int = 1
+
+// Dropping a body of known length, then its NUL.
+val SKIP_COUNTED: Int = 2
+
+// Dropping a body up to its NUL.
+val SKIP_TO_NUL: Int = 3
+
 /// An incremental frame decoder. `feed` it bytes as they arrive and call
-/// `nextFrame` until it reports `None`.
+/// `nextDecoded` (or `nextFrame`) until it reports `None`.
 pub ref record Decoder {
   var buffer: slice[Byte]
   var chunks: List[slice[Byte]]
@@ -221,15 +263,40 @@ pub ref record Decoder {
   var need: Int
   // Where the search for a body's terminating NUL resumes.
   var scanned: Int
+  // The frame being skipped, when `skipMode` is not `SKIP_NONE`.
+  var skipMode: Int
+  var skipCommand: String
+  var skipHeaders: List[Header]
+  var skipReason: String
+  // The frame's content-length, -1 while none has been seen.
+  var skipDeclared: Int
+  // Body bytes still to drop (`SKIP_COUNTED`).
+  var skipLeft: Int
+  // Inside a header line whose start has already been dropped.
+  var skipMidLine: Bool
   maxFrameBytes: Int
 }
 
-/// A decoder that rejects frames larger than `maxFrameBytes`.
+/// A decoder that skips frames whose body is larger than `maxFrameBytes`.
 pub func newDecoder(maxFrameBytes: in Int): Decoder
   requires: maxFrameBytes > 0
 {
   val empty: slice[Byte] = []
-  Decoder(buffer = empty, chunks = newList(), chunkBytes = 0, need = 0, scanned = 0, maxFrameBytes = maxFrameBytes)
+  Decoder(
+    buffer = empty,
+    chunks = newList(),
+    chunkBytes = 0,
+    need = 0,
+    scanned = 0,
+    skipMode = SKIP_NONE,
+    skipCommand = "",
+    skipHeaders = newList(),
+    skipReason = "",
+    skipDeclared = -1,
+    skipLeft = 0,
+    skipMidLine = false,
+    maxFrameBytes = maxFrameBytes
+  )
 }
 
 /// Hand the decoder the next bytes from the wire.
@@ -240,7 +307,7 @@ pub func feed(d: in Decoder, bytes: in slice[Byte]): Unit {
   }
 }
 
-/// The number of bytes fed but not yet returned as part of a frame.
+/// The number of bytes fed but not yet returned as part of a frame or dropped.
 pub func buffered(d: in Decoder): Int {
   d.buffer.length + d.chunkBytes
 }
@@ -296,9 +363,155 @@ func parseHeaderLine(command: in String, line: in String): Result[Header, String
   Ok(Header(name = name, value = value))
 }
 
-/// The next complete frame, `Ok(None)` when more bytes are needed. An `Err`
-/// is a protocol violation: the stream cannot be resynchronised after it.
-pub func nextFrame(d: in Decoder): Result[Option[Frame], String] {
+func parseLength(text: in String): Result[Int, String] {
+  match tryParseInt(Str.trim(text)) {
+    case Ok(len) -> if len >= 0 { Ok(len) } else { Err("a STOMP content-length is negative") }
+    case Err(_) -> Err("a STOMP content-length is not a number")
+  }
+}
+
+// The first content-length among `headers`, -1 without one.
+func declaredLength(headers: in List[Header]): Result[Int, String] {
+  for h in headers.toArray() {
+    if h.name == "content-length" {
+      return parseLength(h.value)
+    }
+  }
+  Ok(-1)
+}
+
+func beginSkip(
+  d: in Decoder,
+  mode: in Int,
+  command: in String,
+  headers: in List[Header],
+  declared: in Int,
+  reason: in String,
+): Unit {
+  d.skipMode = mode
+  d.skipCommand = command
+  d.skipHeaders = headers
+  d.skipDeclared = declared
+  d.skipLeft = if declared > 0 { declared } else { 0 }
+  d.skipReason = reason
+  d.skipMidLine = false
+}
+
+func finishSkip(d: in Decoder): Decoded {
+  val skipped = Skipped(command = d.skipCommand, headers = d.skipHeaders.toArray(), reason = d.skipReason)
+  d.skipMode = SKIP_NONE
+  d.skipCommand = ""
+  d.skipHeaders = newList()
+  d.skipReason = ""
+  d.skipDeclared = -1
+  d.skipLeft = 0
+  d.skipMidLine = false
+  TooLarge(skipped = skipped)
+}
+
+func isKeptWhenSkipping(name: in String): Bool {
+  name == "ack" or name == "message-id" or name == "subscription" or name == "destination" or name == "content-length"
+}
+
+func hasNamed(headers: in List[Header], name: in String): Bool {
+  for h in headers.toArray() {
+    if h.name == name {
+      return true
+    }
+  }
+  false
+}
+
+// One header line of the part beyond `MAX_HEADER_BYTES`: kept only when it is
+// one of the headers a caller needs to answer the frame and the first of its
+// name. A line that does not parse is dropped like the rest; a content-length
+// that does not parse is an error, because the frame's end depends on it.
+func keepSkippedLine(d: in Decoder, buf: in slice[Byte], from: in Int, to: in Int): Result[Unit, String] {
+  val line = match lineText(buf, from, to) { case Ok(v) -> v; case Err(_) -> return Ok(()) }
+  val header = match parseHeaderLine(d.skipCommand, line) { case Ok(v) -> v; case Err(_) -> return Ok(()) }
+  if not isKeptWhenSkipping(header.name) or hasNamed(d.skipHeaders, header.name) {
+    return Ok(())
+  }
+  if header.name == "content-length" {
+    val declared = match parseLength(header.value) { case Ok(n) -> n; case Err(e) -> return Err(e) }
+    d.skipDeclared = declared
+    d.skipLeft = declared
+  }
+  d.skipHeaders.add(header)
+  Ok(())
+}
+
+// Go on dropping the frame being skipped. `Ok(None)` when its end has not
+// arrived yet; whatever was buffered has been dropped by then, except the
+// start of a short header line.
+func continueSkip(d: in Decoder): Result[Option[Decoded], String] {
+  val buf = d.buffer
+  var pos = 0
+  while true {
+    if d.skipMode == SKIP_HEADERS {
+      var lf = pos
+      while lf < buf.length and buf[lf] != LF {
+        lf += 1
+      }
+      if lf >= buf.length {
+        if buf.length - pos > SKIPPED_LINE_BYTES {
+          d.skipMidLine = true
+          pos = buf.length
+        }
+        consume(d, pos)
+        return Ok(None)
+      }
+      if d.skipMidLine {
+        d.skipMidLine = false
+      } else if lf == pos or (lf == pos + 1 and buf[pos] == CR) {
+        d.skipMode = if d.skipDeclared >= 0 { SKIP_COUNTED } else { SKIP_TO_NUL }
+      } else if lf - pos <= SKIPPED_LINE_BYTES {
+        match keepSkippedLine(d, buf, pos, lf) {
+          case Ok(_) -> ()
+          case Err(e) -> return Err(e)
+        }
+      }
+      pos = lf + 1
+    } else if d.skipMode == SKIP_COUNTED {
+      val available = buf.length - pos
+      if d.skipLeft > 0 {
+        val drop = if available < d.skipLeft { available } else { d.skipLeft }
+        d.skipLeft = d.skipLeft - drop
+        pos = pos + drop
+      }
+      if d.skipLeft > 0 or pos >= buf.length {
+        consume(d, pos)
+        return Ok(None)
+      }
+      if buf[pos] != NUL {
+        return Err("a STOMP frame body is not followed by a NUL byte")
+      }
+      consume(d, pos + 1)
+      return Ok(Some(value = finishSkip(d)))
+    } else {
+      while pos < buf.length and buf[pos] != NUL {
+        pos += 1
+      }
+      if pos >= buf.length {
+        consume(d, pos)
+        return Ok(None)
+      }
+      consume(d, pos + 1)
+      return Ok(Some(value = finishSkip(d)))
+    }
+  }
+  Ok(None)
+}
+
+/// The next frame, `Ok(None)` when more bytes are needed. A frame over a
+/// limit is reported as `TooLarge` once all of it has been read and dropped;
+/// the frames after it decode as usual. An `Err` is a protocol violation: the
+/// stream cannot be resynchronised after it.
+pub func nextDecoded(d: in Decoder): Result[Option[Decoded], String] {
+  if d.skipMode != SKIP_NONE {
+    absorbChunks(d)
+    return continueSkip(d)
+  }
   if d.buffer.length + d.chunkBytes < d.need {
     return Ok(None)
   }
@@ -311,7 +524,7 @@ pub func nextFrame(d: in Decoder): Result[Option[Frame], String] {
   }
   if pos > 0 {
     consume(d, pos)
-    return nextFrame(d)
+    return nextDecoded(d)
   }
   if buf.length == 0 {
     return Ok(None)
@@ -336,13 +549,13 @@ pub func nextFrame(d: in Decoder): Result[Option[Frame], String] {
     }
     i += 1
   }
-  if bodyStart < 0 {
-    if buf.length >= MAX_HEADER_BYTES {
-      return Err("a STOMP frame's headers exceed " + MAX_HEADER_BYTES.toString() + " bytes")
-    }
+  if bodyStart < 0 and buf.length < MAX_HEADER_BYTES {
     return Ok(None)
   }
   if lineStarts.count == 0 {
+    if bodyStart < 0 {
+      return Err("a STOMP frame's command line exceeds " + MAX_HEADER_BYTES.toString() + " bytes")
+    }
     return Err("a STOMP frame has no command line")
   }
   val command = match lineText(buf, lineStarts[0], lineEnds[0]) { case Ok(v) -> v; case Err(e) -> return Err(e) }
@@ -354,21 +567,27 @@ pub func nextFrame(d: in Decoder): Result[Option[Frame], String] {
     headers.add(header)
     n += 1
   }
-  var declared = -1
-  for h in headers.toArray() {
-    if declared < 0 and h.name == "content-length" {
-      declared = match tryParseInt(Str.trim(h.value)) {
-        case Ok(len) -> if len >= 0 { len } else { return Err("a STOMP content-length is negative") }
-        case Err(_) -> return Err("a STOMP content-length is not a number")
-      }
-    }
+  val declared = match declaredLength(headers) { case Ok(v) -> v; case Err(e) -> return Err(e) }
+  if bodyStart < 0 {
+    // The header section runs past the limit: keep what ended within it and
+    // read the rest line by line.
+    beginSkip(d, SKIP_HEADERS, command, headers, declared, "its headers exceed " + MAX_HEADER_BYTES.toString() + " bytes")
+    consume(d, lineStart)
+    return continueSkip(d)
   }
   var bodyEnd = -1
   if declared >= 0 {
     if declared > d.maxFrameBytes {
-      return Err(
-        "a STOMP frame body of " + declared.toString() + " bytes exceeds the limit of " + d.maxFrameBytes.toString()
+      beginSkip(
+        d,
+        SKIP_COUNTED,
+        command,
+        headers,
+        declared,
+        "its body of " + declared.toString() + " bytes exceeds the limit of " + d.maxFrameBytes.toString() + " bytes"
       )
+      consume(d, bodyStart)
+      return continueSkip(d)
     }
     if buf.length < bodyStart + declared + 1 {
       d.need = bodyStart + declared + 1
@@ -388,14 +607,53 @@ pub func nextFrame(d: in Decoder): Result[Option[Frame], String] {
     }
     if bodyEnd < 0 {
       if buf.length - bodyStart > d.maxFrameBytes {
-        return Err("a STOMP frame body exceeds the limit of " + d.maxFrameBytes.toString() + " bytes")
+        beginSkip(
+          d,
+          SKIP_TO_NUL,
+          command,
+          headers,
+          -1,
+          "its body exceeds the limit of " + d.maxFrameBytes.toString() + " bytes"
+        )
+        consume(d, buf.length)
+        return Ok(None)
       }
       d.scanned = buf.length
       d.need = buf.length + 1
       return Ok(None)
     }
+    if bodyEnd - bodyStart > d.maxFrameBytes {
+      beginSkip(
+        d,
+        SKIP_TO_NUL,
+        command,
+        headers,
+        -1,
+        "its body exceeds the limit of " + d.maxFrameBytes.toString() + " bytes"
+      )
+      consume(d, bodyEnd + 1)
+      return Ok(Some(value = finishSkip(d)))
+    }
   }
   val frame = Frame(command = command, headers = headers.toArray(), body = buf.slice(bodyStart, bodyEnd))
   consume(d, bodyEnd + 1)
-  Ok(Some(value = frame))
+  Ok(Some(value = Complete(frame = frame)))
+}
+
+/// `nextDecoded` for a caller that has no use for a frame over a limit: such
+/// a frame is an `Err` naming it. The stream is still in step after that
+/// `Err`, but a caller that cannot tell it from a protocol violation should
+/// give the connection up.
+pub func nextFrame(d: in Decoder): Result[Option[Frame], String] {
+  match nextDecoded(d) {
+    case Err(e) -> Err(e)
+    case Ok(None) -> Ok(None)
+    case Ok(Some(item)) -> match item {
+      case Complete(frame) -> Ok(Some(value = frame))
+      case TooLarge(skipped) -> Err(
+        "a STOMP " + skipped.command + " frame was skipped: " +
+          skipped.reason
+      )
+    }
+  }
 }

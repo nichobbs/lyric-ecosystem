@@ -2,8 +2,8 @@
 //! `Mq.QueueConsumer`, over a pure-Lyric STOMP 1.2 client.
 //!
 //! One `ActiveMqQueue` is one connection to the broker's STOMP connector
-//! (plain TCP for `stomp://`, TLS for `stomp+ssl://`) and one destination. It implements both interfaces, so the same value
-//! publishes and consumes.
+//! (plain TCP for `stomp://`, TLS for `stomp+ssl://`) and one destination. It
+//! implements both interfaces, so the same value publishes and consumes.
 //!
 //!   import Mq.ActiveMq
 //!
@@ -26,7 +26,16 @@
 //!   another producer (no `lyric_id`) is delivered with its broker
 //!   `message-id` as the id and its application headers as the headers.
 //! - The first `consume` subscribes with `ack:client-individual`. `ack` sends
-//!   `ACK` for that one delivery.
+//!   `ACK` for that one delivery. A delivery is forgotten once the broker has
+//!   confirmed its settlement; after a refused one it can be settled again.
+//! - `consume(timeoutMs, ...)` returns `Err("timeout")` when no message could
+//!   be handed to the handler within `timeoutMs`, counted from the call: the
+//!   wait for the connection's lock and for the subscription's receipt are
+//!   part of it.
+//! - A message this client cannot hand to a handler (a body that is not
+//!   UTF-8, malformed `lyric_` headers, a body over `maxFrameBytes` or headers
+//!   over 64 KiB) is reported by `consume` as an `Err` and, by default, left
+//!   unacknowledged on the broker; `onUndeliverable` chooses.
 //! - `nack(id, false)` sends `NACK`. ActiveMQ treats a STOMP `NACK` as a
 //!   poison acknowledgement: the message is never redelivered; a persistent
 //!   message moves to the dead-letter queue (`ActiveMQ.DLQ` unless the broker
@@ -52,6 +61,11 @@
 //! connection's lock one at a time, and a blocked `consume` releases it every
 //! 100 ms so a publisher on another thread is not held for the whole wait.
 //! The handler runs outside the lock and may call `ack` / `nack` itself.
+//!
+//! An `ERROR` frame that carries the `receipt-id` of the request in flight
+//! fails that request and leaves the connection usable. Any other `ERROR`
+//! frame cannot be attributed, so the connection is treated as lost, as
+//! STOMP 1.2 has the broker close it after an `ERROR`.
 //!
 //! There is no automatic reconnect. After a transport failure every operation
 //! returns `Err`; open a new connection.
@@ -142,6 +156,21 @@ pub func plainTcp(): TlsOptions {
   )
 }
 
+/// What `consume` does with a message it cannot hand to a handler: a body that
+/// is not UTF-8 text, malformed `lyric_headers` or `lyric_delivery_count`, a
+/// body over `maxFrameBytes`, or a header section over 64 KiB.
+pub enum UndeliverablePolicy {
+  /// Leave it unacknowledged and report it. Nothing is lost: the broker
+  /// redelivers it when this connection closes, and the application may
+  /// settle it by the broker id the error names. Until then it occupies one
+  /// place of the subscription's prefetch window.
+  case LeaveUnacknowledged
+  /// Send `NACK` and report it. ActiveMQ moves a persistent message to its
+  /// dead-letter queue and discards a non-persistent one, so this destroys
+  /// or diverts messages meant for other consumers of a shared queue.
+  case RejectToBroker
+}
+
 /// How to reach a broker and which destination to use.
 pub record ConnectOptions {
   host: String
@@ -155,7 +184,9 @@ pub record ConnectOptions {
   destination: String
   /// `Manual` (the default): the application calls `ack` / `nack`. `Auto`:
   /// `consume` acknowledges when the handler returns `Ok` and requeues when it
-  /// returns `Err`; `ack` and `nack` are then no-ops.
+  /// returns `Err`; `ack` and `nack` are then no-ops, except for a delivery
+  /// `consume` could not settle (the broker refused the settlement, or the
+  /// message was undeliverable).
   ackMode: Mq.AckMode
   /// Whether published messages are persistent (survive a broker restart and
   /// are dead-lettered rather than discarded on `nack(id, false)`).
@@ -168,18 +199,23 @@ pub record ConnectOptions {
   /// Milliseconds to wait for the TCP connection, and again for the TLS
   /// handshake of a TLS connection; 0 = the system's limit.
   connectTimeoutMs: Int
-  /// Milliseconds to wait for the broker to answer a frame.
+  /// Milliseconds to wait for the broker to answer a frame, and the longest
+  /// a write may make no progress because the broker is not reading.
   requestTimeoutMs: Int
-  /// The largest message body accepted from the broker, in bytes.
+  /// The largest message body accepted from the broker, in bytes. A larger
+  /// message is read past without being kept, and handled as
+  /// `onUndeliverable` says; the connection stays usable.
   maxFrameBytes: Int
+  /// What to do with a message that cannot be handed to a handler.
+  onUndeliverable: UndeliverablePolicy
   /// TLS settings; `plainTcp()` for a `stomp://` connector.
   tls: TlsOptions
 }
 
 /// Options for `destination` on `host:port` with the defaults: plain TCP, no
 /// credentials, manual acknowledgement, persistent messages, a 10 s connect
-/// and request timeout and a 16 MiB frame limit. Adjust with `.copy(...)`
-/// and the `with...` functions below.
+/// and request timeout, a 16 MiB frame limit and undeliverable messages left
+/// on the broker. Adjust with `.copy(...)` and the `with...` functions below.
 pub func defaultOptions(host: in String, port: in Int, destination: in String): ConnectOptions {
   ConnectOptions(
     host = host,
@@ -195,6 +231,7 @@ pub func defaultOptions(host: in String, port: in Int, destination: in String): 
     connectTimeoutMs = 10000,
     requestTimeoutMs = 10000,
     maxFrameBytes = 16777216,
+    onUndeliverable = UndeliverablePolicy.LeaveUnacknowledged,
     tls = plainTcp()
   )
 }
@@ -258,6 +295,12 @@ pub record Delivery {
   ackId: String
   frame: Stomp.Frame
   deliveryCount: Int
+  // False for a message that was too large to read: there is no body to copy.
+  requeueable: Bool
+  // In `Auto` mode: `ack` / `nack` act on this delivery, because `consume`
+  // will not settle it (it was never handed to a handler, or its automatic
+  // settlement was refused).
+  byHand: Bool
 }
 
 /// An open connection to one ActiveMQ destination. Obtain one from
@@ -272,8 +315,15 @@ pub ref record ActiveMqQueue {
   var closed: Bool
   var subscribed: Bool
   var counter: Int
-  var backlog: List[Stomp.Frame]
+  var backlog: List[Stomp.Decoded]
   var inFlight: Map[String, List[Delivery]]
+  // The receipt of a SUBSCRIBE the broker has not answered yet ("" = none),
+  // and the time by which it must.
+  var subscribeReceipt: String
+  var subscribeDeadline: Long
+  // The broker's refusal of the SUBSCRIBE, kept for the next `consume` when
+  // it arrived while another request was waiting.
+  var subscribeFailure: String
 }
 
 val EMPTY_ID: String = "activemq: empty message id"
@@ -289,17 +339,22 @@ func header(name: in String, value: in String): Stomp.Header {
 }
 
 // The broker's explanation in an ERROR frame: the `message` header, or the
-// first line of the body when the header is absent.
-func errorText(frame: in Stomp.Frame): String {
+// first line of the body when the header is absent; "" when it gives none.
+func errorDetail(frame: in Stomp.Frame): String {
   val summary = Stomp.headerOr(frame, "message", "")
   if summary.length > 0 {
-    return "activemq: broker error: " + summary
+    return summary
   }
   val body = match Stomp.bodyText(frame) { case Some(s) -> s; case None -> "" }
   val lineEnd = Str.indexOfRaw(body, "\n")
   val first = if lineEnd < 0 { body } else { Str.substring(body, 0, lineEnd) }
-  if first.length > 0 {
-    "activemq: broker error: " + Str.trim(first)
+  Str.trim(first)
+}
+
+func errorText(frame: in Stomp.Frame): String {
+  val detail = errorDetail(frame)
+  if detail.length > 0 {
+    "activemq: broker error: " + detail
   } else {
     "activemq: broker error"
   }
@@ -326,7 +381,7 @@ func checkUsable(q: in ActiveMqQueue): Result[Unit, String] {
 
 func writeFrame(q: in ActiveMqQueue, frame: in Stomp.Frame): Result[Unit, String] {
   val bytes = match Stomp.encodeFrame(frame) { case Ok(b) -> b; case Err(e) -> return Err("activemq: " + e) }
-  match K.sockWrite(q.sock, bytes) {
+  match K.sockWriteWithin(q.sock, bytes, q.options.requestTimeoutMs) {
     case Ok(_) -> Ok(())
     case Err(e) -> Err(markLost(q, e))
   }
@@ -334,12 +389,12 @@ func writeFrame(q: in ActiveMqQueue, frame: in Stomp.Frame): Result[Unit, String
 
 // The next frame, waiting at most `timeoutMs` for it (0 = only what has
 // already arrived). `Ok(None)` is a timeout.
-func readFrame(q: in ActiveMqQueue, timeoutMs: in Int): Result[Option[Stomp.Frame], String] {
+func readFrame(q: in ActiveMqQueue, timeoutMs: in Int): Result[Option[Stomp.Decoded], String] {
   val deadline = K.monotonicMillis() + timeoutMs.toLong()
   while true {
-    match Stomp.nextFrame(q.decoder) {
+    match Stomp.nextDecoded(q.decoder) {
       case Err(e) -> return Err(markLost(q, e))
-      case Ok(Some(frame)) -> return Ok(Some(value = frame))
+      case Ok(Some(item)) -> return Ok(Some(value = item))
       case Ok(None) -> ()
     }
     val remaining = deadline - K.monotonicMillis()
@@ -359,26 +414,79 @@ func nextToken(q: in ActiveMqQueue, prefix: in String): String {
   prefix + "-" + q.counter.toString()
 }
 
-// Wait for the RECEIPT named `receiptId`. Messages that arrive meanwhile are
-// kept for `consume`; an ERROR frame fails the request.
+// Act on a frame from the broker while `awaited` is the receipt the caller
+// waits for ("" = none). `Ok(true)`: that receipt arrived. `Err`: the broker
+// refused the awaited request (the connection stays usable), or the
+// connection is lost.
+//
+// A MESSAGE is kept for `consume`. The receipt or refusal of a SUBSCRIBE that
+// an earlier `consume` did not wait for is recorded. An ERROR frame is the
+// awaited request's only when it carries that request's `receipt-id`; one
+// that does not answers some frame sent without a receipt, or nothing this
+// client sent, and STOMP 1.2 has the broker close the connection after it.
+func route(q: in ActiveMqQueue, item: in Stomp.Decoded, awaited: in String): Result[Bool, String] {
+  val frame = match item {
+    case Complete(f) -> f
+    case TooLarge(skipped) -> {
+      if skipped.command == "MESSAGE" {
+        q.backlog.add(item)
+        return Ok(false)
+      }
+      return Err(markLost(q, "the broker sent a " + skipped.command + " frame this client cannot read: " + skipped.reason))
+    }
+  }
+  if frame.command == "MESSAGE" {
+    q.backlog.add(item)
+    return Ok(false)
+  }
+  val receiptId = Stomp.headerOr(frame, "receipt-id", "")
+  val answersSubscribe = receiptId.length > 0 and receiptId == q.subscribeReceipt
+  val answersAwaited = receiptId.length > 0 and receiptId == awaited
+  if frame.command == "RECEIPT" {
+    if answersSubscribe {
+      q.subscribeReceipt = ""
+      q.subscribed = true
+    }
+    return Ok(answersAwaited)
+  }
+  if frame.command != "ERROR" {
+    return Ok(false)
+  }
+  if answersSubscribe {
+    q.subscribeReceipt = ""
+    if not answersAwaited {
+      q.subscribeFailure = errorText(frame)
+      return Ok(false)
+    }
+  }
+  if answersAwaited {
+    return Err(errorText(frame))
+  }
+  val detail = errorDetail(frame)
+  Err(
+    markLost(
+      q,
+      "the broker sent an ERROR frame that answers no request in flight" +
+        (if detail.length > 0 { ": " + detail } else { "" })
+    )
+  )
+}
+
+// Wait for the RECEIPT named `receiptId`.
 func awaitReceipt(q: in ActiveMqQueue, receiptId: in String, timeoutMs: in Int): Result[Unit, String] {
   val deadline = K.monotonicMillis() + timeoutMs.toLong()
   while true {
     val remaining = deadline - K.monotonicMillis()
     val wait = if remaining <= 0i64 { 0 } else { remaining.toInt() }
-    val frame = match readFrame(q, wait) {
+    val item = match readFrame(q, wait) {
       case Err(e) -> return Err(e)
       case Ok(None) -> return Err(markLost(q, "the broker did not answer within " + timeoutMs.toString() + " ms"))
-      case Ok(Some(f)) -> f
+      case Ok(Some(i)) -> i
     }
-    if frame.command == "RECEIPT" {
-      if Stomp.headerOr(frame, "receipt-id", "") == receiptId {
-        return Ok(())
-      }
-    } else if frame.command == "MESSAGE" {
-      q.backlog.add(frame)
-    } else if frame.command == "ERROR" {
-      return Err(errorText(frame))
+    match route(q, item, receiptId) {
+      case Err(e) -> return Err(e)
+      case Ok(true) -> return Ok(())
+      case Ok(false) -> ()
     }
   }
   Ok(())
@@ -552,7 +660,10 @@ pub func connectWith(options: in ConnectOptions): Result[ActiveMqQueue, String] 
     subscribed = false,
     counter = 0,
     backlog = newList(),
-    inFlight = newMap()
+    inFlight = newMap(),
+    subscribeReceipt = "",
+    subscribeDeadline = 0i64,
+    subscribeFailure = ""
   )
   val headers: List[Stomp.Header] = newList()
   headers.add(header("accept-version", "1.2"))
@@ -567,12 +678,29 @@ pub func connectWith(options: in ConnectOptions): Result[ActiveMqQueue, String] 
     case Ok(_) -> ()
   }
   val answer = match readFrame(q, options.requestTimeoutMs) {
-    case Err(e) -> return Err(e)
+    // ActiveMQ refuses a login with an ERROR frame and closes the connection
+    // at once; now and then the close overtakes the frame, or cuts a TLS
+    // record short, and the refusal arrives as a bare close or a read error.
+    case Err(_) -> return Err(
+      "activemq: connection lost: " + endpoint +
+        " ended the connection during login without a readable answer; a broker does that when it refuses the login or passcode (" +
+        q.lost +
+        ")"
+    )
     case Ok(None) -> {
       K.sockClose(sock)
       return Err("activemq: " + endpoint + " did not answer CONNECT within " + options.requestTimeoutMs.toString() + " ms")
     }
-    case Ok(Some(f)) -> f
+    case Ok(Some(item)) -> match item {
+      case Complete(f) -> f
+      case TooLarge(skipped) -> {
+        K.sockClose(sock)
+        return Err(
+          "activemq: " + endpoint + " answered CONNECT with a " + skipped.command + " frame this client cannot read: " +
+            skipped.reason
+        )
+      }
+    }
   }
   if answer.command == "ERROR" {
     K.sockClose(sock)
@@ -685,6 +813,8 @@ func tlsFromEnv(base: in ConnectOptions): Result[ConnectOptions, String] {
 /// - `LYRIC_CONFIG_MQ_ACTIVEMQ_URL`: the broker URL (required)
 /// - `LYRIC_CONFIG_MQ_ACTIVEMQ_QUEUENAME`: the queue or destination (required)
 /// - `LYRIC_CONFIG_MQ_ACTIVEMQ_ACKMODE`: `Manual` (default) or `Auto`
+/// - `LYRIC_CONFIG_MQ_ACTIVEMQ_ONUNDELIVERABLE`: `Leave` (default) or
+///   `Reject`, the `onUndeliverable` option
 ///
 /// and, for a `stomp+ssl://` URL:
 ///
@@ -716,8 +846,16 @@ pub func connectFromEnv(): Result[ActiveMqQueue, String] {
   } else {
     return Err("activemq: LYRIC_CONFIG_MQ_ACTIVEMQ_ACKMODE must be Manual or Auto")
   }
+  val policyText = Str.toLower(envOr("ONUNDELIVERABLE", "leave"))
+  val policy = if policyText == "leave" {
+    UndeliverablePolicy.LeaveUnacknowledged
+  } else if policyText == "reject" {
+    UndeliverablePolicy.RejectToBroker
+  } else {
+    return Err("activemq: LYRIC_CONFIG_MQ_ACTIVEMQ_ONUNDELIVERABLE must be Leave or Reject")
+  }
   val base = match optionsFromUrl(url, queueName) { case Ok(o) -> o; case Err(e) -> return Err(e) }
-  match tlsFromEnv(base.copy(ackMode = mode)) {
+  match tlsFromEnv(base.copy(ackMode = mode, onUndeliverable = policy)) {
     case Ok(options) -> connectWith(options)
     case Err(e) -> Err(e)
   }
@@ -769,6 +907,16 @@ func sendHeaders(q: in ActiveMqQueue, message: in Mq.Message, extra: in slice[St
   headers
 }
 
+// A consumer refuses a negative `lyric_delivery_count`, so none is sent.
+func checkDeliveryCount(message: in Mq.Message): Result[Unit, String] {
+  if message.deliveryCount < 0 {
+    return Err(
+      "activemq: message '" + message.id + "' has the negative deliveryCount " + message.deliveryCount.toString()
+    )
+  }
+  Ok(())
+}
+
 /// Publish `message` with extra STOMP headers on the `SEND` frame (ActiveMQ
 /// stores unknown headers as JMS properties). A header in `extra` replaces the
 /// one this client would send under the same name. `Mq.ActiveMq.Extras` builds
@@ -778,6 +926,10 @@ pub func publishWithHeaders(
 ): Result[Unit, String] {
   if message.id.length == 0 {
     return Err(EMPTY_ID)
+  }
+  match checkDeliveryCount(message) {
+    case Err(e) -> return Err(e)
+    case Ok(_) -> ()
   }
   K.lockEnter(q.lock)
   defer {
@@ -870,6 +1022,12 @@ impl Mq.MessageQueue for ActiveMqQueue {
     if not allHaveIds(messages) {
       return Err(EMPTY_ID)
     }
+    for m in messages {
+      match checkDeliveryCount(m) {
+        case Err(e) -> return Err(e)
+        case Ok(_) -> ()
+      }
+    }
     K.lockEnter(self.lock)
     defer {
       K.lockExit(self.lock)
@@ -879,31 +1037,72 @@ impl Mq.MessageQueue for ActiveMqQueue {
 }
 
 // ─── Consuming ───────────────────────────────────────────────────────────────
-func subscribeLocked(q: in ActiveMqQueue): Result[Unit, String] {
+func millisUntil(deadline: in Long): Int {
+  val remaining = deadline - K.monotonicMillis()
+  if remaining <= 0i64 {
+    0
+  } else {
+    remaining.toInt()
+  }
+}
+
+// Open the subscription, waiting at most `waitMs` for the broker to confirm
+// it. `Ok(false)`: the SUBSCRIBE is on its way but not confirmed yet; a later
+// call goes on waiting for the same receipt, which has `requestTimeoutMs`
+// from the moment the frame was sent.
+func subscribeLocked(q: in ActiveMqQueue, waitMs: in Int): Result[Bool, String] {
   match checkUsable(q) {
     case Err(e) -> return Err(e)
     case Ok(_) -> ()
   }
   if q.subscribed {
-    return Ok(())
+    return Ok(true)
   }
-  val headers: List[Stomp.Header] = newList()
-  headers.add(header("id", SUBSCRIPTION_ID))
-  headers.add(header("destination", q.options.destination))
-  headers.add(header("ack", "client-individual"))
-  if q.options.selector.length > 0 {
-    headers.add(header("selector", q.options.selector))
+  if q.subscribeFailure.length > 0 {
+    val refusal = q.subscribeFailure
+    q.subscribeFailure = ""
+    return Err(refusal)
   }
-  if q.options.prefetchSize > 0 {
-    headers.add(header("activemq.prefetchSize", q.options.prefetchSize.toString()))
+  val waitUntil = K.monotonicMillis() + waitMs.toLong()
+  if q.subscribeReceipt.length == 0 {
+    val receiptId = nextToken(q, "lyric-r")
+    val headers: List[Stomp.Header] = newList()
+    headers.add(header("id", SUBSCRIPTION_ID))
+    headers.add(header("destination", q.options.destination))
+    headers.add(header("ack", "client-individual"))
+    if q.options.selector.length > 0 {
+      headers.add(header("selector", q.options.selector))
+    }
+    if q.options.prefetchSize > 0 {
+      headers.add(header("activemq.prefetchSize", q.options.prefetchSize.toString()))
+    }
+    headers.add(header("receipt", receiptId))
+    match send(q, "SUBSCRIBE", headers, noBody()) {
+      case Err(e) -> return Err(e)
+      case Ok(_) -> ()
+    }
+    q.subscribeReceipt = receiptId
+    q.subscribeDeadline = K.monotonicMillis() + q.options.requestTimeoutMs.toLong()
   }
-  match request(q, "SUBSCRIBE", headers, noBody()) {
-    case Err(e) -> Err(e)
-    case Ok(_) -> {
-      q.subscribed = true
-      Ok(())
+  val receiptId = q.subscribeReceipt
+  while not q.subscribed {
+    val limit = if waitUntil < q.subscribeDeadline { waitUntil } else { q.subscribeDeadline }
+    val item = match readFrame(q, millisUntil(limit)) {
+      case Err(e) -> return Err(e)
+      case Ok(None) -> {
+        if K.monotonicMillis() >= q.subscribeDeadline {
+          return Err(markLost(q, "the broker did not answer SUBSCRIBE within " + q.options.requestTimeoutMs.toString() + " ms"))
+        }
+        return Ok(false)
+      }
+      case Ok(Some(i)) -> i
+    }
+    match route(q, item, receiptId) {
+      case Err(e) -> return Err(e)
+      case Ok(_) -> ()
     }
   }
+  Ok(true)
 }
 
 /// Open the subscription now instead of on the first `consume`. A topic only
@@ -914,45 +1113,45 @@ pub func subscribe(q: in ActiveMqQueue): Result[Unit, String] {
   defer {
     K.lockExit(q.lock)
   }
-  subscribeLocked(q)
+  match subscribeLocked(q, q.options.requestTimeoutMs) {
+    case Err(e) -> Err(e)
+    case Ok(true) -> Ok(())
+    case Ok(false) -> Err(
+      markLost(
+        q,
+        "the broker did not answer SUBSCRIBE within " + q.options.requestTimeoutMs.toString() + " ms"
+      )
+    )
+  }
 }
 
-// The next MESSAGE frame, from the backlog or the wire, within `waitMs`.
-func nextMessageLocked(q: in ActiveMqQueue, waitMs: in Int): Result[Option[Stomp.Frame], String] {
-  match subscribeLocked(q) {
-    case Err(e) -> return Err(e)
-    case Ok(_) -> ()
-  }
-  if q.backlog.count > 0 {
-    val frame = q.backlog[0]
-    q.backlog.removeAt(0)
-    return Ok(Some(value = frame))
-  }
+func takeBacklog(q: in ActiveMqQueue): Stomp.Decoded {
+  val item = q.backlog[0]
+  q.backlog.removeAt(0)
+  item
+}
+
+// The next MESSAGE, from the backlog or the wire, within `waitMs`; the wait
+// for the subscription is part of `waitMs`.
+func nextMessageLocked(q: in ActiveMqQueue, waitMs: in Int): Result[Option[Stomp.Decoded], String] {
   val deadline = K.monotonicMillis() + waitMs.toLong()
-  while true {
-    val remaining = deadline - K.monotonicMillis()
-    val wait = if remaining <= 0i64 { 0 } else { remaining.toInt() }
-    val frame = match readFrame(q, wait) {
+  match subscribeLocked(q, waitMs) {
+    case Err(e) -> return Err(e)
+    case Ok(false) -> return Ok(None)
+    case Ok(true) -> ()
+  }
+  while q.backlog.count == 0 {
+    val item = match readFrame(q, millisUntil(deadline)) {
       case Err(e) -> return Err(e)
       case Ok(None) -> return Ok(None)
-      case Ok(Some(f)) -> f
+      case Ok(Some(i)) -> i
     }
-    if frame.command == "MESSAGE" {
-      return Ok(Some(value = frame))
-    }
-    if frame.command == "ERROR" {
-      return Err(errorText(frame))
+    match route(q, item, "") {
+      case Err(e) -> return Err(e)
+      case Ok(_) -> ()
     }
   }
-  Ok(None)
-}
-
-func nextMessage(q: in ActiveMqQueue, waitMs: in Int): Result[Option[Stomp.Frame], String] {
-  K.lockEnter(q.lock)
-  defer {
-    K.lockExit(q.lock)
-  }
-  nextMessageLocked(q, waitMs)
+  Ok(Some(value = takeBacklog(q)))
 }
 
 // Headers the broker or this client put on a MESSAGE frame; everything else
@@ -1026,13 +1225,61 @@ func ackHeaders(ackId: in String): List[Stomp.Header] {
   headers
 }
 
-// Turn a MESSAGE frame into a tracked delivery. A message this client cannot
-// represent is rejected to the dead-letter queue so it does not block the
-// destination, and reported as an `Err`.
-func admit(q: in ActiveMqQueue, frame: in Stomp.Frame): Result[Mq.Message, String] {
-  K.lockEnter(q.lock)
-  defer {
-    K.lockExit(q.lock)
+func track(q: in ActiveMqQueue, id: in String, delivery: in Delivery): Unit {
+  if q.inFlight.containsKey(id) {
+    q.inFlight[id].add(delivery)
+  } else {
+    val waiting: List[Delivery] = newList()
+    waiting.add(delivery)
+    q.inFlight[id] = waiting
+  }
+}
+
+// A MESSAGE that cannot be handed to a handler: apply `onUndeliverable` and
+// report it. Unless the broker took the rejection, the delivery is tracked
+// under the broker's `message-id`, so the application can settle it.
+func refuseDelivery(
+  q: in ActiveMqQueue, frame: in Stomp.Frame, why: in String, requeueable: in Bool
+): Result[Mq.Message, String] {
+  val ackId = Stomp.headerOr(frame, "ack", "")
+  if ackId.length == 0 {
+    return Err(markLost(q, "the broker sent a MESSAGE without an ack header"))
+  }
+  val brokerId = Stomp.headerOr(frame, "message-id", "")
+  if brokerId.length == 0 {
+    return Err(markLost(q, "the broker sent a MESSAGE without a message-id header"))
+  }
+  val delivery = Delivery(ackId = ackId, frame = frame, deliveryCount = 0, requeueable = requeueable, byHand = true)
+  val problem = "activemq: message " + brokerId + " cannot be delivered: " + why
+  val settleHint = "ack or nack the id " + brokerId + " to settle it"
+  match q.options.onUndeliverable {
+    case RejectToBroker -> match request(q, "NACK", ackHeaders(ackId), noBody()) {
+      case Ok(_) -> Err(problem + "; it was rejected to the broker's dead-letter handling")
+      case Err(e) -> {
+        track(q, brokerId, delivery)
+        Err(problem + "; rejecting it failed (" + e + "), so it is left unacknowledged on the broker; " + settleHint)
+      }
+    }
+    case LeaveUnacknowledged -> {
+      track(q, brokerId, delivery)
+      Err(
+        problem + "; it was left unacknowledged on the broker, which redelivers it when this connection closes; " +
+          settleHint
+      )
+    }
+  }
+}
+
+// Turn what the broker sent into a tracked delivery for the handler.
+func admitLocked(q: in ActiveMqQueue, item: in Stomp.Decoded): Result[Mq.Message, String] {
+  val frame = match item {
+    case Complete(f) -> f
+    case TooLarge(skipped) -> return refuseDelivery(
+      q,
+      Stomp.Frame(command = skipped.command, headers = skipped.headers, body = noBody()),
+      skipped.reason + " accepted by this connection",
+      false
+    )
   }
   val ackId = Stomp.headerOr(frame, "ack", "")
   if ackId.length == 0 {
@@ -1040,41 +1287,57 @@ func admit(q: in ActiveMqQueue, frame: in Stomp.Frame): Result[Mq.Message, Strin
   }
   val message = match decodeMessage(frame) {
     case Ok(m) -> m
-    case Err(why) -> {
-      val brokerId = Stomp.headerOr(frame, "message-id", "?")
-      val outcome = match request(q, "NACK", ackHeaders(ackId), noBody()) {
-        case Ok(_) -> "; it was rejected to the broker's dead-letter handling"
-        case Err(e) -> "; rejecting it failed: " + e
-      }
-      return Err("activemq: message " + brokerId + " cannot be delivered: " + why + outcome)
-    }
+    case Err(why) -> return refuseDelivery(q, frame, why, true)
   }
   if message.id.length == 0 {
     return Err(markLost(q, "the broker sent a MESSAGE without a message-id header"))
   }
-  val delivery = Delivery(ackId = ackId, frame = frame, deliveryCount = message.deliveryCount)
-  if q.inFlight.containsKey(message.id) {
-    q.inFlight[message.id].add(delivery)
-  } else {
-    val waiting: List[Delivery] = newList()
-    waiting.add(delivery)
-    q.inFlight[message.id] = waiting
-  }
+  track(
+    q,
+    message.id,
+    Delivery(ackId = ackId, frame = frame, deliveryCount = message.deliveryCount, requeueable = true, byHand = false)
+  )
   Ok(message)
 }
 
-// The oldest unsettled delivery of `messageId`, removed from the in-flight set.
-func takeDelivery(q: in ActiveMqQueue, messageId: in String): Result[Delivery, String] {
+// The next message for a handler, `Ok(None)` when none could be had before
+// `deadline`: the lock was not free, the subscription is not confirmed yet,
+// or nothing arrived. One call waits at most one slice for the wire, so the
+// lock is given up between slices.
+func nextDelivery(q: in ActiveMqQueue, deadline: in Long): Result[Option[Mq.Message], String] {
+  if not K.lockTryEnter(q.lock, millisUntil(deadline)) {
+    return Ok(None)
+  }
+  defer {
+    K.lockExit(q.lock)
+  }
+  val remaining = millisUntil(deadline)
+  val item = match nextMessageLocked(q, if remaining > WAIT_SLICE_MS { WAIT_SLICE_MS } else { remaining }) {
+    case Err(e) -> return Err(e)
+    case Ok(None) -> return Ok(None)
+    case Ok(Some(i)) -> i
+  }
+  match admitLocked(q, item) {
+    case Ok(message) -> Ok(Some(value = message))
+    case Err(e) -> Err(e)
+  }
+}
+
+// The oldest unsettled delivery of `messageId`. It stays in the in-flight
+// set until `forgetDelivery`.
+func oldestDelivery(q: in ActiveMqQueue, messageId: in String): Result[Delivery, String] {
   if not q.inFlight.containsKey(messageId) {
     return Err("activemq: no unsettled delivery has message id '" + messageId + "'")
   }
+  Ok(q.inFlight[messageId][0])
+}
+
+func forgetDelivery(q: in ActiveMqQueue, messageId: in String): Unit {
   val waiting = q.inFlight[messageId]
-  val delivery = waiting[0]
   waiting.removeAt(0)
   if waiting.count == 0 {
     q.inFlight.remove(messageId)
   }
-  Ok(delivery)
 }
 
 // Headers of a delivered message that must not be copied onto its requeued
@@ -1125,7 +1388,11 @@ func requeueLocked(q: in ActiveMqQueue, delivery: in Delivery): Result[Unit, Str
 }
 
 // Settle the oldest delivery of `messageId`: 0 = ack, 1 = reject, 2 = requeue.
-func settle(q: in ActiveMqQueue, messageId: in String, how: in Int): Result[Unit, String] {
+// The delivery is forgotten only when the broker has confirmed the
+// settlement. After a refusal it stays unsettled, here as on the broker, and
+// can be settled again; `automatic` (the settlement `consume` does in `Auto`
+// mode) then hands it over to `ack` / `nack`.
+func settle(q: in ActiveMqQueue, messageId: in String, how: in Int, automatic: in Bool): Result[Unit, String] {
   if messageId.length == 0 {
     return Err(EMPTY_ID)
   }
@@ -1137,14 +1404,53 @@ func settle(q: in ActiveMqQueue, messageId: in String, how: in Int): Result[Unit
     case Err(e) -> return Err(e)
     case Ok(_) -> ()
   }
-  val delivery = match takeDelivery(q, messageId) { case Ok(d) -> d; case Err(e) -> return Err(e) }
-  if how == 0 {
+  val delivery = match oldestDelivery(q, messageId) { case Ok(d) -> d; case Err(e) -> return Err(e) }
+  val outcome = if how == 0 {
     request(q, "ACK", ackHeaders(delivery.ackId), noBody())
   } else if how == 1 {
     request(q, "NACK", ackHeaders(delivery.ackId), noBody())
+  } else if not delivery.requeueable {
+    Err(
+      "activemq: message " + messageId +
+        " was too large to be read, so there is nothing to requeue; ack it or reject it with nack(id, false)"
+    )
   } else {
     requeueLocked(q, delivery)
   }
+  match outcome {
+    case Ok(_) -> {
+      forgetDelivery(q, messageId)
+      Ok(())
+    }
+    case Err(e) -> {
+      if automatic and not delivery.byHand {
+        q.inFlight[messageId][0] = delivery.copy(byHand = true)
+      }
+      Err(e)
+    }
+  }
+}
+
+// In `Auto` mode: whether `ack` / `nack` must act on `messageId`, because its
+// oldest unsettled delivery is one `consume` will not settle.
+func settledByHand(q: in ActiveMqQueue, messageId: in String): Bool {
+  K.lockEnter(q.lock)
+  defer {
+    K.lockExit(q.lock)
+  }
+  match oldestDelivery(q, messageId) {
+    case Ok(delivery) -> delivery.byHand
+    case Err(_) -> false
+  }
+}
+
+// `ack` / `nack`: in `Auto` mode they do nothing, except for a delivery
+// `consume` will not settle.
+func settleByCaller(q: in ActiveMqQueue, messageId: in String, how: in Int): Result[Unit, String] {
+  if messageId.length > 0 and isAuto(q) and not settledByHand(q, messageId) {
+    return Ok(())
+  }
+  settle(q, messageId, how, false)
 }
 
 func isAuto(q: in ActiveMqQueue): Bool {
@@ -1162,11 +1468,12 @@ func closeLocked(q: in ActiveMqQueue): Unit {
   if q.lost.length > 0 {
     return
   }
-  if q.subscribed {
+  if q.subscribed or q.subscribeReceipt.length > 0 {
     val headers: List[Stomp.Header] = newList()
     headers.add(header("id", SUBSCRIPTION_ID))
     val _ = send(q, "UNSUBSCRIBE", headers, noBody())
     q.subscribed = false
+    q.subscribeReceipt = ""
   }
   if q.lost.length == 0 {
     val receiptId = nextToken(q, "lyric-r")
@@ -1190,31 +1497,22 @@ impl Mq.QueueConsumer for ActiveMqQueue {
     val deadline = K.monotonicMillis() + timeoutMs.toLong()
     var first = true
     while true {
-      val remaining = deadline - K.monotonicMillis()
-      if not first and remaining <= 0i64 {
+      if not first and K.monotonicMillis() >= deadline {
         return Err("timeout")
       }
       first = false
-      val wait = if remaining <= 0i64 {
-        0
-      } else if remaining > WAIT_SLICE_MS.toLong() {
-        WAIT_SLICE_MS
-      } else {
-        remaining.toInt()
-      }
-      match nextMessage(self, wait) {
+      match nextDelivery(self, deadline) {
         case Err(e) -> return Err(e)
         case Ok(None) -> ()
-        case Ok(Some(frame)) -> {
-          val message = match admit(self, frame) { case Ok(m) -> m; case Err(e) -> return Err(e) }
+        case Ok(Some(message)) -> {
           val outcome = handler(message)
           if not isAuto(self) {
             return outcome
           }
           match outcome {
-            case Ok(_) -> return settle(self, message.id, 0)
+            case Ok(_) -> return settle(self, message.id, 0, true)
             case Err(e) -> {
-              return match settle(self, message.id, 2) {
+              return match settle(self, message.id, 2, true) {
                 case Ok(_) -> Err(e)
                 case Err(requeueError) -> Err(e + " (and requeueing the message failed: " + requeueError + ")")
               }
@@ -1227,17 +1525,11 @@ impl Mq.QueueConsumer for ActiveMqQueue {
   }
 
   func ack(messageId: in String): Result[Unit, String] {
-    if messageId.length > 0 and isAuto(self) {
-      return Ok(())
-    }
-    return settle(self, messageId, 0)
+    return settleByCaller(self, messageId, 0)
   }
 
   func nack(messageId: in String, requeue: in Bool): Result[Unit, String] {
-    if messageId.length > 0 and isAuto(self) {
-      return Ok(())
-    }
-    return settle(self, messageId, if requeue { 2 } else { 1 })
+    return settleByCaller(self, messageId, if requeue { 2 } else { 1 })
   }
 
   func close(): Unit {

@@ -4,7 +4,8 @@
 //!
 //! The login and passcode are percent-decoded, so a passcode may hold `@`,
 //! `:` or `/` written as `%40`, `%3A`, `%2F`. An IPv6 literal is written in
-//! brackets (`stomp://[::1]:61613`). The port defaults to 61613 for `stomp`
+//! brackets (`stomp://[::1]:61613`); without them it is refused, because its
+//! last group cannot be told from a port. The port defaults to 61613 for `stomp`
 //! and 61614 for `stomp+ssl`, the ports of a stock ActiveMQ. Other schemes
 //! are refused.
 @runtime_checked
@@ -143,6 +144,11 @@ pub func parseUrl(url: in String): Result[BrokerAddress, String] {
     }
   } else {
     val colon = Str.lastIndexOfRaw(rest, ":")
+    if colon >= 0 and Str.indexOfRaw(rest, ":") != colon {
+      // Two colons: an IPv6 address, where the last colon is not a port
+      // separator (`::1` would read as host `::`, port 1).
+      return Err(invalid("an IPv6 address must be written in brackets, as in " + scheme + "://[::1]:" + port.toString()))
+    }
     if colon >= 0 {
       host = Str.substring(rest, 0, colon)
       port = match parsePort(Str.substring(rest, colon + 1)) { case Ok(p) -> p; case Err(e) -> return Err(e) }

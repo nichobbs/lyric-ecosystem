@@ -67,12 +67,13 @@ passed to `publishBatch`, a negative `timeoutMs`. The error texts:
 | the handler's own text | `consume`: the handler returned `Err`; it is passed through unchanged |
 | `activemq: empty message id` | an empty id given to `ack`, `nack`, `publishWithHeaders`, or (on dotnet) inside a `publishBatch` |
 | `activemq: no unsettled delivery has message id '...'` | `ack`/`nack` of an id that was never delivered on this connection, or is already settled |
-| `activemq: broker error: ...` | the broker answered with an `ERROR` frame; the text is its `message` header. The connection stays usable. |
-| `activemq: connection lost: ...` | the transport failed or a request was not confirmed in time; the connection is unusable from here on |
+| `activemq: broker error: ...` | the broker refused this request: an `ERROR` frame carrying the request's `receipt-id` (or the answer to `CONNECT`); the text is its `message` header. The connection stays usable, except after `CONNECT`. |
+| `activemq: connection lost: ...` | the transport failed, a request was not confirmed or a write not taken within `requestTimeoutMs`, the broker sent an `ERROR` frame that answers no request in flight, or the broker ended the connection during login; the connection is unusable from here on |
+| `activemq: message 'ID' has the negative deliveryCount N` | `publish`, `publishBatch`, `publishWithHeaders`: nothing was sent |
 | `activemq: the connection is closed` | any operation after `close` |
 | `activemq: cannot connect to HOST:PORT: ...` | the TCP connection could not be opened |
 | `activemq: TLS handshake with HOST:PORT failed: ...` | the TLS handshake failed or timed out |
-| `activemq: message ID cannot be delivered: ...` | `consume` received a message this client cannot represent and rejected it |
+| `activemq: message ID cannot be delivered: ...` | `consume` received a message it cannot hand to a handler; the text gives the reason, what was done with the message (`onUndeliverable`) and the broker id to settle it by |
 | `activemq: invalid broker URL: ...`, `activemq: TLS ...`, other `activemq: ...` | unusable URL, options, certificate or key; nothing was dialled |
 
 No text contains the passcode or a private key. The part after the last colon of a connect,
@@ -162,7 +163,7 @@ Variations:
       Mq.Message(id = "a-2", body = "second", headers = [], deliveryCount = 0),
       Mq.Message(id = "a-3", body = "third", headers = [], deliveryCount = 0)
     ])?
-    consumer.consume(0, { m -> Ok(()) })
+    consumer.consume(0, { m -> handle(m) })
   }
   ```
 
@@ -234,7 +235,7 @@ stomp+ssl://...                   the same, over TLS
 |---|---|---|
 | scheme | (required) | `stomp` or `stomp+ssl`, in any case. `ssl://`, `stomps://`, `tcp://` and every other scheme are refused. |
 | `login`, `passcode` | none | Percent-decoded as UTF-8, so `@`, `:`, `/` and `%` in a passcode are written `%40`, `%3A`, `%2F`, `%25`. A login without a passcode is accepted; an empty login before `@` is refused. |
-| `host` | (required) | An IPv6 address is written `[::1]` |
+| `host` | (required) | An IPv6 address is written in brackets, `[::1]` or `[::1]:61613`. Without brackets it is refused (`stomp://::1` is not host `::`, port 1). |
 | `port` | 61613 for `stomp`, 61614 for `stomp+ssl` | the ports of a stock ActiveMQ |
 | path, query, fragment | | Refused (one trailing `/` is tolerated). The destination is the separate `queueName` argument, and no option can be set in the URL. |
 
@@ -249,13 +250,14 @@ full STOMP destination taken as written (`/queue/NAME`, `/topic/NAME`). An empty
 | `destination` | (required) | a STOMP destination starting with `/`; a bare name is refused here (use `resolveDestination`) |
 | `login`, `passcode` | empty | credentials; an empty login sends none |
 | `virtualHost` | empty: `host` | the STOMP `host` header |
-| `ackMode` | `Manual` | `Auto`: `consume` acknowledges when the handler returns `Ok` and requeues when it returns `Err`; `ack` and `nack` are then no-ops |
+| `ackMode` | `Manual` | `Auto`: `consume` acknowledges when the handler returns `Ok` and requeues when it returns `Err`; `ack` and `nack` are then no-ops, except for a delivery `consume` could not settle |
 | `persistent` | `true` | delivery mode of messages sent with `publish` and `publishBatch` |
 | `selector` | empty | JMS selector of the subscription |
 | `prefetchSize` | 0 (broker default) | `activemq.prefetchSize` of the subscription; set 1 for fair sharing between slow consumers |
 | `connectTimeoutMs` | 10000 | limit for the TCP connect, and again for the TLS handshake; 0 is no limit |
-| `requestTimeoutMs` | 10000 | how long to wait for the broker to confirm a frame; at least 1 |
-| `maxFrameBytes` | 16777216 (16 MiB) | largest message body accepted from the broker; at least 1 |
+| `requestTimeoutMs` | 10000 | how long to wait for the broker to confirm a frame, and how long a write may make no progress because the broker is not reading; at least 1 |
+| `maxFrameBytes` | 16777216 (16 MiB) | largest message body accepted from the broker, in bytes, inclusive; at least 1. A larger message is undeliverable (next row); the connection stays usable. |
+| `onUndeliverable` | `UndeliverablePolicy.LeaveUnacknowledged` | what `consume` does with a message it cannot hand to a handler: `LeaveUnacknowledged` leaves it on the broker, `RejectToBroker` sends `NACK` (dead-letter queue if persistent, discarded if not). Either way `consume` returns an `Err`. See "Surprises". |
 | `tls` | `plainTcp()` | `TlsOptions`, set with the functions below |
 
 TLS options. The function names and the rule for skipping verification are those of
@@ -278,6 +280,7 @@ Environment variables. An empty variable counts as unset.
 | `LYRIC_CONFIG_MQ_ACTIVEMQ_URL` | `connectFromEnv` | broker URL (required) |
 | `LYRIC_CONFIG_MQ_ACTIVEMQ_QUEUENAME` | `connectFromEnv` | queue name or destination (required) |
 | `LYRIC_CONFIG_MQ_ACTIVEMQ_ACKMODE` | `connectFromEnv` | `Manual` (default) or `Auto`, in any case |
+| `LYRIC_CONFIG_MQ_ACTIVEMQ_ONUNDELIVERABLE` | `connectFromEnv` | `Leave` (default) or `Reject`, in any case: the `onUndeliverable` option |
 | `LYRIC_CONFIG_MQ_ACTIVEMQ_TLSCAFILE` | `connectFromEnv` | PEM file: a CA certificate trusted in addition to the platform trust store |
 | `LYRIC_CONFIG_MQ_ACTIVEMQ_TLSCAEXCLUSIVE` | `connectFromEnv` | `true`: trust only that CA (default `false`; any other value is an `Err`, and so is `true` without a CA file) |
 | `LYRIC_CONFIG_MQ_ACTIVEMQ_TLSCERTFILE` | `connectFromEnv` | PEM file: client certificate (mutual TLS) |
@@ -328,7 +331,8 @@ Requeue, reject and `deliveryCount`:
   counter over STOMP, so several such rounds still add one. A requeue after a flagged delivery
   writes the raised count into the copy, where it stays.
 - **A `deliveryCount` above 0 on a published message is sent and comes back.** The reference
-  broker resets it to 0 on publish. A negative one is sent as 0.
+  broker resets it to 0 on publish. A negative one is an `Err` and nothing is sent (for a batch,
+  none of it), because a consumer refuses a negative `lyric_delivery_count`.
 - **`nack(id, false)` is final and where the message goes depends on its delivery mode.** A
   persistent message moves to the dead-letter queue (`ActiveMQ.DLQ`, shared by all queues, with the
   default strategy) and keeps its id, body and headers there. A non-persistent one is discarded
@@ -341,15 +345,21 @@ Requeue, reject and `deliveryCount`:
 - **`ack` and `nack` settle by `Message.id`, oldest unsettled delivery first.** Ids are not
   required to be unique; two unsettled deliveries with the same id are settled in delivery order.
 - **Settling an unknown or already settled id is an `Err`**, not `Ok` as with the reference broker.
-- **A failed `ack` or `nack` cannot be repeated.** The delivery leaves the client's in-flight set
-  before the frame is sent. If the broker refuses the frame with an `ERROR` (the connection stays
-  open), a second call with the same id is "no unsettled delivery"; the message stays unsettled on
-  the broker and is redelivered when this connection closes.
+- **A refused `ack` or `nack` can be repeated.** A delivery leaves the client's in-flight set only
+  when the broker has confirmed the settlement (the `RECEIPT` of the `ACK`, `NACK` or, for a
+  requeue, the `COMMIT`). If the broker refuses it with an `ERROR` and the connection stays open,
+  the call returns `broker error`, the delivery is still unsettled here and on the broker, and
+  `ack` / `nack` with the same id tries again. A refused requeue leaves no copy: its transaction
+  is aborted. If the connection is lost instead, nothing can be settled any more and the broker
+  redelivers.
 - **In `Manual` mode a handler's `Err` settles nothing.** `consume` returns the handler's error
   and the delivery stays unsettled until `ack`, `nack` or `close`.
 - **In `Auto` mode `ack` and `nack` are no-ops that answer `Ok`** for any non-empty id, delivered
-  or not. `consume` returns the handler's error after the requeue; if the requeue itself fails the
-  text is `HANDLER ERROR (and requeueing the message failed: ...)`.
+  or not, with one exception: a delivery `consume` did not settle. That is a delivery whose
+  automatic acknowledgement or requeue the broker refused (`consume` then returns the broker's
+  error, or `HANDLER ERROR (and requeueing the message failed: ...)`), and an undeliverable
+  message left on the broker. For those, `ack` and `nack` act as in `Manual` mode, so the
+  delivery can still be settled; `unsettledCount` counts them.
 - **The default acknowledgement mode is `Manual`**, where `lyric-mq` documents `Auto` as the
   default of its own configuration.
 
@@ -389,9 +399,9 @@ How a message travels, and what does not round-trip:
 - **`Message.headers` is one JSON array in the `lyric_headers` header**, so order, repeated keys
   and every character survive. They are not individual JMS properties and a selector cannot see
   them; use `Extras.SendOptions.properties` for that. An empty list sends no header.
-- **All headers of a frame share a size limit.** This client refuses a frame from the broker whose
-  header section exceeds 65536 bytes and then treats the connection as lost, and ActiveMQ has its
-  own limits on header size. Large data belongs in the body.
+- **All headers of a frame share a size limit.** A message whose header section (the command
+  line, every header line and their line ends) exceeds 65536 bytes is undeliverable (below), and
+  ActiveMQ has its own limits on header size. Large data belongs in the body.
 - **`Message.body` is UTF-8 text** sent with `content-length` (so it may contain NUL) and
   `amq-msg-type:text`, which makes it a JMS `TextMessage` for other consumers. There is no binary
   body.
@@ -405,16 +415,41 @@ How a message travels, and what does not round-trip:
   `timestamp`, `redelivered`, `persistent`, `amq-msg-type`, `receipt`, `transaction`).
   `correlation-id`, `reply-to`, `type` and JMS properties are therefore among them. Requeueing such
   a message changes its id, because the copy gets a new `message-id`.
-- **A message this client cannot represent is rejected, not skipped.** A body that is not UTF-8
-  (a JMS `BytesMessage` from another producer), or malformed `lyric_headers` /
-  `lyric_delivery_count`, is answered with `NACK`, so a persistent one moves to the dead-letter
-  queue and a non-persistent one is destroyed, and `consume` returns an `Err` naming it at once
-  without waiting for the next message. Do not point this client at a queue that carries binary
-  messages for someone else.
-- **A body larger than `maxFrameBytes` breaks the connection.** The frame is refused before it is
-  read, the connection is `lost`, and the message, never settled, is redelivered to the next
-  connection. Raise `maxFrameBytes` on consumers of a queue with large messages. Publishing has no
-  size limit of its own.
+- **Four kinds of message cannot be handed to a handler** ("undeliverable"): a body that is not
+  UTF-8 (a JMS `BytesMessage` from another producer); malformed `lyric_headers` or
+  `lyric_delivery_count`; a body of more than `maxFrameBytes` bytes; a header section of more
+  than 65536 bytes. `consume` returns
+  `Err("activemq: message BROKER-ID cannot be delivered: REASON; OUTCOME")` at once, without
+  waiting for the next message, and the connection stays usable: the next `consume` delivers the
+  next message. What happens to the message is `ConnectOptions.onUndeliverable`:
+  - `LeaveUnacknowledged` (the default) leaves it unacknowledged on the broker. Nothing is
+    destroyed: the broker redelivers it, flagged `redelivered`, when this connection closes, to
+    whichever consumer is next (one with a larger `maxFrameBytes`, or the JMS consumer the binary
+    message was meant for). Until then the delivery is tracked under the broker's `message-id`,
+    which the error names: `ack(brokerId)` removes the message, `nack(brokerId, false)` rejects it
+    to the dead-letter handling, `nack(brokerId, true)` requeues it as it is (not possible for a
+    message that was too large to read: there is no body to copy, and the call is an `Err`).
+    `unsettledCount` counts it.
+  - `RejectToBroker` sends `NACK`, so a persistent message moves to the dead-letter queue and a
+    non-persistent one is destroyed. Use it on a queue this application owns. If the `NACK` is
+    refused, the message is left as with the other policy and the error says so.
+- **A message left unacknowledged takes a place in the prefetch window, on every connection that
+  meets it.** With `prefetchSize = 1` a connection that has left one undeliverable message
+  receives nothing more (its `consume` reports `timeout`) until the message is settled or the
+  connection closes, and the next connection meets the same message first. With the default
+  window the effect is one `Err` per connection. An application that sees the error repeat should
+  settle the message by its id, raise `maxFrameBytes`, or choose `RejectToBroker`.
+- **A message over a limit is read past, not kept.** The client reads the oversize frame to its
+  end and drops the bytes as they arrive, so memory stays bounded (at most 64 KiB of headers and
+  one read of 16 KiB are held), but the bytes still cross the network: the wait for the next
+  message includes the time to receive the oversize one. Of an oversize header section the client
+  keeps the headers within the first 64 KiB and, from the rest, `ack`, `message-id`,
+  `subscription`, `destination` and `content-length` when their line is at most 1024 bytes; a
+  message whose `ack` header cannot be found that way loses the connection. Raise `maxFrameBytes`
+  on consumers of a queue with large messages. `maxFrameBytes` counts body bytes and is
+  inclusive; headers do not count towards it. Publishing has no size limit of its own.
+- **A frame other than `MESSAGE` over a limit, or a command line over 64 KiB, loses the
+  connection.** The broker has no reason to send one.
 
 Consuming and timeouts:
 
@@ -427,14 +462,33 @@ Consuming and timeouts:
 - **`consume` returns `Err("timeout")` when nothing arrived**, the interface's text. The timeout
   bounds the wait for a message only: the handler, and in `Auto` mode the settlement, run after
   it.
+- **`timeoutMs` is an upper bound on the wait for a message, counted from the call.** Everything
+  that precedes the hand-over to the handler counts against it: waiting for the connection's lock
+  (another thread's `publish` waiting for its receipt holds it), sending `SUBSCRIBE` and waiting
+  for its receipt on the first call, and waiting for a `MESSAGE`. When the time is up, `consume`
+  returns `Err("timeout")`, whichever of these it was waiting for. What is not bounded: the
+  handler, the settlement in `Auto` mode, the `NACK` of an undeliverable message under
+  `RejectToBroker` (each up to `requestTimeoutMs`), and one last poll of the socket of about 1 ms.
 - **`consume(0, ...)` returns only a message the broker has already dispatched to this
-  connection.** It still waits about 1 ms for the socket on both targets. The first call also
-  sends `SUBSCRIBE` and waits for its receipt (up to `requestTimeoutMs`), and can report `timeout`
-  on a non-empty queue, because the broker dispatches after the receipt.
-- **A `consume` can overrun its timeout** by the time it waits for the connection's lock (another
-  thread's publish waiting for a receipt) plus one 100 ms slice.
-- **A broker `ERROR` frame that arrives during a `consume` ends it** with `broker error`. The
-  connection stays usable if the broker keeps it open (ActiveMQ does for most errors).
+  connection**, after a poll of about 1 ms on both targets. The first `consume(0)` sends
+  `SUBSCRIBE` and does not wait for the receipt, so it reports `timeout` even on a non-empty
+  queue; later calls pick the receipt up. Call `subscribe(queue)` first, or use a timeout, when
+  the first poll matters.
+- **A subscription that an expired `consume` left unconfirmed is completed by later calls.** Its
+  receipt has `requestTimeoutMs` from the moment `SUBSCRIBE` was sent, whichever operation reads
+  it; when that passes without one, the next `consume` reports the connection lost. A refusal
+  of the `SUBSCRIBE` (a broken selector) that arrives while a `publish` is waiting is reported by
+  the next `consume`. `subscribe(queue)` waits the whole `requestTimeoutMs`.
+- **An `ERROR` frame is a request's failure only when it carries that request's `receipt-id`.**
+  ActiveMQ puts the `receipt-id` on the `ERROR` for a frame sent with a `receipt` (checked against
+  5.17.6 for a refused `SUBSCRIBE`), which is how a refused `SEND`, `SUBSCRIBE`, `ACK`, `NACK` or
+  `COMMIT` becomes `broker error` with the connection still usable. An `ERROR` without a `receipt-id`, or with another one, answers a frame
+  that was sent without a receipt (`BEGIN`, a `SEND` or `ACK` inside a transaction, `ABORT`,
+  `UNSUBSCRIBE`) or nothing this client sent. It cannot be attributed, STOMP 1.2 has the broker
+  close the connection after it, and the client treats the connection as lost:
+  `connection lost: the broker sent an ERROR frame that answers no request in flight: TEXT`,
+  from whichever operation read it, `consume` included. The outcome of a request that was in
+  flight then is unknown, as for any lost connection.
 - **A topic delivers only what is published after its subscription exists.** Call
   `Mq.ActiveMq.subscribe(queue)` before the publisher starts. Unsettled topic deliveries are not
   redelivered.
@@ -461,8 +515,22 @@ Connection, heart-beats and reconnecting:
   because a late receipt could otherwise be taken for the next one.
 - **`isOpen` does not probe.** It is true until `close` or until an operation has failed.
 - **Connecting can take `connectTimeoutMs` twice plus `requestTimeoutMs`**: the TCP connect, the
-  TLS handshake and the wait for `CONNECTED` each have their own limit. Writes are not bounded by
-  any timeout on either target.
+  TLS handshake and the wait for `CONNECTED` each have their own limit.
+- **A write is given up when the broker takes no data for `requestTimeoutMs`.** A broker that
+  stops reading (or a stalled network) would otherwise block `publish` for ever while it holds the
+  connection's lock. The limit is on progress, not on the whole write, so a large message on a
+  slow link is not cut off while bytes keep moving (on `jvm` progress is measured per 64 KiB). The
+  connection is lost afterwards (`connection lost: the write timed out: ...`), because part of a
+  frame may have been sent.
+- **A wrong login or passcode is usually `broker error`, and sometimes `connection lost`.**
+  ActiveMQ answers the `CONNECT` with an `ERROR` frame and closes the connection at once, and now
+  and then the close overtakes the frame: on plain TCP the client sees a bare close (between one
+  login in a hundred and one in a thousand against a local 5.17.6, with any client), over TLS it can see a failed read
+  instead (.NET: "The decryption operation failed"). The client delivers the `ERROR` frame
+  whenever it arrived whole. When it did not, the error is
+  `activemq: connection lost: HOST:PORT ended the connection during login without a readable answer; a broker does that when it refuses the login or passcode (PLATFORM REASON)`.
+  Neither form contains the passcode. Treat both as a refused login; a network fault during login
+  gives the second form too.
 - **`close` is idempotent and waits.** It sends `DISCONNECT` and waits up to 2 s (or
   `requestTimeoutMs` if shorter) for the receipt. Deliveries not yet settled go back to the queue
   in their original order, flagged `redelivered`. `close` on a lost connection does nothing.
@@ -476,7 +544,12 @@ Threads:
 
 - **An `ActiveMqQueue` can be shared between threads; operations are serialized by one lock.**
   There is one socket and no pipelining, so a `publish` waiting for its receipt (up to
-  `requestTimeoutMs`) blocks every other operation on the connection, `close` included.
+  `requestTimeoutMs`) blocks every other operation on the connection, `close` included. A
+  `consume` does not wait for the lock beyond its own timeout.
+- **On `dotnet` a connection that has been read from owns a thread** until `close` (or until the
+  broker closes it). The client does not use the runtime's shared thread pool, so it keeps its
+  timing when the application's pool threads are all busy; the price is that a connection dropped
+  without `close` keeps its reader thread and socket. Always `close`.
 - **A waiting `consume` gives the lock up every 100 ms**, so a publisher on another thread is held
   for at most that long. On `jvm` the lock is fair, so the publisher gets it at that point; on
   `dotnet` it is a monitor, which makes no such promise.
@@ -536,7 +609,9 @@ Differences between `dotnet` and `jvm`, collected:
 | Connection lock | monitor, not fair | fair `ReentrantLock` |
 | TLS handshake limit | whole handshake | each read |
 | Skip-verify | chain policy with `X509VerificationFlags.AllFlags` | a trust manager that accepts everything, and no endpoint identification |
-| Reads | one pending `Stream.ReadAsync`, waited on with a limit | `SO_TIMEOUT` on the socket |
+| Reads | a reader thread per connection doing blocking reads, handing each chunk over; no shared thread pool | `SO_TIMEOUT` on the socket |
+| Write limit | `SendTimeout` on the socket | the write runs on a virtual thread; the socket is closed when no 64 KiB chunk gets through in time |
+| A refused login whose `ERROR` frame was cut off, over TLS | a failed read ("The decryption operation failed") | a failed read or a bare close |
 | Platform part of error texts | .NET exception messages | JDK exception messages |
 
 Differences from the reference in-process broker (`Mq.connect`), collected:
@@ -548,7 +623,7 @@ Differences from the reference in-process broker (`Mq.connect`), collected:
 | Two unsettled deliveries with one id | the second replaces the first | both tracked, settled oldest first |
 | `nack(id, false)` | dropped | dead-lettered if persistent, discarded if not |
 | `publishBatch` | one by one, can stop half way | one transaction |
-| Published `deliveryCount` | reset to 0 | kept |
+| Published `deliveryCount` | reset to 0 | kept; a negative one is an `Err` |
 | Acknowledgement mode | none: `ack`/`nack` always act | `Manual` or `Auto` |
 | Empty id on `ack`/`nack` | `Err(Mq.EMPTY_MESSAGE_ID)` | `Err("activemq: empty message id")` |
 | Failure modes | none | connection loss, request timeouts, broker errors |
@@ -560,7 +635,13 @@ Things the tests assert that look odd, and why:
 - The mutual-TLS tests accept any `activemq: ...` error for a missing client certificate, for the
   TLS 1.3 reason above.
 - `"an ERROR frame alone does not close the connection"` holds against the fake broker and against
-  ActiveMQ for a refused `SEND` or a second `ACK`; a refused `CONNECT` does close it.
+  ActiveMQ for a refused `SEND` or `SUBSCRIBE`, because the frame carries the request's
+  `receipt-id`; a refused `CONNECT` does close it.
+- The integration suite accepts two errors for a wrong passcode (`expectLoginRefused`), for the
+  reason under "Connection" above, and checks over 300 logins that it is one of the two and
+  mostly the broker's.
+- Tests whose handler must return `Ok` use a named function, not `{ m -> Ok(()) }` (see "Known
+  gaps").
 - A consumed message's `headers` are empty after `Extras.publishWith` with properties ("delivery
   options are not message headers").
 - The integration suite expects `JMSDeliveryMode = 'NON_PERSISTENT'`, a string: that is how
@@ -585,8 +666,7 @@ func extras(queue: in ActiveMq.ActiveMqQueue): Result[Unit, String] {
   Extras.publishWith(
     queue,
     Mq.Message(id = "inv-7", body = "{}", headers = [], deliveryCount = 0),
-    options.copy(
-      persistent = false,
+    options.withPersistent(false).copy(
       priority = 7,
       timeToLiveMs = 60000i64,
       correlationId = "req-19",
@@ -625,7 +705,8 @@ func rawHeaders(queue: in ActiveMq.ActiveMqQueue): Result[Unit, String] {
 | Function | |
 |---|---|
 | `queueDestination(name)`, `topicDestination(name)` | `/queue/NAME`, `/topic/NAME`. An empty name is a contract violation. |
-| `defaultSendOptions()` | persistent, broker default priority, no expiry, nothing else set |
+| `defaultSendOptions()` | the connection's persistence, broker default priority, no expiry, nothing else set |
+| `options.withPersistent(true / false)` | this message is persistent, or not, whatever the connection's setting |
 | `publishWith(queue, message, options)` | `publish` with `SendOptions`; returns once the broker has confirmed |
 | `isPropertyName(name)` | whether `name` may be a property in `SendOptions.properties` |
 | `selectorEquals(name, value)`, `selectorForId(id)` | a selector `name = 'value'` with the value quoted; by message id |
@@ -634,7 +715,7 @@ func rawHeaders(queue: in ActiveMq.ActiveMqQueue): Result[Unit, String] {
 
 | Field | Default | Meaning |
 |---|---|---|
-| `persistent` | `true` | delivery mode of this message |
+| `persistent` | `None` | `Option[Bool]`: `None` sends the message with the connection's `ConnectOptions.persistent`; `Some(value = true)` / `Some(value = false)` (or `withPersistent`) decide for this message |
 | `priority` | -1 | 0 to 9; -1 leaves the broker's default of 4. Anything else is an `Err`. |
 | `timeToLiveMs` | 0 | milliseconds after which the broker discards an undelivered message; 0 is never; negative is an `Err` |
 | `correlationId`, `replyTo`, `jmsType` | empty | the JMS correlation id, a STOMP destination for replies, the JMS type; empty is not set |
@@ -642,9 +723,10 @@ func rawHeaders(queue: in ActiveMq.ActiveMqQueue): Result[Unit, String] {
 
 Things to know:
 
-- **`SendOptions.persistent` replaces `ConnectOptions.persistent`.** `publishWith` always sends its
-  own value, and `defaultSendOptions()` says `true`, so on a connection opened with
-  `persistent = false` a `publishWith` with default options sends a persistent message.
+- **`SendOptions.persistent` is unset by default and then the connection decides.** A
+  `publishWith` with `defaultSendOptions()` on a connection opened with `persistent = false`
+  sends a non-persistent message, like `publish`. Only `withPersistent(...)` (or
+  `persistent = Some(...)`) overrides `ConnectOptions.persistent`, in either direction.
 - **`timeToLiveMs` becomes an absolute expiry on the client's clock** (`expires` is epoch
   milliseconds), so a clock difference between the application and the broker shifts it.
 - **Property names are restricted**: an ASCII identifier (letters, digits, `_`, `$`, not starting
@@ -667,9 +749,9 @@ The other packages:
 |---|---|---|
 | `src/activemq.l` | `Mq.ActiveMq` | connection, interface implementation |
 | `src/extras.l` | `Mq.ActiveMq.Extras` | topics, delivery options, selectors |
-| `src/stomp.l` | `Mq.ActiveMq.Stomp` | STOMP 1.2 frame encoder and incremental decoder, no I/O |
+| `src/stomp.l` | `Mq.ActiveMq.Stomp` | STOMP 1.2 frame encoder and incremental decoder (which reads past frames over a limit and reports them), no I/O |
 | `src/url.l` | `Mq.ActiveMq.Url` | broker URL parsing (`parseUrl`, `percentDecode`) |
-| `src/_kernel_dotnet/socket_kernel.l` | `Mq.ActiveMq.Kernel` | `System.Net.Sockets`, `System.Net.Security.SslStream`, monitor lock, clock, task |
+| `src/_kernel_dotnet/socket_kernel.l` | `Mq.ActiveMq.Kernel` | `System.Net.Sockets`, `System.Net.Security.SslStream`, monitor lock, clock, dedicated threads |
 | `src/_kernel_jvm/socket_kernel.l` | `Mq.ActiveMq.Kernel` | `java.net.Socket`, `javax.net.ssl.SSLSocket`, `ReentrantLock`, clock, thread |
 
 The two kernel files declare the same package and surface; a file-level `@cfg(target = ...)` keeps
@@ -683,9 +765,16 @@ How the kernels do TLS:
 - dotnet: `SslStream.AuthenticateAsClient` with `SslClientAuthenticationOptions`. Trust is a
   `CertificateChainPolicy` (custom root store; the platform's root stores are added to it for
   `withCaCertificate`), and skip-verify is that policy with `X509VerificationFlags.AllFlags`. No
-  validation callback is involved. A read is a `Stream.ReadAsync` task the connection keeps and
-  waits on with a limit, so a consume timeout is exact whether or not TLS has buffered data; the
-  plain transport uses the same path.
+  validation callback is involved. Each connection has a reader thread that does blocking
+  `Stream.Read` calls and hands every chunk, and then the end of the stream or the read's failure,
+  to the consumer in order, which waits for the hand-over with a limit; so a consume timeout is
+  exact whether or not TLS has buffered data, nothing that arrived before a failure is lost, and
+  the plain transport uses the same path. The connect, the handshake and the reader run on
+  threads of their own and every call is the synchronous one: nothing completes on the runtime's
+  shared thread pool. An earlier version kept a pending `Stream.ReadAsync` instead; its completion
+  needs a pool thread, so with the pool busy (blocked tasks of the application, or of the tests'
+  own in-process broker on a machine with few cores) a message that had arrived was seen seconds
+  late and a `consume` timed out.
 - jvm: an `SSLContext` from a `KeyStore`-backed `TrustManagerFactory` and `KeyManagerFactory`,
   an `SSLSocket` layered over the connected socket, and
   `SSLParameters.setEndpointIdentificationAlgorithm("HTTPS")`. Reads and timeouts are the socket's
@@ -705,8 +794,11 @@ lyric test --manifest mq-activemq/lyric.toml --target jvm
 
 This runs the frame codec, URL, kernel, re-export and `Extras` unit tests, and
 `tests/client_tests.l`: the `Testing.Conformance.Mq` queue suite and the error paths (refused
-connection, bad credentials, `ERROR` frame, connection dropped during publish and during consume,
-unconfirmed request) against an in-process STOMP broker on a loopback socket. The same broker is
+connection, bad credentials, `ERROR` frame with and without a `receipt-id`, connection dropped
+during publish, during consume and during login, unconfirmed request, refused settlements,
+undeliverable and oversize messages under both policies, a broker that stops reading, the bounds
+of `consume`, a busy thread pool, and bytes arriving in pieces across read timeouts) against an
+in-process STOMP broker on a loopback socket. The same broker is
 also started behind TLS and behind TLS with a required client certificate: the conformance suite
 runs once more over TLS, with tests of CA trust (exclusive and additional), an untrusted CA, the
 name check and the server name override, the two keys of skip-verify, mutual TLS with and without
@@ -738,8 +830,10 @@ lyric test --manifest mq-activemq/lyric.toml --target jvm --features integration
 ```
 
 Over the plain connector it runs the conformance suite and tests of redelivery, the dead-letter
-queue, batches, `Auto` mode, large bodies, foreign and binary messages, selectors, delivery
-options, expiry, topics and competing consumers. Over TLS it runs the conformance suite again and
+queue, batches, `Auto` mode, large bodies, foreign and binary messages under both
+`onUndeliverable` policies, bodies and header sections over the limits, repeated wrong-passcode
+logins and broken selectors, selectors, delivery options and their inheritance, expiry, topics
+and competing consumers. Over TLS it runs the conformance suite again and
 tests of a verified connection with the custom CA, refusal without it, refusal of a name the
 certificate lacks, skip-verify with one key and with both, mutual TLS with a client certificate
 and without, and consume timeouts, receipts, transactions, large bodies, redelivery and `ERROR`
@@ -793,7 +887,20 @@ There is no third-party library (`[nuget]` and `[maven]` are empty). What the su
 - `DeadLetterStore` is not implemented (see "Surprises").
 - No binary message bodies, in either direction, and no access to the delivery options of a
   received message.
-- A failed `ack` or `nack` cannot be retried on the same connection (see "Surprises").
+- The default for undeliverable messages keeps them on the broker, where one can hold up a
+  consumer with a small prefetch window (see "Surprises"); the client has no option that moves
+  such a message aside without `NACK`.
+- Frames inside a transaction (`publishBatch`, requeue) are sent without receipts, so a broker
+  `ERROR` for one of them cannot be attributed and loses the connection instead of failing the
+  call with `broker error`. The transaction is not committed in that case.
+- On `dotnet` every connection that is read from holds one thread until it is closed.
+- Not reproduced here: the two failures seen on a hosted CI runner (`dotnet`, TLS) that led to the
+  reader-thread design, a `consume(1000)` that missed a delivered message and a wrong-passcode
+  login reported as "The decryption operation failed". The first matches what a starved thread
+  pool does to the earlier `ReadAsync` design (reproduced deterministically by the hermetic test
+  "a busy thread pool does not delay connecting, publishing or consuming"); the second matches the
+  broker's close overtaking its `ERROR` frame (reproduced on plain TCP with this client and with a
+  plain Python socket, 23 of 3000 logins).
 - Durable topic subscriptions (`activemq.subscriptionName` with a `client-id`) are not exposed.
 - Only ActiveMQ Classic 5.17.6 has been tested. The official `apache/activemq-classic` container
   image has not been run against this suite.
@@ -814,6 +921,12 @@ There is no third-party library (`[nuget]` and `[maven]` are empty). What the su
   - lyric-lang#9064: the standard library has no TLS client for a raw socket, so each kernel binds
     the platform's TLS (`SslStream`, JSSE) itself and the TLS options here repeat those of
     `Std.Http`.
+- Compiler defect met while fixing the settlement paths (not yet filed): on `--target dotnet` the
+  lambda `{ m -> Ok(()) }` passed as a `(Mq.Message) -> Result[Unit, String]` handler builds a
+  `Result` of the wrong generic instantiation, and `consume` fails with an invalid cast
+  (`Result_Ok<Object, Object>` to `Result<Object, String>`) at the moment it calls the handler.
+  A handler that calls a function with a declared result type (`{ m -> handle(m) }`), as every
+  example here does, is not affected; `--target jvm` is not affected.
 - Standard library and compiler limits met while adding TLS (not yet filed):
   - `Std.Tls.Certificate.rawHandle` and `Identity.rawHandle` are `internal`, so a package outside
     the standard library cannot hand a `Certificate` or `Identity` to a host TLS API. This is why

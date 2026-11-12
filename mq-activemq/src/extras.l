@@ -51,8 +51,9 @@ pub record Property {
 /// Per-message delivery options for `publishWith`.
 pub record SendOptions {
   /// Persistent messages survive a broker restart and are dead-lettered, not
-  /// discarded, when rejected.
-  persistent: Bool
+  /// discarded, when rejected. `None` sends the message as the connection's
+  /// `ConnectOptions.persistent` says; `Some` decides for this message.
+  persistent: Option[Bool]
   /// 0 (lowest) to 9 (highest); -1 leaves the broker's default of 4.
   priority: Int
   /// Milliseconds after which the broker discards an undelivered message;
@@ -68,11 +69,12 @@ pub record SendOptions {
   properties: slice[Property]
 }
 
-/// Persistent, default priority, no expiry, nothing else set.
+/// The connection's persistence, default priority, no expiry, nothing else
+/// set.
 pub func defaultSendOptions(): SendOptions {
   val none: slice[Property] = []
   SendOptions(
-    persistent = true,
+    persistent = None,
     priority = -1,
     timeToLiveMs = 0i64,
     correlationId = "",
@@ -80,6 +82,12 @@ pub func defaultSendOptions(): SendOptions {
     jmsType = "",
     properties = none
   )
+}
+
+/// Send the message persistent (`true`) or not (`false`), whatever the
+/// connection's `ConnectOptions.persistent` is.
+pub func SendOptions.withPersistent(o: in SendOptions, persistent: in Bool): SendOptions {
+  o.copy(persistent = Some(value = persistent))
 }
 
 func isLetter(unit: in Int): Bool {
@@ -141,7 +149,13 @@ func stompHeaders(options: in SendOptions): Result[slice[Stomp.Header], String] 
     return Err("activemq: timeToLiveMs must not be negative")
   }
   val headers: List[Stomp.Header] = newList()
-  headers.add(Stomp.Header(name = "persistent", value = if options.persistent { "true" } else { "false" }))
+  // Without a header of its own the SEND keeps the connection's.
+  match options.persistent {
+    case Some(persistent) -> headers.add(
+      Stomp.Header(name = "persistent", value = if persistent { "true" } else { "false" })
+    )
+    case None -> ()
+  }
   if options.priority >= 0 {
     headers.add(Stomp.Header(name = "priority", value = options.priority.toString()))
   }

@@ -15,7 +15,9 @@ test "destinations" {
 
 test "default send options" {
   val o = Extras.defaultSendOptions()
-  assertTrue(o.persistent, "persistent")
+  assertTrue(isNone(o.persistent), "persistence is the connection's")
+  assertTrue(o.withPersistent(true).persistent == Some(value = true), "persistent on request")
+  assertTrue(o.withPersistent(false).persistent == Some(value = false), "non-persistent on request")
   assertEqualInt(o.priority, -1, "broker default priority")
   assertTrue(o.timeToLiveMs == 0i64, "no expiry")
   assertEqualInt(o.properties.length, 0, "no properties")

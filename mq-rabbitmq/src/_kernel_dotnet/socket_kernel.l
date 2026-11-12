@@ -2,18 +2,31 @@
 //! `--target dotnet`.
 //!
 //! `System.Net.Sockets.TcpClient` / `TcpListener`, `System.Net.Security.SslStream`
-//! for TLS, a monitor lock, a monotonic clock and a background task. Every
+//! for TLS, a monitor lock, a monotonic clock and a background thread. Every
 //! operation returns a `Result` with the failure text; nothing throws.
 //!
 //! `Std.TcpHost` is not used: an AMQP consumer has to tell "nothing arrived
 //! within the wait" from "the connection failed", and `Std.TcpHost` reports a
-//! receive timeout as the same `TransportFailed` as a reset. Here a read is a
-//! `Stream.ReadAsync` whose task the connection keeps: `sockRead` waits for it
-//! with a limit and, when the limit passes, leaves it pending for the next
-//! call. That is exact for a plain socket and for an `SslStream` alike, where
-//! polling the socket would be wrong: bytes on the wire may be a handshake
-//! message or part of a record (no plaintext yet), and plaintext may already
-//! sit decrypted in the stream with nothing left on the wire.
+//! receive timeout as the same `TransportFailed` as a reset. Here each
+//! connection that is read from has a reader thread of its own, which does
+//! blocking `Stream.Read` calls and hands each chunk to `sockRead` through a
+//! pair of semaphores; `sockRead` waits for the hand-over with a limit. That
+//! is exact for a plain socket and for an `SslStream` alike, where polling the
+//! socket would be wrong: bytes on the wire may be a handshake message or part
+//! of a record (no plaintext yet), and plaintext may already sit decrypted in
+//! the stream with nothing left on the wire. The reader reads the next chunk
+//! only after the previous one was taken, and the end of the stream or a read
+//! failure is handed over after every chunk read before it, so nothing that
+//! arrived is lost or reordered.
+//!
+//! Nothing here runs on, or waits for, the runtime's shared thread pool. The
+//! connect, the TLS handshake, the reader and `startBackground` each run on a
+//! thread of their own (`TaskCreationOptions.LongRunning`), and reads and
+//! writes are the synchronous stream calls. The asynchronous calls
+//! (`ConnectAsync`, `ReadAsync`) complete on pool threads, so an application
+//! whose pool threads are all blocked, as they are when it calls this
+//! synchronous client from many tasks at once, would see its reads complete
+//! seconds late: a consume would time out with the message already received.
 //!
 //! TLS: the client side is `SslStream.AuthenticateAsClient` with an
 //! `SslClientAuthenticationOptions`. Trust is configured through
@@ -83,12 +96,52 @@ extern type StoreLocation = "System.Security.Cryptography.X509Certificates.Store
 
 extern type OpenFlags = "System.Security.Cryptography.X509Certificates.OpenFlags"
 
+extern type TaskFactory = "System.Threading.Tasks.TaskFactory"
+
+extern type TaskCreationOptions = "System.Threading.Tasks.TaskCreationOptions"
+
+extern type Semaphore = "System.Threading.SemaphoreSlim"
+
+extern type NetObject = "System.Object"
+
+extern type NetMonitor = "System.Threading.Monitor"
+
 @externTarget("System.Net.Sockets.TcpClient..ctor")
 func newTcpClient(): TcpClient = ()
 
 @externInstance
-@externTarget("System.Net.Sockets.TcpClient.ConnectAsync")
-func clientConnectAsync(c: in TcpClient, host: in String, port: in Int): BclTask = ()
+@externTarget("System.Net.Sockets.TcpClient.Connect")
+func clientConnect(c: in TcpClient, host: in String, port: in Int): Unit = ()
+
+@externInstance
+@externTarget("System.Net.Sockets.TcpClient.set_SendTimeout")
+func clientSetSendTimeout(c: in TcpClient, ms: in Int): Unit = ()
+
+@externStatic
+@externTarget("System.Threading.Tasks.Task.get_Factory")
+func taskFactory(): TaskFactory = ()
+
+@externInstance
+@externTarget("System.Threading.Tasks.TaskFactory.StartNew")
+func factoryStartNew(f: in TaskFactory, work: in () -> Unit, options: in TaskCreationOptions): BclTask = ()
+
+@externTarget("System.Threading.Tasks.TaskCreationOptions.LongRunning")
+func longRunning(): TaskCreationOptions = ()
+
+@externTarget("System.Threading.SemaphoreSlim..ctor")
+func newSemaphore(initialCount: in Int): Semaphore = ()
+
+@externInstance
+@externTarget("System.Threading.SemaphoreSlim.Wait")
+func semWait(s: in Semaphore): Unit = ()
+
+@externInstance
+@externTarget("System.Threading.SemaphoreSlim.Wait")
+func semWaitFor(s: in Semaphore, timeoutMs: in Int): Bool = ()
+
+@externInstance
+@externTarget("System.Threading.SemaphoreSlim.Release")
+func semRelease(s: in Semaphore): Int = ()
 
 @externInstance
 @externTarget("System.Threading.Tasks.Task.Wait")
@@ -103,14 +156,6 @@ func taskWait(t: in BclTask): Unit = ()
 func taskRun(work: in () -> Unit): BclTask = ()
 
 @externInstance
-@externTarget("System.Threading.Tasks.Task.Wait")
-func readWaitFor(t: in Task[Int], timeoutMs: in Int): Bool = ()
-
-@externInstance
-@externTarget("System.Threading.Tasks.Task`1.get_Result")
-func readResult[T](t: in Task[T]): T = ()
-
-@externInstance
 @externTarget("System.Net.Sockets.TcpClient.GetStream")
 func clientStream(c: in TcpClient): Stream = ()
 
@@ -122,10 +167,9 @@ func clientClose(c: in TcpClient): Unit = ()
 @externTarget("System.Net.Sockets.TcpClient.set_NoDelay")
 func clientSetNoDelay(c: in TcpClient, on: in Bool): Unit = ()
 
-// The live `Task<int>` of one read; `sockRead` waits for it with a limit.
-func streamReadAsync(s: in Stream, buffer: in slice[Byte], offset: in Int, count: in Int): Task[Int] {
-  s.ReadAsync(buffer, offset, count)
-}
+@externInstance
+@externTarget("System.IO.Stream.Read")
+func streamReadInto(s: in Stream, buffer: in slice[Byte], offset: in Int, count: in Int): Int = ()
 
 @externInstance
 @externTarget("System.IO.Stream.Write")
@@ -172,14 +216,6 @@ func listenerLocalEndPoint(l: in TcpListener): EndPoint = ()
 
 @externTarget("System.Object.ToString")
 func endPointToString(e: in EndPoint): String = ()
-
-@externStatic
-@externTarget("System.Threading.Monitor.Enter")
-func monitorEnter[T](obj: in T): Unit = ()
-
-@externStatic
-@externTarget("System.Threading.Monitor.Exit")
-func monitorExit[T](obj: in T): Unit = ()
 
 @externStatic
 @externTarget("System.Threading.Thread.Sleep")
@@ -323,11 +359,22 @@ func storeClose(s: in X509Store): Unit = ()
 
 val readBufferSize: Int = 16384
 
-/// The read in progress on a connection, and bytes a read returned beyond
-/// what its caller asked for.
+/// What a connection's reader thread hands to `sockRead`, and bytes a read
+/// returned beyond what its caller asked for.
 pub ref record ReadState {
-  var pending: Option[Task[Int]]
   var carry: slice[Byte]
+  // Whether the reader thread has been started (by the first `sockRead`).
+  var started: Bool
+  // Written by the reader before it signals `ready`, read by `sockRead` after
+  // it has taken `ready`: one chunk, or the end of the stream (`ended`, with
+  // `failure` when the read failed).
+  var chunk: slice[Byte]
+  var ended: Bool
+  var failure: String
+  // Signalled once per hand-over, and left signalled at the end of the stream.
+  ready: Semaphore
+  // Signalled when `sockRead` has taken a chunk: the reader may read again.
+  taken: Semaphore
 }
 
 /// One open connection: plain TCP, or TLS over it.
@@ -383,8 +430,10 @@ pub record Background {
   task: BclTask
 }
 
-/// A reentrant mutual-exclusion lock.
-pub record Lock {
+/// A reentrant mutual-exclusion lock. A `ref record`, so each lock is its own
+/// instance; the monitor is that of the `System.Object` it holds.
+pub ref record Lock {
+  gate: NetObject
 }
 
 func closeQuietly(client: in TcpClient): Unit {
@@ -405,7 +454,15 @@ func sockOver(client: in TcpClient, stream: in Stream): Sock {
     client = client,
     stream = stream,
     readBuf = newMemStreamCap(readBufferSize),
-    reader = ReadState(pending = None, carry = noBytes())
+    reader = ReadState(
+      carry = noBytes(),
+      started = false,
+      chunk = noBytes(),
+      ended = false,
+      failure = "",
+      ready = newSemaphore(0),
+      taken = newSemaphore(0)
+    )
   )
 }
 
@@ -425,6 +482,41 @@ func causeOf(message: in String): String {
   }
 }
 
+ref record Attempt {
+  var failure: String
+}
+
+func runGuarded(outcome: in Attempt, fallback: in String, work: in () -> Unit): Unit {
+  try {
+    work()
+  } catch Bug as b {
+    outcome.failure = if b.message.length > 0 { causeOf(b.message) } else { fallback }
+  }
+}
+
+// Start `work` on a thread of its own, not one of the shared pool's.
+func runDedicated(work: in () -> Unit): BclTask {
+  factoryStartNew(taskFactory(), work, longRunning())
+}
+
+// Run a blocking call on its own thread so it can be abandoned: `Ok(false)`
+// when `timeoutMs` (0 = no limit) passed first. The caller then closes the
+// socket, which ends a call still in flight.
+func runWithin(work: in () -> Unit, timeoutMs: in Int, fallback: in String): Result[Bool, String] {
+  val outcome = Attempt(failure = "")
+  val running = runDedicated({ -> runGuarded(outcome, fallback, work) })
+  if timeoutMs == 0 {
+    taskWait(running)
+  } else if not taskWaitFor(running, timeoutMs) {
+    return Ok(false)
+  }
+  if outcome.failure.length > 0 {
+    Err(outcome.failure)
+  } else {
+    Ok(true)
+  }
+}
+
 /// Open a TCP connection to `host:port`, waiting at most `connectTimeoutMs`
 /// milliseconds for it (`0` = the operating system's limit).
 pub func sockConnect(host: in String, port: in Int, connectTimeoutMs: in Int): Result[Sock, String]
@@ -432,14 +524,17 @@ pub func sockConnect(host: in String, port: in Int, connectTimeoutMs: in Int): R
 {
   val client = newTcpClient()
   try {
-    val pending = clientConnectAsync(client, host, port)
-    if connectTimeoutMs == 0 {
-      taskWait(pending)
-    } else if not taskWaitFor(pending, connectTimeoutMs) {
-      closeQuietly(client)
-      return Err("connect to " + host + ":" + port.toString() + " timed out after " + connectTimeoutMs.toString() + " ms")
+    match runWithin({ -> clientConnect(client, host, port) }, connectTimeoutMs, "the connect failed") {
+      case Ok(true) -> Ok(wrapClient(client))
+      case Ok(false) -> {
+        closeQuietly(client)
+        Err("connect to " + host + ":" + port.toString() + " timed out after " + connectTimeoutMs.toString() + " ms")
+      }
+      case Err(e) -> {
+        closeQuietly(client)
+        Err(e)
+      }
     }
-    Ok(wrapClient(client))
   } catch Bug as b {
     closeQuietly(client)
     Err(b.message)
@@ -456,8 +551,37 @@ func takeCarry(state: in ReadState, maxBytes: in Int): slice[Byte] {
   held.slice(0, maxBytes)
 }
 
+// The reader thread of one connection: read a chunk, hand it over, wait until
+// it was taken. It ends with the stream (the peer's close, a failure, or
+// `sockClose`, which fails the read in flight).
+func readLoop(s: in Sock): Unit {
+  val state = s.reader
+  var open = true
+  while open {
+    try {
+      val n = streamReadInto(s.stream, memGetBuffer(s.readBuf), 0, readBufferSize)
+      if n <= 0 {
+        state.ended = true
+        open = false
+      } else {
+        state.chunk = memGetBuffer(s.readBuf).slice(0, n)
+      }
+    } catch Bug as b {
+      state.failure = if b.message.length > 0 { causeOf(b.message) } else { "the read failed" }
+      state.ended = true
+      open = false
+    }
+    val _ = semRelease(state.ready)
+    if open {
+      semWait(state.taken)
+    }
+  }
+}
+
 /// Read up to `maxBytes` bytes, waiting at most `timeoutMs` milliseconds for
-/// the first one (`0` = only what has already arrived).
+/// the first one (`0` = only what has already arrived). Bytes that arrived
+/// before the stream ended or failed are returned before the `Eof` or `Err`,
+/// which every later call then repeats.
 pub func sockRead(s: in Sock, maxBytes: in Int, timeoutMs: in Int): Result[ReadOutcome, String]
   requires: maxBytes > 0
   requires: timeoutMs >= 0
@@ -467,39 +591,55 @@ pub func sockRead(s: in Sock, maxBytes: in Int, timeoutMs: in Int): Result[ReadO
     return Ok(Data(bytes = takeCarry(state, maxBytes)))
   }
   try {
-    val read = match state.pending {
-      case Some(t) -> t
-      case None -> {
-        val t = streamReadAsync(s.stream, memGetBuffer(s.readBuf), 0, readBufferSize)
-        state.pending = Some(value = t)
-        t
-      }
+    if not state.started {
+      state.started = true
+      val _ = runDedicated({ -> readLoop(s) })
     }
-    // A wait of 0 would miss a read that is completing on another thread.
-    if not readWaitFor(read, if timeoutMs < 1 { 1 } else { timeoutMs }) {
+    // A wait of 0 would miss a chunk the reader is handing over right now.
+    if not semWaitFor(state.ready, if timeoutMs < 1 { 1 } else { timeoutMs }) {
       return Ok(TimedOut)
     }
-    state.pending = None
-    val n = readResult(read)
-    if n <= 0 {
+    if state.ended {
+      val _ = semRelease(state.ready)
+      if state.failure.length > 0 {
+        return Err(state.failure)
+      }
       return Ok(Eof)
     }
-    state.carry = memGetBuffer(s.readBuf).slice(0, n)
+    state.carry = state.chunk
+    state.chunk = noBytes()
+    val _ = semRelease(state.taken)
     Ok(Data(bytes = takeCarry(state, maxBytes)))
   } catch Bug as b {
     Err(causeOf(b.message))
   }
 }
 
-/// Write all of `bytes` and flush.
-pub func sockWrite(s: in Sock, bytes: in slice[Byte]): Result[Unit, String] {
+/// Write all of `bytes` and flush. The write is given up, with an `Err`, when
+/// the peer accepts no data for `timeoutMs` milliseconds (`0` = no limit);
+/// how much was written by then is unknown, so the connection is of no further
+/// use.
+pub func sockWriteWithin(s: in Sock, bytes: in slice[Byte], timeoutMs: in Int): Result[Unit, String]
+  requires: timeoutMs >= 0
+{
+  val started = tickCount64()
   try {
+    clientSetSendTimeout(s.client, timeoutMs)
     streamWriteFrom(s.stream, bytes, 0, bytes.length)
     streamFlush(s.stream)
     Ok(())
   } catch Bug as b {
-    Err(b.message)
+    if timeoutMs > 0 and tickCount64() - started >= timeoutMs.toLong() {
+      Err("the write timed out: the peer accepted no data for " + timeoutMs.toString() + " ms")
+    } else {
+      Err(b.message)
+    }
   }
+}
+
+/// Write all of `bytes` and flush, however long the peer takes to accept them.
+pub func sockWrite(s: in Sock, bytes: in slice[Byte]): Result[Unit, String] {
+  sockWriteWithin(s, bytes, 0)
 }
 
 /// Close the connection. Closing twice is harmless.
@@ -510,6 +650,13 @@ pub func sockClose(s: in Sock): Unit {
     ()
   }
   closeQuietly(s.client)
+  // A reader waiting for its last chunk to be taken goes on to a read that
+  // now fails, and ends.
+  try {
+    val _ = semRelease(s.reader.taken)
+  } catch Bug as _ {
+    ()
+  }
 }
 
 // ─── TLS ─────────────────────────────────────────────────────────────────────
@@ -602,32 +749,12 @@ func serverOptions(tls: in ServerTls): Result[SslServerOptions, String] {
   Ok(options)
 }
 
-ref record Handshake {
-  var failure: String
-}
-
-func runGuarded(outcome: in Handshake, work: in () -> Unit): Unit {
-  try {
-    work()
-  } catch Bug as b {
-    outcome.failure = if b.message.length > 0 { b.message } else { "the handshake failed" }
-  }
-}
-
-// Run a blocking handshake on another thread so it can be abandoned: the
-// caller closes the socket on `Err`, which ends a handshake still in flight.
+// A handshake that fails or outlasts `timeoutMs` (0 = no limit) is an `Err`.
 func handshakeWithin(work: in () -> Unit, timeoutMs: in Int): Result[Unit, String] {
-  val outcome = Handshake(failure = "")
-  val running = taskRun({ -> runGuarded(outcome, work) })
-  if timeoutMs == 0 {
-    taskWait(running)
-  } else if not taskWaitFor(running, timeoutMs) {
-    return Err("timed out after " + timeoutMs.toString() + " ms")
-  }
-  if outcome.failure.length > 0 {
-    Err(outcome.failure)
-  } else {
-    Ok(())
+  match runWithin(work, timeoutMs, "the handshake failed") {
+    case Ok(true) -> Ok(())
+    case Ok(false) -> Err("timed out after " + timeoutMs.toString() + " ms")
+    case Err(e) -> Err(e)
   }
 }
 
@@ -721,8 +848,14 @@ pub func serverClose(server: in ServerSock): Unit {
   }
 }
 
-/// Run `work` on another thread.
+/// Run `work` on a thread of its own.
 pub func startBackground(work: in () -> Unit): Background {
+  Background(task = runDedicated(work))
+}
+
+/// Queue `work` to the runtime's shared thread pool, which the rest of this
+/// kernel stays away from. For tests that keep the pool busy.
+pub func startPoolWork(work: in () -> Unit): Background {
   Background(task = taskRun(work))
 }
 
@@ -748,13 +881,21 @@ pub func monotonicMillis(): Long {
 }
 
 pub func newLock(): Lock {
-  Lock()
+  Lock(gate = NetObject.new())
 }
 
 pub func lockEnter(l: in Lock): Unit {
-  monitorEnter(l)
+  NetMonitor.Enter(l.gate)
+}
+
+/// Take the lock if it becomes free within `timeoutMs` milliseconds (`0` =
+/// only if it is free now). False when it did not.
+pub func lockTryEnter(l: in Lock, timeoutMs: in Int): Bool
+  requires: timeoutMs >= 0
+{
+  NetMonitor.TryEnter(l.gate, timeoutMs)
 }
 
 pub func lockExit(l: in Lock): Unit {
-  monitorExit(l)
+  NetMonitor.Exit(l.gate)
 }

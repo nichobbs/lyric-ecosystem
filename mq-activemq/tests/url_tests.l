@@ -103,6 +103,16 @@ test "malformed URLs are rejected with a reason" {
   assertTrue(Str.contains(rejected("stomp://[::1]x"), "unexpected text"), "junk after IPv6")
 }
 
+test "an IPv6 address without brackets is rejected" {
+  assertTrue(Str.contains(rejected("stomp://::1"), "brackets"), "::1 is not host '::' and port 1")
+  assertTrue(Str.contains(rejected("stomp://::1:61613"), "brackets"), "with a port")
+  assertTrue(Str.contains(rejected("stomp://u:p@fe80::1"), "brackets"), "after credentials")
+  assertTrue(
+    Str.contains(rejected("stomp+ssl://2001:db8::7:61614"), "stomp+ssl://[::1]:61614"),
+    "the error shows the form"
+  )
+}
+
 test "an error never repeats the passcode" {
   val e = rejected("stomp://user:hunter2@h:notaport")
   assertTrue(not Str.contains(e, "hunter2"), "the passcode is not echoed")

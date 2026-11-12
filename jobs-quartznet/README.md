@@ -367,7 +367,7 @@ Quartz.NET 4.x is not supported: its `IJob.Execute` returns a `ValueTask`.
 - Cron expressions use the process's local time zone; there is no per-job time zone.
 - `schedule` always uses `MisfirePolicy.Smart`; choose another policy with `Triggers.quartzCron` and
   `scheduleTrigger`.
-- Compiler issues met while writing this package (to be filed in `nichobbs/lyric-lang`; none is worked
+- Compiler issues met while writing this package (nichobbs/lyric-lang#9068; none is worked
   around with a shim):
   - `impl Interface for T` where `T` is a `pub opaque type` does not produce a working implementation,
     so `QuartzJobScheduler` is a `pub record` whose internals sit in the opaque `QuartzState`
