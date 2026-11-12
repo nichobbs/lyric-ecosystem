@@ -1,0 +1,34 @@
+[package]
+name        = "Lyric.Session.Redis"
+version     = "0.1.0"
+stability   = "experimental"
+authors     = ["Lyric Contributors"]
+license     = "MIT"
+description = "Redis backend for the Lyric.Session SessionStore interface, on the pure-Lyric Lyric.Redis client."
+targets     = ["dotnet", "jvm"]
+
+[project]
+name            = "Lyric.Session.Redis"
+output          = "single"
+output_assembly = "Session.Redis.dll"
+
+[project.packages]
+"Session.Redis"       = "src/session_redis.l"
+"Session.Redis.Admin" = "src/session_redis_admin.l"
+
+[project.tests]
+"Session.Redis.StoreTests"       = "tests/session_redis_tests.l"
+# Needs a real Redis: file-level `@cfg(feature = "integration")`, so a plain
+# `lyric test` reports the module as gated and stays hermetic.
+"Session.Redis.IntegrationTests" = "tests/integration/session_redis_integration_tests.l"
+
+[features]
+default     = []
+integration = []   # run tests/integration against the server named by LYRIC_REDIS_URL
+
+[dependencies]
+# The interface and its conformance suite, resolved through the root
+# [workspace.overrides].
+"Lyric.Testing"  = { workspace = true }
+"Lyric.Session"  = { workspace = true }
+"Lyric.Redis"   = { workspace = true }

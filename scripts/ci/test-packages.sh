@@ -5,9 +5,11 @@
 #
 # Usage: scripts/ci/test-packages.sh <dotnet|jvm> [--integration]
 #
-# Default: the hermetic suites, i.e. every `[project.tests]` entry of
-# `<package>/lyric.toml`. With --integration: the suites that need a real
-# service, declared in `<package>/tests/integration/lyric.toml`.
+# Default: the hermetic suites. With --integration: only the packages that
+# declare an `integration` feature, run with `--features integration`, which
+# enables their `@cfg(feature = "integration")` suites under tests/integration/
+# (they need a real service; the package README names the environment
+# variables that locate it).
 #
 # Environment: LYRIC names the compiler binary (default: `lyric` on PATH).
 set -euo pipefail
@@ -30,9 +32,10 @@ ran=0
 for manifest in */lyric.toml; do
   pkg="$(dirname "$manifest")"
   claims_target "$manifest" || { echo "== $pkg: does not claim $target, skipped"; continue; }
+  extra=()
   if [ "$mode" = "--integration" ]; then
-    manifest="$pkg/tests/integration/lyric.toml"
-    [ -f "$manifest" ] || continue
+    grep -Eq '^integration[[:space:]]*=' "$manifest" || continue
+    extra=(--features integration)
   fi
   echo "== $pkg ($manifest, --target $target)"
   ran=$((ran + 1))
@@ -40,7 +43,7 @@ for manifest in */lyric.toml; do
     failed+=("$pkg (restore)")
     continue
   fi
-  if ! "$lyric" test --manifest "$manifest" --target "$target"; then
+  if ! "$lyric" test --manifest "$manifest" --target "$target" "${extra[@]}"; then
     failed+=("$pkg")
   fi
 done

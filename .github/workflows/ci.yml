@@ -39,3 +39,38 @@ jobs:
       - name: Test packages
         working-directory: lyric-ecosystem
         run: bash scripts/ci/test-packages.sh ${{ matrix.target }}
+
+  # Suites that need a real service (`--features integration`), against
+  # disposable service containers.
+  integration:
+    name: integration (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [dotnet, jvm]
+    services:
+      redis:
+        image: redis:7.4
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      LYRIC_REDIS_URL: redis://127.0.0.1:6379
+    steps:
+      - name: Check out lyric-ecosystem
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: lyric-ecosystem
+
+      - name: Set up Lyric
+        uses: ./lyric-ecosystem/.github/actions/setup-lyric
+
+      - name: Test packages against the services
+        working-directory: lyric-ecosystem
+        run: bash scripts/ci/test-packages.sh ${{ matrix.target }} --integration

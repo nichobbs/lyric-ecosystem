@@ -6,6 +6,8 @@ set -euo pipefail
 lyric="${LYRIC:-lyric}"
 cd "$(dirname "$0")/../.."
 
+"$lyric" --version >/dev/null || { echo "error: cannot run the compiler ($lyric); set LYRIC" >&2; exit 2; }
+
 status=0
 while IFS= read -r file; do
   if ! "$lyric" fmt --check "$file" >/dev/null 2>&1; then
