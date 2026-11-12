@@ -1,0 +1,656 @@
+//! tests/integration/activemq_integration_tests.l - the backend against a
+//! real Apache ActiveMQ Classic broker.
+//!
+//! Runs only with `--features integration`. The broker is named by
+//! `LYRIC_ACTIVEMQ_URL` (`stomp://login:passcode@host:port`); every test fails
+//! with a message saying so when the variable is unset. The broker must
+//! enforce authentication (the bad-credentials test expects a refusal) and
+//! use the default dead-letter strategy (the shared `ActiveMQ.DLQ` queue).
+//! Each test uses its own destination, named with a fresh UUID.
+@cfg(feature = "integration")
+@test_module
+package Mq.ActiveMq.IntegrationTests
+
+import Std.Core
+import Std.Collections
+import Std.Testing
+import Std.Encoding
+import Std.String as Str
+import Std.Uuid as Uuid
+import Std.Environment as Env
+import Testing.Conformance
+import Testing.Conformance.Mq as MqConformance
+import Mq
+import Mq.ActiveMq as ActiveMq
+import Mq.ActiveMq.Extras as Extras
+import Mq.ActiveMq.Kernel as K
+import Mq.ActiveMq.Stomp as Stomp
+import Mq.ActiveMq.Url as Url
+
+func brokerUrl(): String {
+  val url = Env.getVarOrDefault("LYRIC_ACTIVEMQ_URL", "")
+  if url.length == 0 {
+    panic(
+      "LYRIC_ACTIVEMQ_URL is not set; the integration tests need a running ActiveMQ, e.g. LYRIC_ACTIVEMQ_URL=stomp://user:passcode@127.0.0.1:61613"
+    )
+  }
+  url
+}
+
+func brokerAddress(): Url.BrokerAddress {
+  match Url.parseUrl(brokerUrl()) {
+    case Ok(a) -> a
+    case Err(e) -> panic("LYRIC_ACTIVEMQ_URL: " + e)
+  }
+}
+
+func unique(prefix: in String): String {
+  prefix + "." + Uuid.uuidToString(Uuid.newUuid())
+}
+
+func optionsFor(destination: in String): ActiveMq.ConnectOptions {
+  val address = brokerAddress()
+  val base = ActiveMq.defaultOptions(address.host, address.port, destination)
+  base.copy(login = address.login, passcode = address.passcode)
+}
+
+func open(options: in ActiveMq.ConnectOptions): ActiveMq.ActiveMqQueue {
+  match ActiveMq.connectWith(options) {
+    case Ok(q) -> q
+    case Err(e) -> panic("connect failed: " + e)
+  }
+}
+
+func openQueue(): ActiveMq.ActiveMqQueue {
+  open(optionsFor(Extras.queueDestination(unique("lyric.it"))))
+}
+
+func message(id: in String, body: in String): Mq.Message {
+  Mq.Message(id = id, body = body, headers = [], deliveryCount = 0)
+}
+
+func mustPublish(q: in ActiveMq.ActiveMqQueue, m: in Mq.Message): Unit {
+  match q.publish(m) {
+    case Ok(_) -> ()
+    case Err(e) -> panic("publish failed: " + e)
+  }
+}
+
+func mustPublishWith(q: in ActiveMq.ActiveMqQueue, m: in Mq.Message, options: in Extras.SendOptions): Unit {
+  match Extras.publishWith(q, m, options) {
+    case Ok(_) -> ()
+    case Err(e) -> panic("publishWith failed: " + e)
+  }
+}
+
+ref record Got {
+  var messages: List[Mq.Message]
+}
+
+func keep(got: in Got, m: in Mq.Message): Result[Unit, String] {
+  got.messages.add(m)
+  Ok(())
+}
+
+func mustTake(q: in ActiveMq.ActiveMqQueue): Mq.Message {
+  val got = Got(messages = newList())
+  match q.consume(5000, { m -> keep(got, m) }) {
+    case Ok(_) -> got.messages[0]
+    case Err(e) -> panic("consume failed: " + e)
+  }
+}
+
+func expectNothing(q: in ActiveMq.ActiveMqQueue, waitMs: in Int, label: in String): Unit {
+  val got = Got(messages = newList())
+  match q.consume(waitMs, { m -> keep(got, m) }) {
+    case Err(e) -> assertEqual(e, "timeout", label)
+    case Ok(_) -> assertTrue(false, label + ": delivered " + got.messages[0].id)
+  }
+}
+
+func errorOf(r: in Result[Unit, String], label: in String): String {
+  match r {
+    case Err(e) -> e
+    case Ok(_) -> {
+      assertTrue(false, label + ": expected an Err")
+      ""
+    }
+  }
+}
+
+func expectContains(text: in String, part: in String, label: in String): Unit {
+  assertTrue(Str.contains(text, part), label + ": got \"" + text + "\"")
+}
+
+// ─── Conformance ─────────────────────────────────────────────────────────────
+ref record Opened {
+  var queues: List[ActiveMq.ActiveMqQueue]
+}
+
+val opened: Opened = Opened(queues = newList())
+
+func makeEnds(): MqConformance.QueueEnds {
+  val q = openQueue()
+  opened.queues.add(q)
+  val publisher: Mq.MessageQueue = q
+  val consumer: Mq.QueueConsumer = q
+  MqConformance.QueueEnds(publisher = publisher, consumer = consumer)
+}
+
+test "ActiveMQ conforms to MessageQueue and QueueConsumer" {
+  val checks = MqConformance.runQueue({ -> makeEnds() })
+  for q in opened.queues.toArray() {
+    q.close()
+  }
+  requireConformance(checks)
+}
+
+// ─── Connecting ──────────────────────────────────────────────────────────────
+test "the broker identifies itself as ActiveMQ" {
+  val q = openQueue()
+  assertTrue(Str.startsWith(ActiveMq.serverInfo(q), "ActiveMQ/"), "server header: " + ActiveMq.serverInfo(q))
+  q.close()
+}
+
+test "connectUrl reaches the broker named by the URL" {
+  val name = unique("lyric.it.url")
+  match ActiveMq.connectUrl(brokerUrl(), name) {
+    case Err(e) -> assertTrue(false, e)
+    case Ok(q) -> {
+      assertEqual(ActiveMq.destination(q), "/queue/" + name, "destination")
+      mustPublish(q, message("u-1", "via url"))
+      val got = mustTake(q)
+      assertEqual(got.body, "via url", "round trip")
+      assertTrue(isOk(q.ack(got.id)), "ack")
+      q.close()
+    }
+  }
+}
+
+test "a refused connection is an Err" {
+  val server = match K.serverListen("127.0.0.1", 0) { case Ok(s) -> s; case Err(e) -> panic(e) }
+  val port = K.serverPort(server)
+  K.serverClose(server)
+  match ActiveMq.connectWith(ActiveMq.defaultOptions("127.0.0.1", port, "/queue/a")) {
+    case Ok(_) -> assertTrue(false, "nothing listens there")
+    case Err(e) -> expectContains(e, "activemq: cannot connect to 127.0.0.1:" + port.toString(), "refused")
+  }
+}
+
+test "bad credentials are refused by the broker" {
+  val options = optionsFor(Extras.queueDestination(unique("lyric.it")))
+  match ActiveMq.connectWith(options.copy(passcode = "definitely-not-the-passcode")) {
+    case Ok(q) -> {
+      q.close()
+      assertTrue(false, "the broker accepted a wrong passcode; it must enforce authentication for this suite")
+    }
+    case Err(e) -> {
+      expectContains(e, "activemq: broker error:", "an ERROR frame")
+      assertTrue(not Str.contains(e, "definitely-not-the-passcode"), "the passcode is not echoed")
+    }
+  }
+}
+
+test "a broker ERROR frame is reported, here for an invalid selector" {
+  val options = optionsFor(Extras.queueDestination(unique("lyric.it")))
+  val q = open(options.copy(selector = "color = = 'red' ("))
+  val e = errorOf(q.consume(1000, { m -> Ok(()) }), "subscribe with a broken selector")
+  expectContains(e, "activemq: broker error:", "an ERROR frame")
+  q.close()
+}
+
+test "a second ack of one delivery is refused and the connection survives" {
+  val q = openQueue()
+  mustPublish(q, message("m", "x"))
+  val got = mustTake(q)
+  assertTrue(isOk(q.ack(got.id)), "ack")
+  assertTrue(isErr(q.ack(got.id)), "the client refuses a second ack itself")
+  mustPublish(q, message("n", "y"))
+  assertEqual(mustTake(q).id, "n", "still usable")
+  assertTrue(isOk(q.ack("n")), "ack")
+  q.close()
+}
+
+// ─── Redelivery and dead-lettering ───────────────────────────────────────────
+test "a requeue keeps the body and headers and counts every round" {
+  val q = openQueue()
+  val body = "payload \u{0000} with NUL, \"quotes\", café 世\nline2"
+  val sent = Mq.Message(
+    id = "r:1 é",
+    body = body,
+    headers = [
+      Mq.MessageHeader(key = "content-type", value = "text/plain"),
+      Mq.MessageHeader(key = "k:colon\nnewline", value = "v\\backslash"),
+      Mq.MessageHeader(key = "content-type", value = "duplicate key kept")
+    ],
+    deliveryCount = 0
+  )
+  mustPublish(q, sent)
+  var round = 0
+  while round < 4 {
+    val got = mustTake(q)
+    assertEqual(got.id, "r:1 é", "id in round " + round.toString())
+    assertEqual(got.body, body, "body in round " + round.toString())
+    assertEqualInt(got.deliveryCount, round, "deliveryCount in round " + round.toString())
+    assertEqualInt(got.headers.length, 3, "header count in round " + round.toString())
+    assertEqual(got.headers[1].key, "k:colon\nnewline", "an awkward header key")
+    assertEqual(got.headers[1].value, "v\\backslash", "an awkward header value")
+    assertEqual(got.headers[2].value, "duplicate key kept", "a repeated key keeps its place")
+    assertTrue(isOk(q.nack(got.id, true)), "requeue")
+    round += 1
+  }
+  val last = mustTake(q)
+  assertEqualInt(last.deliveryCount, 4, "after four requeues")
+  assertTrue(isOk(q.ack(last.id)), "ack")
+  expectNothing(q, 300, "nothing is left")
+  q.close()
+}
+
+test "a requeued message goes behind the messages already waiting" {
+  val options = optionsFor(Extras.queueDestination(unique("lyric.it")))
+  val q = open(options.copy(prefetchSize = 1))
+  mustPublish(q, message("first", "1"))
+  mustPublish(q, message("second", "2"))
+  val a = mustTake(q)
+  assertEqual(a.id, "first", "first delivery")
+  assertTrue(isOk(q.nack(a.id, true)), "requeue the first")
+  val b = mustTake(q)
+  assertEqual(b.id, "second", "the waiting message comes next")
+  assertTrue(isOk(q.ack(b.id)), "ack")
+  val c = mustTake(q)
+  assertEqual(c.id, "first", "then the requeued one")
+  assertEqualInt(c.deliveryCount, 1, "with its count raised")
+  assertTrue(isOk(q.ack(c.id)), "ack")
+  q.close()
+}
+
+test "deliveries left unsettled at close are redelivered to the next consumer" {
+  val destination = Extras.queueDestination(unique("lyric.it"))
+  val first = open(optionsFor(destination))
+  mustPublish(first, message("left-1", "a"))
+  mustPublish(first, message("left-2", "b"))
+  assertEqual(mustTake(first).id, "left-1", "delivered to the first consumer")
+  assertEqual(mustTake(first).id, "left-2", "delivered to the first consumer")
+  first.close()
+  val second = open(optionsFor(destination))
+  val a = mustTake(second)
+  assertEqual(a.id, "left-1", "order is kept")
+  assertEqualInt(a.deliveryCount, 1, "the broker's redelivered flag counts as one delivery")
+  val b = mustTake(second)
+  assertEqual(b.id, "left-2", "second message")
+  assertEqualInt(b.deliveryCount, 1, "also flagged")
+  assertTrue(isOk(second.ack(a.id)), "ack")
+  assertTrue(isOk(second.ack(b.id)), "ack")
+  expectNothing(second, 300, "nothing is left")
+  second.close()
+}
+
+func deadLetterConsumer(messageId: in String): ActiveMq.ActiveMqQueue {
+  val options = optionsFor("/queue/ActiveMQ.DLQ")
+  open(options.copy(selector = Extras.selectorForId(messageId)))
+}
+
+test "a rejected persistent message moves to the broker's dead-letter queue" {
+  val q = openQueue()
+  val id = unique("dlq")
+  mustPublish(
+    q,
+    Mq.Message(id = id, body = "poison", headers = [Mq.MessageHeader(key = "why", value = "test")], deliveryCount = 0)
+  )
+  val got = mustTake(q)
+  assertTrue(isOk(q.nack(got.id, false)), "reject")
+  expectNothing(q, 300, "a rejected message is not redelivered")
+  q.close()
+  val dlq = deadLetterConsumer(id)
+  val dead = mustTake(dlq)
+  assertEqual(dead.id, id, "the dead letter keeps its id")
+  assertEqual(dead.body, "poison", "and its body")
+  assertEqualInt(dead.headers.length, 1, "and its headers")
+  assertTrue(isOk(dlq.ack(dead.id)), "remove it from the dead-letter queue")
+  dlq.close()
+}
+
+test "a rejected non-persistent message is discarded" {
+  val q = openQueue()
+  val id = unique("dlq.np")
+  val options = Extras.defaultSendOptions()
+  mustPublishWith(q, message(id, "transient"), options.copy(persistent = false))
+  val got = mustTake(q)
+  assertTrue(isOk(q.nack(got.id, false)), "reject")
+  expectNothing(q, 300, "not redelivered")
+  q.close()
+  val dlq = deadLetterConsumer(id)
+  expectNothing(dlq, 700, "not dead-lettered either")
+  dlq.close()
+}
+
+// ─── Batches, Auto mode, large and foreign messages ──────────────────────────
+test "publishBatch delivers the whole batch in order" {
+  val q = openQueue()
+  val batch: List[Mq.Message] = newList()
+  var n = 0
+  while n < 25 {
+    batch.add(message("b-" + n.toString(), n.toString()))
+    n += 1
+  }
+  match q.publishBatch(batch.toArray()) {
+    case Ok(_) -> ()
+    case Err(e) -> assertTrue(false, e)
+  }
+  n = 0
+  while n < 25 {
+    val got = mustTake(q)
+    assertEqual(got.id, "b-" + n.toString(), "batch order")
+    assertTrue(isOk(q.ack(got.id)), "ack")
+    n += 1
+  }
+  expectNothing(q, 300, "exactly the batch")
+  q.close()
+}
+
+test "Auto mode acknowledges on Ok and requeues on Err" {
+  val options = optionsFor(Extras.queueDestination(unique("lyric.it")))
+  val q = open(options.copy(ackMode = Mq.AckMode.Auto))
+  mustPublish(q, message("auto", "x"))
+  val refused = errorOf(q.consume(5000, { m -> Err("not now") }), "a failing handler")
+  assertEqual(refused, "not now", "the handler's error is returned")
+  val again = mustTake(q)
+  assertEqual(again.id, "auto", "redelivered")
+  assertEqualInt(again.deliveryCount, 1, "with a higher count")
+  assertEqualInt(ActiveMq.unsettledCount(q), 0, "acknowledged by consume")
+  q.close()
+  val check = open(options)
+  expectNothing(check, 500, "the acknowledged message is gone for good")
+  check.close()
+}
+
+test "a 300 KiB body round-trips" {
+  val parts: List[String] = newList()
+  var n = 0
+  while n < 30000 {
+    parts.add("0123456789")
+    n += 1
+  }
+  parts.add("é世 end")
+  val body = Str.joinList("", parts)
+  val q = openQueue()
+  mustPublish(q, message("large", body))
+  val got = mustTake(q)
+  assertEqualInt(got.body.length, body.length, "length")
+  assertTrue(got.body == body, "content")
+  assertTrue(isOk(q.ack(got.id)), "ack")
+  q.close()
+}
+
+// A producer that is not this client: raw STOMP frames on a socket.
+func rawSend(destination: in String, headers: in slice[Stomp.Header], body: in slice[Byte]): Unit {
+  val address = brokerAddress()
+  val sock = match K.sockConnect(address.host, address.port, 5000) { case Ok(s) -> s; case Err(e) -> panic(e) }
+  val all: List[Stomp.Header] = newList()
+  all.add(Stomp.Header(name = "destination", value = destination))
+  all.add(Stomp.Header(name = "receipt", value = "raw-1"))
+  for header in headers {
+    all.add(header)
+  }
+  val frames = [
+    Stomp.bareFrame(
+      "CONNECT",
+      [
+        Stomp.Header(name = "accept-version", value = "1.2"),
+        Stomp.Header(name = "host", value = address.host),
+        Stomp.Header(name = "login", value = address.login),
+        Stomp.Header(name = "passcode", value = address.passcode)
+      ]
+    ),
+    Stomp.Frame(command = "SEND", headers = all.toArray(), body = body),
+    Stomp.bareFrame("DISCONNECT", [Stomp.Header(name = "receipt", value = "raw-2")])
+  ]
+  val decoder = Stomp.newDecoder(65536)
+  for frame in frames {
+    match Stomp.encodeFrame(frame) {
+      case Ok(bytes) -> {
+        val _ = K.sockWrite(sock, bytes)
+      }
+      case Err(e) -> panic(e)
+    }
+    var answered = false
+    while not answered {
+      match Stomp.nextFrame(decoder) {
+        case Ok(Some(answer)) -> {
+          if answer.command == "ERROR" {
+            panic("the broker refused a raw frame: " + Stomp.headerOr(answer, "message", ""))
+          }
+          answered = true
+        }
+        case Ok(None) -> match K.sockRead(sock, 4096, 5000) {
+          case Ok(Data(bytes)) -> Stomp.feed(decoder, bytes)
+          case _ -> panic("the broker did not answer a raw frame")
+        }
+        case Err(e) -> panic(e)
+      }
+    }
+  }
+  K.sockClose(sock)
+}
+
+test "a text message from another STOMP producer is delivered with its broker id and headers" {
+  val destination = Extras.queueDestination(unique("lyric.it"))
+  rawSend(destination, [Stomp.Header(name = "trace", value = "abc")], encodeUtf8("from elsewhere"))
+  val q = open(optionsFor(destination))
+  val got = mustTake(q)
+  assertTrue(Str.startsWith(got.id, "ID:"), "the id is the broker's message-id, got " + got.id)
+  assertEqual(got.body, "from elsewhere", "body")
+  assertEqualInt(got.headers.length, 1, "application headers only")
+  assertEqual(got.headers[0].key, "trace", "header key")
+  assertEqual(got.headers[0].value, "abc", "header value")
+  assertEqualInt(got.deliveryCount, 0, "first delivery")
+  assertTrue(isOk(q.nack(got.id, true)), "a foreign message can be requeued")
+  val again = mustTake(q)
+  assertEqual(again.body, "from elsewhere", "requeued body")
+  assertEqualInt(again.deliveryCount, 1, "requeued count")
+  assertTrue(isOk(q.ack(again.id)), "ack")
+  q.close()
+}
+
+test "a binary message is rejected to the dead-letter queue and does not block the queue" {
+  val destination = Extras.queueDestination(unique("lyric.it"))
+  val binary: slice[Byte] = [255u8, 254u8, 0u8, 1u8]
+  rawSend(destination, [Stomp.Header(name = "persistent", value = "true")], binary)
+  val q = open(optionsFor(destination))
+  val e = errorOf(q.consume(5000, { m -> Ok(()) }), "consume a binary message")
+  expectContains(e, "cannot be delivered: its body is not UTF-8 text", "reason")
+  expectContains(e, "rejected to the broker's dead-letter handling", "outcome")
+  mustPublish(q, message("next", "fine"))
+  val got = mustTake(q)
+  assertEqual(got.id, "next", "the queue is not blocked")
+  assertTrue(isOk(q.ack(got.id)), "ack")
+  q.close()
+}
+
+// ─── Extras: delivery options, selectors, topics ─────────────────────────────
+test "a selector on a property delivers only the matching messages" {
+  val destination = Extras.queueDestination(unique("lyric.it"))
+  val publisher = open(optionsFor(destination))
+  val base = Extras.defaultSendOptions()
+  mustPublishWith(
+    publisher,
+    message("blue-1", "b"),
+    base.copy(properties = [Extras.Property(name = "color", value = "blue")])
+  )
+  mustPublishWith(
+    publisher,
+    message("red-1", "r"),
+    base.copy(properties = [Extras.Property(name = "color", value = "red")])
+  )
+  mustPublishWith(
+    publisher,
+    message("red-2", "r'"),
+    base.copy(properties = [Extras.Property(name = "color", value = "red")])
+  )
+  val options = optionsFor(destination)
+  val reds = open(options.copy(selector = Extras.selectorEquals("color", "red")))
+  val first = mustTake(reds)
+  assertEqual(first.id, "red-1", "first red")
+  val second = mustTake(reds)
+  assertEqual(second.id, "red-2", "second red")
+  assertTrue(isOk(reds.ack(first.id)), "ack")
+  assertTrue(isOk(reds.ack(second.id)), "ack")
+  expectNothing(reds, 300, "blue is not selected")
+  reds.close()
+  val rest = open(options)
+  val blue = mustTake(rest)
+  assertEqual(blue.id, "blue-1", "the unselected message is still queued")
+  assertTrue(isOk(rest.ack(blue.id)), "ack")
+  rest.close()
+  publisher.close()
+}
+
+func takeSelected(destination: in String, selector: in String, label: in String): String {
+  val options = optionsFor(destination)
+  val q = open(options.copy(selector = selector))
+  val got = mustTake(q)
+  assertTrue(isOk(q.ack(got.id)), "ack " + label)
+  expectNothing(q, 200, "only one message matches " + label)
+  q.close()
+  got.id
+}
+
+test "priority, correlation id, type and delivery mode reach the broker" {
+  val destination = Extras.queueDestination(unique("lyric.it"))
+  val publisher = open(optionsFor(destination))
+  val base = Extras.defaultSendOptions()
+  mustPublishWith(publisher, message("urgent", "1"), base.copy(priority = 9))
+  mustPublishWith(publisher, message("correlated", "2"), base.copy(correlationId = "corr-42"))
+  mustPublishWith(publisher, message("typed", "3"), base.copy(jmsType = "invoice"))
+  mustPublishWith(publisher, message("transient", "4"), base.copy(persistent = false))
+  assertEqual(takeSelected(destination, "JMSPriority = 9", "priority"), "urgent", "JMSPriority")
+  assertEqual(
+    takeSelected(destination, "JMSCorrelationID = 'corr-42'", "correlation"),
+    "correlated",
+    "JMSCorrelationID"
+  )
+  assertEqual(takeSelected(destination, "JMSType = 'invoice'", "type"), "typed", "JMSType")
+  assertEqual(
+    takeSelected(destination, "JMSDeliveryMode = 'NON_PERSISTENT'", "delivery mode"),
+    "transient",
+    "JMSDeliveryMode"
+  )
+  publisher.close()
+}
+
+test "a message past its time to live is not delivered" {
+  val q = openQueue()
+  val base = Extras.defaultSendOptions()
+  mustPublishWith(q, message("short-lived", "x"), base.copy(timeToLiveMs = 200i64, persistent = false))
+  mustPublishWith(q, message("long-lived", "y"), base.copy(timeToLiveMs = 60000i64))
+  K.sleepMs(700)
+  val got = mustTake(q)
+  assertEqual(got.id, "long-lived", "only the unexpired message arrives")
+  assertTrue(isOk(q.ack(got.id)), "ack")
+  expectNothing(q, 300, "the expired one never arrives")
+  q.close()
+}
+
+test "invalid send options are refused before anything is sent" {
+  val q = openQueue()
+  val base = Extras.defaultSendOptions()
+  expectContains(
+    errorOf(Extras.publishWith(q, message("m", "x"), base.copy(priority = 10)), "priority"),
+    "outside 0..9",
+    "priority"
+  )
+  expectContains(
+    errorOf(Extras.publishWith(q, message("m", "x"), base.copy(timeToLiveMs = -1i64)), "ttl"),
+    "timeToLiveMs",
+    "time to live"
+  )
+  expectContains(
+    errorOf(
+      Extras.publishWith(
+        q,
+        message("m", "x"),
+        base.copy(properties = [Extras.Property(name = "bad-name", value = "v")])
+      ),
+      "property name"
+    ),
+    "cannot be used as a JMS property name",
+    "property name"
+  )
+  expectNothing(q, 300, "nothing was published")
+  q.close()
+}
+
+test "a topic delivers a copy to every subscriber and nothing to a late one" {
+  val destination = Extras.topicDestination(unique("lyric.it.topic"))
+  val one = open(optionsFor(destination))
+  val two = open(optionsFor(destination))
+  assertTrue(isOk(ActiveMq.subscribe(one)), "first subscription")
+  assertTrue(isOk(ActiveMq.subscribe(two)), "second subscription")
+  val publisher = open(optionsFor(destination))
+  mustPublish(publisher, message("tick", "42"))
+  val a = mustTake(one)
+  val b = mustTake(two)
+  assertEqual(a.id, "tick", "first subscriber")
+  assertEqual(b.id, "tick", "second subscriber")
+  assertEqual(b.body, "42", "body")
+  assertTrue(isOk(one.ack(a.id)), "ack")
+  assertTrue(isOk(two.ack(b.id)), "ack")
+  val late = open(optionsFor(destination))
+  expectNothing(late, 300, "a subscription opened after the publish gets nothing")
+  late.close()
+  publisher.close()
+  one.close()
+  two.close()
+}
+
+// ─── Several consumers ───────────────────────────────────────────────────────
+func drain(q: in ActiveMq.ActiveMqQueue, got: in Got): Unit {
+  var idle = 0
+  while idle < 3 {
+    val before = got.messages.count
+    match q.consume(300, { m -> keep(got, m) }) {
+      case Ok(_) -> {
+        val _ = q.ack(got.messages[before].id)
+        idle = 0
+      }
+      case Err(_) -> {
+        idle += 1
+      }
+    }
+  }
+}
+
+test "two consumers on their own threads share a queue without loss or duplication" {
+  val destination = Extras.queueDestination(unique("lyric.it"))
+  val publisher = open(optionsFor(destination))
+  val options = optionsFor(destination)
+  val left = open(options.copy(prefetchSize = 1))
+  val right = open(options.copy(prefetchSize = 1))
+  assertTrue(isOk(ActiveMq.subscribe(left)), "left subscription")
+  assertTrue(isOk(ActiveMq.subscribe(right)), "right subscription")
+  val count = 60
+  var n = 0
+  while n < count {
+    mustPublish(publisher, message("w-" + n.toString(), n.toString()))
+    n += 1
+  }
+  val leftGot = Got(messages = newList())
+  val rightGot = Got(messages = newList())
+  val leftWork = K.startBackground({ -> drain(left, leftGot) })
+  val rightWork = K.startBackground({ -> drain(right, rightGot) })
+  K.waitBackground(leftWork)
+  K.waitBackground(rightWork)
+  val seen: Map[String, Bool] = newMap()
+  for m in leftGot.messages.toArray() {
+    seen[m.id] = true
+  }
+  for m in rightGot.messages.toArray() {
+    seen[m.id] = true
+  }
+  assertEqualInt(leftGot.messages.count + rightGot.messages.count, count, "every message was delivered once")
+  assertEqualInt(seen.count, count, "and no id twice")
+  assertTrue(leftGot.messages.count > 0 and rightGot.messages.count > 0, "both consumers took part")
+  left.close()
+  right.close()
+  publisher.close()
+}

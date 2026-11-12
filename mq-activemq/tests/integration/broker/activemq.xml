@@ -1,0 +1,27 @@
+<!--
+  Broker for the integration suite: ActiveMQ Classic, in memory, with one user
+  and a STOMP connector on 127.0.0.1. The user, passcode and port come from
+  system properties so no credential is written here:
+
+    -Dlyric.activemq.user=... -Dlyric.activemq.passcode=... -Dlyric.activemq.stompPort=...
+
+  See the README's "Tests" section for the command line.
+-->
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+                           http://activemq.apache.org/schema/core http://activemq.apache.org/schema/core/activemq-core.xsd">
+  <bean class="org.springframework.beans.factory.config.PropertyPlaceholderConfigurer"/>
+  <broker xmlns="http://activemq.apache.org/schema/core" brokerName="lyric-integration" persistent="false" useJmx="false">
+    <plugins>
+      <simpleAuthenticationPlugin>
+        <users>
+          <authenticationUser username="${lyric.activemq.user}" password="${lyric.activemq.passcode}" groups="users,admins"/>
+        </users>
+      </simpleAuthenticationPlugin>
+    </plugins>
+    <transportConnectors>
+      <transportConnector name="stomp" uri="stomp://127.0.0.1:${lyric.activemq.stompPort}"/>
+    </transportConnectors>
+  </broker>
+</beans>

@@ -71,6 +71,10 @@ jobs:
       - name: Set up Lyric
         uses: ./lyric-ecosystem/.github/actions/setup-lyric
 
+      - name: Start ActiveMQ
+        working-directory: lyric-ecosystem
+        run: bash scripts/ci/start-activemq.sh
+
       - name: Test packages against the services
         working-directory: lyric-ecosystem
         run: bash scripts/ci/test-packages.sh ${{ matrix.target }} --integration
