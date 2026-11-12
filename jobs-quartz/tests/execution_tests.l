@@ -531,6 +531,36 @@ test "cancelling a running job interrupts the handler, keeps it Cancelled and st
   stop(s)
 }
 
+test "a job cancelled between two attempts never runs its handler again" {
+  val s = started(testConfig().copy(workerThreads = 1, retryDelayMs = 8000))
+  val log = Log()
+  Quartz.registerHandler(s, "flaky", Flaky(log = log, failures = 100))
+  Quartz.registerHandler(s, "echo", Echo(log = Log()))
+  val id = mustId(s.enqueue("flaky", "", 3, 30000))
+  var waited = 0
+  while Quartz.attemptsRun(s, id) < 1 and waited < 10000 {
+    Jobs.sleepMs(5)
+    waited = waited + 5
+  }
+  assertEqualInt(Quartz.attemptsRun(s, id), 1, "the first attempt has failed; the firing is in its retry delay")
+  val cancelledAt = Jobs.nowMs()
+  match s.cancel(id) {
+    case Ok(_) -> ()
+    case Err(e) -> assertTrue(false, e)
+  }
+  assertEqual(statusName(s.status(id)), "Cancelled", "status right after cancel")
+  // The only worker is free again once the cancelled firing has ended.
+  val next = mustId(s.enqueue("echo", "after", 1, 30000))
+  assertEqual(statusName(Quartz.awaitFinished(s, next, 30000)), "Succeeded", "the worker runs the next job")
+  val freed = Jobs.nowMs() - cancelledAt
+  assertTrue(freed < 6000i64, "cancel cuts the 8000ms retry delay short, worker free after " + freed.toString() + "ms")
+  assertEqualInt(log.count(), 1, "the handler is not called again after cancel")
+  assertEqualInt(Quartz.attemptsRun(s, id), 1, "no attempt is recorded after cancel")
+  assertEqualInt(resultsOf(s, id).length, 1, "only the attempt before the cancel is recorded")
+  assertEqual(statusName(s.status(id)), "Cancelled", "the job stays Cancelled")
+  stop(s)
+}
+
 test "cancel is a no-op for finished and unknown jobs" {
   val s = started(testConfig())
   Quartz.registerHandler(s, "echo", Echo(log = Log()))

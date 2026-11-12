@@ -259,10 +259,7 @@ test "a firing is skipped while the previous firing of the same job is still run
   Jobs.sleepMs(1500)
   assertEqualInt(counter.count(), 1, "the firings at 200ms and 400ms overlapped the first and were skipped")
   assertEqualInt(Quartz.timesFired(s, id), 1, "timesFired counts only firings that ran")
-  match s.cancel(id) {
-    case Ok(_) -> ()
-    case Err(e) -> assertTrue(false, e)
-  }
+  assertEqual(statusName(Quartz.awaitFinished(s, id, 10000)), "Succeeded", "the firing that ran finishes the job")
   stop(s)
 }
 
@@ -277,6 +274,89 @@ impl Jobs.JobHandler for SlowTick {
     Jobs.sleepMs(self.ms)
     Ok("slow")
   }
+}
+
+// Counts its calls and holds each one until the gate is opened.
+protected type Gate {
+  var calls: Int = 0
+  var open: Bool = false
+  entry enter(): Int {
+    calls = calls + 1
+    return calls
+  }
+  entry count(): Int {
+    return calls
+  }
+  entry release() {
+    open = true
+  }
+  entry released(): Bool {
+    return open
+  }
+}
+
+record Held {
+  gate: Gate
+  fail: Bool
+}
+
+impl Jobs.JobHandler for Held {
+  func handle(spec: in Jobs.JobSpec): Result[String, Jobs.JobError] {
+    val _ = self.gate.enter()
+    while not self.gate.released() {
+      Jobs.sleepMs(5)
+    }
+    if self.fail {
+      return Err(Jobs.JobError(message = "held failed", code = ""))
+    }
+    Ok("held")
+  }
+}
+
+func waitUntilDropped(s: in Quartz.QuartzJobScheduler, id: in String, timeoutMs: in Int): Bool {
+  var waited = 0
+  while waited < timeoutMs {
+    match Quartz.heldByQuartz(s, id) {
+      case Ok(held) -> {
+        if not held {
+          return true
+        }
+      }
+      case Err(e) -> panic(e)
+    }
+    Jobs.sleepMs(10)
+    waited = waited + 10
+  }
+  false
+}
+
+// The first firing is held until every later firing of the trigger, the last
+// one included, has come and been skipped; the job must still finish, with
+// the outcome of the firing that ran.
+func statusAfterSkippedLastFiring(fail: in Bool): String {
+  val s = created(testConfig())
+  val gate = Gate()
+  Quartz.registerHandler(s, "held", Held(gate = gate, fail = fail))
+  begin(s)
+  val spec = mustSpec(Triggers.interval(0i64, 100i64, 2, Triggers.MisfirePolicy.Smart))
+  val id = mustId(Quartz.scheduleTrigger(s, "held", "", spec, 1, 600000))
+  assertTrue(waitUntilDropped(s, id, 30000), "Quartz has finished the trigger while the first firing still runs")
+  assertEqual(statusName(s.status(id)), "Running", "the first firing is still running")
+  gate.release()
+  val final = statusName(Quartz.awaitFinished(s, id, 30000))
+  assertEqualInt(gate.count(), 1, "the later firings were skipped")
+  assertEqualInt(Quartz.timesFired(s, id), 1, "timesFired")
+  assertEqualInt(resultsOf(s, id).length, 1, "one attempt recorded")
+  stop(s)
+  final
+}
+
+test "a finite job whose last firing is skipped succeeds when its running firing succeeds" {
+  assertEqual(statusAfterSkippedLastFiring(false), "Succeeded", "final status")
+}
+
+test "a finite job whose last firing is skipped fails when its running firing fails" {
+  assertEqual(statusAfterSkippedLastFiring(true), "Failed", "final status")
 }
 
 // ─── Misfire policy ───────────────────────────────────────────────────────────

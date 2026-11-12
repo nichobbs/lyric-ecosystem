@@ -37,8 +37,12 @@
 //! keeps its worker thread until it returns, and the attempt still counts as
 //! timed out.  A failed attempt is retried at once (or after
 //! `QuartzConfig.retryDelayMs`) within the same firing, up to `maxAttempts`.
+//! Once `cancel` has returned, the handler is not called again for the job
+//! and a retry delay in progress ends.
 //!
 //! A recurring job whose previous firing is still running skips the firing.
+//! When the skipped firing was the trigger's last, the running firing is the
+//! job's last and decides its final status.
 //!
 //! Quartz-only scheduling (native cron, intervals, delays, misfire policy) is
 //! described by `Jobs.Quartz.Triggers` and submitted with `scheduleTrigger`.
@@ -99,6 +103,9 @@ ref record JobEntry {
   var attempts: Int
   var firings: Int
   var lastFireMs: Long
+  // The last firing its trigger will ever make came while an earlier firing
+  // was running and was skipped: the running firing is the job's last.
+  var exhausted: Bool
 }
 
 func isFinal(s: in Jobs.JobStatus): Bool {
@@ -174,13 +181,21 @@ protected type JobTable {
   }
   // Claim one firing.  `None` when the job is unknown, already final, still
   // running an earlier firing, or has already run for this scheduled time
-  // (two triggers of one job selecting the same instant).
-  entry beginFiring(id: in String, scheduledMs: in Long): Option[Jobs.JobSpec] {
+  // (two triggers of one job selecting the same instant).  A skipped firing
+  // that was the trigger's last leaves it to the running firing to close the
+  // job.
+  entry beginFiring(id: in String, scheduledMs: in Long, mayFireAgain: in Bool): Option[Jobs.JobSpec] {
     if not jobs.containsKey(id) {
       return None
     }
     val e: JobEntry = jobs[id]
-    if isFinal(e.status) or inFlight(e.status) or e.lastFireMs == scheduledMs {
+    if inFlight(e.status) {
+      if not mayFireAgain {
+        e.exhausted = true
+      }
+      return None
+    }
+    if isFinal(e.status) or e.lastFireMs == scheduledMs {
       return None
     }
     e.status = Jobs.JobStatus.Running
@@ -197,26 +212,32 @@ protected type JobTable {
       )
     )
   }
-  // Record one attempt; false when the job was cancelled meanwhile, so the
-  // caller stops retrying.
-  entry recordAttempt(id: in String, r: in Jobs.JobResult, keep: in Int): Bool {
+  // False once the job is cancelled (or forgotten): the firing in progress
+  // must not start, or wait for, another attempt.
+  entry stillRunning(id: in String): Bool {
     if not jobs.containsKey(id) {
       return false
     }
     val e: JobEntry = jobs[id]
-    e.attempts = e.attempts + 1
-    e.results.add(r)
-    while e.results.count > keep {
-      e.results.removeAt(0)
-    }
     return inFlight(e.status)
   }
-  // Close a firing.  A cancelled job stays cancelled.
+  entry recordAttempt(id: in String, r: in Jobs.JobResult, keep: in Int) {
+    if jobs.containsKey(id) {
+      val e: JobEntry = jobs[id]
+      e.attempts = e.attempts + 1
+      e.results.add(r)
+      while e.results.count > keep {
+        e.results.removeAt(0)
+      }
+    }
+  }
+  // Close a firing.  A cancelled job stays cancelled.  The job goes back to
+  // `Pending` only when a later firing can still come and run.
   entry endFiring(id: in String, succeeded: in Bool, mayFireAgain: in Bool) {
     if jobs.containsKey(id) {
       val e: JobEntry = jobs[id]
       if inFlight(e.status) {
-        if mayFireAgain {
+        if mayFireAgain and not e.exhausted {
           e.status = Jobs.JobStatus.Pending
         } else if succeeded {
           e.status = Jobs.JobStatus.Succeeded
@@ -287,20 +308,54 @@ func safeCall(handler: in Jobs.JobHandler, spec: in Jobs.JobSpec): AttemptOutcom
   }
 }
 
+func callIfLive(
+  table: in JobTable, handler: in Jobs.JobHandler, spec: in Jobs.JobSpec, slot: in List[AttemptOutcome]
+): Unit {
+  if table.stillRunning(spec.id) {
+    slot.add(safeCall(handler, spec))
+  }
+}
+
 // One attempt on the calling (Quartz worker) thread, bounded by
 // `spec.timeoutMs`: when the time is up the thread is interrupted, which ends
 // a handler blocked in a sleep, a wait or interruptible I/O.  A handler that
 // ignores the interrupt overruns; either way the attempt counts as failed.
-func runAttempt(handler: in Jobs.JobHandler, spec: in Jobs.JobSpec): AttemptOutcome {
+//
+// `None` when the job was cancelled before the handler was called.  The
+// check runs once the attempt can be interrupted, and `cancel` marks the job
+// before it interrupts, so a cancel either prevents the call or interrupts it.
+func runAttempt(table: in JobTable, handler: in Jobs.JobHandler, spec: in Jobs.JobSpec): Option[AttemptOutcome] {
   val slot: List[AttemptOutcome] = newList()
-  val ended = Kernel.runBounded(spec.id, spec.timeoutMs, { -> slot.add(safeCall(handler, spec)) })
+  val ended = Kernel.runBounded(spec.id, spec.timeoutMs, { -> callIfLive(table, handler, spec, slot) })
+  if slot.count == 0 {
+    return None
+  }
   if ended == Kernel.runTimedOut {
-    return AttemptOutcome(ok = false, text = "handler exceeded timeoutMs (" + spec.timeoutMs.toString() + "ms)")
+    return Some(
+      value = AttemptOutcome(ok = false, text = "handler exceeded timeoutMs (" + spec.timeoutMs.toString() + "ms)")
+    )
   }
   if ended == Kernel.runInterrupted {
-    return AttemptOutcome(ok = false, text = "cancelled while running")
+    return Some(value = AttemptOutcome(ok = false, text = "cancelled while running"))
   }
-  slot[0]
+  Some(value = slot[0])
+}
+
+func sleepIfLive(table: in JobTable, jobId: in String, ms: in Int): Unit {
+  if table.stillRunning(jobId) {
+    try {
+      Jobs.sleepMs(ms)
+    } catch Bug as _ {
+      ()
+    }
+  }
+}
+
+// The pause before a retry, ended early by `cancel`; false when the job was
+// cancelled before or during it.
+func retryPause(table: in JobTable, jobId: in String, ms: in Int): Bool {
+  val _ = Kernel.runCancellable(jobId, { -> sleepIfLive(table, jobId, ms) })
+  table.stillRunning(jobId)
 }
 
 func attemptResult(spec: in Jobs.JobSpec, outcome: in AttemptOutcome, startedAt: in Long): Jobs.JobResult {
@@ -334,7 +389,7 @@ func runFiring(
   scheduledMs: in Long,
   mayFireAgain: in Bool,
 ): Unit {
-  match table.beginFiring(jobId, scheduledMs) {
+  match table.beginFiring(jobId, scheduledMs, mayFireAgain) {
     case None -> ()
     case Some(claimed) -> {
       val spec: Jobs.JobSpec = claimed
@@ -342,7 +397,7 @@ func runFiring(
       match handlers.find(spec.name) {
         case None -> {
           val missing = AttemptOutcome(ok = false, text = "no handler registered for job '" + spec.name + "'")
-          val _ = table.recordAttempt(jobId, attemptResult(spec, missing, Jobs.nowMs()), config.maxResultsPerJob)
+          table.recordAttempt(jobId, attemptResult(spec, missing, Jobs.nowMs()), config.maxResultsPerJob)
         }
         case Some(found) -> {
           val handler: Jobs.JobHandler = found
@@ -350,12 +405,21 @@ func runFiring(
           var live = true
           while live and not succeeded and attempt <= spec.maxAttempts {
             if attempt > 1 and config.retryDelayMs > 0 {
-              Jobs.sleepMs(config.retryDelayMs)
+              live = retryPause(table, jobId, config.retryDelayMs)
             }
-            val startedAt = Jobs.nowMs()
-            val outcome = runAttempt(handler, spec)
-            live = table.recordAttempt(jobId, attemptResult(spec, outcome, startedAt), config.maxResultsPerJob)
-            succeeded = outcome.ok
+            if live {
+              val startedAt = Jobs.nowMs()
+              match runAttempt(table, handler, spec) {
+                case None -> {
+                  live = false
+                }
+                case Some(outcome) -> {
+                  table.recordAttempt(jobId, attemptResult(spec, outcome, startedAt), config.maxResultsPerJob)
+                  succeeded = outcome.ok
+                  live = table.stillRunning(jobId)
+                }
+              }
+            }
             attempt = attempt + 1
           }
         }
@@ -509,7 +573,8 @@ func submit(
           results = newList(),
           attempts = 0,
           firings = 0,
-          lastFireMs = -1i64
+          lastFireMs = -1i64,
+          exhausted = false
         )
       )
       match Kernel.submitJob(s.state.quartz, id, triggers) {
@@ -562,6 +627,8 @@ func cancelJob(s: in QuartzJobScheduler, jobId: in String): Result[Unit, String]
   if s.state.table.cancel(jobId) != cancelDone {
     return Ok(())
   }
+  // After the table entry: an attempt or a retry pause that saw the job
+  // still running has registered its run by now and is interrupted here.
   val _ = Kernel.interruptRun(jobId)
   // The table already refuses further firings; removing the job from
   // Quartz stops its triggers.  After `shutdown` Quartz has dropped them.

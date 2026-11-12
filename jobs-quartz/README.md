@@ -127,12 +127,15 @@ SLF4J prints its "No SLF4J providers were found" notice once and discards Quartz
 Status and results:
 
 - **A recurring job is `Pending` between firings**, and reaches `Succeeded` or `Failed` only after its
-  last possible firing; the outcome of that last firing alone decides which. A cron job has no last
+  last possible firing; the outcome of the last firing that ran alone decides which. When the
+  trigger's last firing is skipped because an earlier firing is still running (see below), that
+  earlier firing is the last one that ran, and the job finishes when it ends. A cron job has no last
   firing, so it never finishes: `awaitFinished` on it times out unless the job is cancelled.
-- **A finite recurring job can stay `Pending` for ever.** When the last firing of an interval trigger
-  is skipped because an earlier firing was still running (see below), no firing is left to close the
-  job: its status stays `Pending` although Quartz has dropped it (`heldByQuartz` is `Ok(false)`).
-  Cancel it, or keep the interval longer than the handler.
+- **A finite interval job whose remaining firings are dropped as misfires stays `Pending`.** With
+  `MisfirePolicy.Skip`, when every remaining firing is later than `misfireThresholdMs` (no worker was
+  free, or the scheduler was in standby), Quartz ends the trigger without firing it again; nothing
+  closes the job, and Quartz keeps holding it (`heldByQuartz` is `Ok(true)`). Cancel such a job. See
+  Known gaps.
 - **A newly enqueued job is not reliably `Pending`** on a started scheduler: the trigger fires as soon
   as a worker is free, possibly before `enqueue` returns. It is `Pending` for certain only in standby
   or while every worker is busy.
@@ -168,9 +171,9 @@ Handlers, retries, timeout, cancel:
   ignores interruption keeps its worker until it returns; the attempt is still recorded as
   `handler exceeded timeoutMs (<n>ms)` and whatever the handler returned late is discarded.
 - **Cancelling a running job** marks it `Cancelled` at once and interrupts the handler in the same way,
-  so the handler may still be running when `cancel` returns. A cancel that arrives between two
-  attempts (during `retryDelayMs`) does not stop the next attempt from starting: that attempt runs and
-  is recorded, and only then do the retries stop.
+  so the handler may still be running when `cancel` returns. The handler is not called again for
+  the job once `cancel` has returned: a cancel that arrives between two attempts ends the
+  `retryDelayMs` pause at once, no further attempt is started or recorded, and the worker is free.
 - **A firing is skipped, not queued, while the previous firing of the same job is still running.**
   `timesFired` counts only the firings that ran. Different jobs with the same name do run concurrently,
   so a handler must be safe to call from several worker threads.
@@ -247,9 +250,10 @@ two minutes.
 - `tests/conformance_tests.l`: `Testing.Conformance.Jobs.run` against a Quartz scheduler in standby
   and against a started scheduler whose single worker is busy.
 - `tests/execution_tests.l`: real handlers run by Quartz worker threads: output recording, retries,
-  panics, timeouts, cancellation before and during a run, handler lookup, lifecycle.
+  panics, timeouts, cancellation before a run, during a run and between two attempts, handler lookup,
+  lifecycle.
 - `tests/trigger_execution_tests.l`: Quartz cron at seconds resolution, interval and delayed triggers,
-  overlap skipping, misfire policies, and `schedule` with a 5-field expression firing at the next minute
+  overlap skipping (including a skipped last firing), misfire policies, and `schedule` with a 5-field expression firing at the next minute
   (this one test waits up to 65 s).
 - `tests/triggers_tests.l`: the cron translation and trigger validation, checked against Quartz's parser.
 
@@ -270,7 +274,9 @@ two minutes.
 - Cron expressions use the JVM default time zone; there is no per-job time zone.
 - `schedule` always uses `MisfirePolicy.Smart`; choose another policy with `Triggers.quartzCron` and
   `scheduleTrigger`.
-- A finite interval job whose last firing is skipped stays `Pending` (see Surprises).
+- A finite interval job with `MisfirePolicy.Skip` whose remaining firings are all dropped as misfires
+  stays `Pending` and stays stored in Quartz until it is cancelled (see Surprises). Closing it needs
+  a Quartz `SchedulerListener` (`triggerFinalized`), which the kernel does not register yet.
 - Compiler issues met while writing this package (tracked in `nichobbs/lyric-lang`):
   - `impl Interface for T` where `T` is a `pub opaque type` does not produce a working implementation
     on either target, so `QuartzJobScheduler` is a `pub record` whose internals sit in the opaque

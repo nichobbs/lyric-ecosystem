@@ -494,7 +494,8 @@ func clearInterrupt(): Unit {
 /// `runCompleted`, `runTimedOut` or `runInterrupted`; in the last two cases
 /// `action` was interrupted (it may still have run to its end if it ignored
 /// that).  `action` must not let a panic escape.  `key` identifies the run
-/// while it lasts; one key runs at most once at a time.
+/// while it lasts; one key runs at most once at a time.  The run is
+/// registered under `key` before `action` starts.
 pub func runBounded(key: in String, timeoutMs: in Int, action: in () -> Unit): Int
   requires: key.length > 0
   requires: timeoutMs >= 1
@@ -504,6 +505,24 @@ pub func runBounded(key: in String, timeoutMs: in Int, action: in () -> Unit): I
   action()
   val reason = watches.disarm(key)
   cancelWatchdog(dog)
+  if reason != runCompleted {
+    clearInterrupt()
+  }
+  reason
+}
+
+/// Run `action` on the calling thread with no time limit, interrupting that
+/// thread when `interruptRun(key)` is called meanwhile.  Returns
+/// `runCompleted` or `runInterrupted`.  The run is registered under `key`
+/// before `action` starts, so an `action` that first checks whether it is
+/// still wanted cannot miss an `interruptRun` issued after that check.
+/// `action` must not let a panic escape.
+pub func runCancellable(key: in String, action: in () -> Unit): Int
+  requires: key.length > 0
+{
+  val _ = watches.arm(key, JThread.currentThread())
+  action()
+  val reason = watches.disarm(key)
   if reason != runCompleted {
     clearInterrupt()
   }
