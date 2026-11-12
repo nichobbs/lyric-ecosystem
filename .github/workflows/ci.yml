@@ -62,6 +62,9 @@ jobs:
           --health-retries 10
     env:
       LYRIC_REDIS_URL: redis://127.0.0.1:6379
+      LYRIC_S3_ENDPOINT: http://127.0.0.1:9000
+      LYRIC_S3_BUCKET: lyric-it
+      LYRIC_S3_REGION: us-east-1
     steps:
       - name: Check out lyric-ecosystem
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -70,6 +73,25 @@ jobs:
 
       - name: Set up Lyric
         uses: ./lyric-ecosystem/.github/actions/setup-lyric
+
+      # A service container cannot be given a command, and MinIO needs `server`.
+      - name: Start MinIO
+        run: |
+          secret="$(head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+          echo "::add-mask::$secret"
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=lyricit -e MINIO_ROOT_PASSWORD="$secret" \
+            minio/minio:latest server /data
+          for _ in $(seq 60); do
+            if curl -sf http://127.0.0.1:9000/minio/health/live; then
+              echo "AWS_ACCESS_KEY_ID=lyricit" >> "$GITHUB_ENV"
+              echo "AWS_SECRET_ACCESS_KEY=$secret" >> "$GITHUB_ENV"
+              exit 0
+            fi
+            sleep 1
+          done
+          docker logs minio
+          exit 1
 
       - name: Start ActiveMQ
         working-directory: lyric-ecosystem

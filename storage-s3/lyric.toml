@@ -1,0 +1,40 @@
+[package]
+name        = "Lyric.Storage.S3"
+version     = "0.1.0"
+stability   = "experimental"
+authors     = ["Lyric Contributors"]
+license     = "MIT"
+description = "Amazon S3 and S3-compatible backend for the Lyric Storage.StorageBucket interface, in pure Lyric (SigV4 over Std.Http)."
+targets     = ["dotnet", "jvm"]
+
+[project]
+name            = "Lyric.Storage.S3"
+output          = "single"
+output_assembly = "Storage.S3.dll"
+
+[project.packages]
+"Storage.S3"        = "src/s3.l"
+"Storage.S3.Client" = "src/client.l"
+"Storage.S3.Extras" = "src/extras.l"
+"Storage.S3.SigV4"  = "src/sigv4.l"
+"Storage.S3.Wire"   = "src/wire.l"
+
+[project.tests]
+"Storage.S3.SigV4Tests" = "tests/sigv4_tests.l"
+"Storage.S3.WireTests"  = "tests/wire_tests.l"
+# The conformance suite and the backend's own behaviour over real HTTP, against
+# an in-process S3 server (tests/fake_s3_tests.l) that verifies every signature.
+"Storage.S3.FakeS3Tests" = "tests/fake_s3_tests.l"
+# Needs a real S3-compatible server: file-level `@cfg(feature = "integration")`,
+# so a plain `lyric test` reports the module as gated and stays hermetic.
+"Storage.S3.IntegrationTests" = "tests/integration/s3_integration_tests.l"
+
+[features]
+default     = []
+integration = []   # run tests/integration against the server named by LYRIC_S3_ENDPOINT
+
+[dependencies]
+# The interface and its conformance suite, resolved through the root
+# [workspace.overrides].
+"Lyric.Testing" = { workspace = true }
+"Lyric.Storage" = { workspace = true }
