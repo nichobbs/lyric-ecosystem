@@ -92,6 +92,16 @@ jobs:
         working-directory: lyric-ecosystem
         run: bash scripts/ci/start-redis-tls.sh
 
+      - name: Cache Azurite
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/lyric-ci/azurite
+          key: azurite-${{ runner.os }}-${{ hashFiles('lyric-ecosystem/scripts/ci/start-azurite.sh') }}
+
+      - name: Start Azurite
+        working-directory: lyric-ecosystem
+        run: bash scripts/ci/start-azurite.sh
+
       - name: Test packages against the services
         working-directory: lyric-ecosystem
         run: bash scripts/ci/test-packages.sh ${{ matrix.target }} --integration
