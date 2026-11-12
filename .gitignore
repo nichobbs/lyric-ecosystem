@@ -9,3 +9,5 @@ target/
 .lyric-release/
 lyric.lock
 erl_crash.dump
+obj/
+*-restore.csproj
