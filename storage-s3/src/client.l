@@ -1,7 +1,7 @@
 //! Storage.S3.Client - a signed S3 REST client over `Std.Http`.
 //!
 //! One `S3Client` talks to one bucket. Every request is signed with AWS
-//! Signature Version 4 (`Storage.S3.SigV4`) and sent with `Std.Http`; there is
+//! Signature Version 4 (`Aws.SigV4`, from the `Lyric.Aws.SigV4` package) and sent with `Std.Http`; there is
 //! no AWS SDK underneath, so the same code runs on .NET and the JVM.
 //!
 //! Addressing follows the endpoint: AWS itself is virtual-hosted
@@ -21,13 +21,14 @@ package Storage.S3.Client
 import Std.Core
 import Std.Collections
 import Std.Encoding as Enc
-import Std.Environment as Env
 import Std.Errors
 import Std.Hash as Hash
 import Std.Http
 import Std.String as Str
 import Std.Task
 import Std.Time as Time
+import Aws.SigV4
+import Aws.SigV4.Env as AwsEnv
 import Storage
 import Storage.S3.SigV4
 import Storage.S3.Wire
@@ -131,41 +132,28 @@ pub func S3Config.withRequestTimeout(cfg: in S3Config, requestTimeoutMs: in Int)
   )
 }
 
-func envOr(name: in String, fallback: in String): String {
-  val v = Env.getVarOrDefault(name, "")
-  if v.length > 0 {
-    v
-  } else {
-    fallback
-  }
-}
-
 /// Configuration for `bucket` from the standard AWS environment variables:
 /// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`,
 /// the region from `AWS_REGION` or `AWS_DEFAULT_REGION`, and an optional
 /// endpoint from `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` (path-style when
 /// set). `Err(INVALID_CONFIG)` names the first variable that is missing.
 pub func configFromEnv(bucket: in String): Result[S3Config, StorageError] {
-  val accessKeyId = Env.getVarOrDefault("AWS_ACCESS_KEY_ID", "")
-  if accessKeyId.length == 0 {
-    return Err(StorageError(message = "AWS_ACCESS_KEY_ID is not set", code = "INVALID_CONFIG"))
+  val creds = match AwsEnv.credentialsFromEnv() {
+    case Ok(c) -> c
+    case Err(message) -> return Err(StorageError(message = message, code = "INVALID_CONFIG"))
   }
-  val secretAccessKey = Env.getVarOrDefault("AWS_SECRET_ACCESS_KEY", "")
-  if secretAccessKey.length == 0 {
-    return Err(StorageError(message = "AWS_SECRET_ACCESS_KEY is not set", code = "INVALID_CONFIG"))
+  val region = match AwsEnv.regionFromEnv() {
+    case Ok(r) -> r
+    case Err(message) -> return Err(StorageError(message = message, code = "INVALID_CONFIG"))
   }
-  val region = envOr("AWS_REGION", Env.getVarOrDefault("AWS_DEFAULT_REGION", ""))
-  if region.length == 0 {
-    return Err(StorageError(message = "neither AWS_REGION nor AWS_DEFAULT_REGION is set", code = "INVALID_CONFIG"))
-  }
-  val endpoint = envOr("AWS_ENDPOINT_URL_S3", Env.getVarOrDefault("AWS_ENDPOINT_URL", ""))
+  val endpoint = AwsEnv.endpointFromEnv("S3")
   Ok(
     S3Config(
       bucket = bucket,
       region = region,
-      accessKeyId = accessKeyId,
-      secretAccessKey = secretAccessKey,
-      sessionToken = Env.getVarOrDefault("AWS_SESSION_TOKEN", ""),
+      accessKeyId = creds.accessKeyId,
+      secretAccessKey = creds.secretAccessKey,
+      sessionToken = creds.sessionToken,
       endpoint = endpoint,
       pathStyle = endpoint.length > 0,
       requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS
@@ -355,8 +343,7 @@ pub func openClient(cfg: in S3Config): Result[S3Client, StorageError] {
 /// `yyyymmddThhmmssZ` for the current instant: the `x-amz-date` of a request
 /// signed now.
 pub func amzDateNow(): String {
-  val iso = Time.toIsoString(Time.now())
-  Str.replace(Str.replace(iso.substring(0, 19), "-", ""), ":", "") + "Z"
+  AwsEnv.amzDateNow()
 }
 
 /// The canonical URI of `key` in this client's bucket (`/<key>` or
@@ -381,9 +368,6 @@ pub record Payload {
   contentType: String
   bytes: slice[Byte]
 }
-
-// SHA-256 of the empty string: the payload hash of a request with no body.
-val EMPTY_PAYLOAD_SHA256: String = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 
 /// A response to a signed request: the status, the headers the caller needs,
 /// and the body.
@@ -450,31 +434,20 @@ pub func S3Client.send(
 ): Result[S3Response, StorageError] {
   val payloadHash = match body {
     case Some(payload) -> Str.toLower(Hash.sha256OfBytes(payload.bytes))
-    case None -> EMPTY_PAYLOAD_SHA256
+    case None -> emptyPayloadSha256()
   }
-  val amzDate = amzDateNow()
-  val signedHeaders: List[Pair] = newList()
-  signedHeaders.add(Pair(name = "host", value = client.host))
-  signedHeaders.add(Pair(name = "x-amz-content-sha256", value = payloadHash))
-  signedHeaders.add(Pair(name = "x-amz-date", value = amzDate))
-  if client.creds.sessionToken.length > 0 {
-    signedHeaders.add(Pair(name = "x-amz-security-token", value = client.creds.sessionToken))
-  }
-  var i = 0
-  while i < amzHeaders.count {
-    signedHeaders.add(amzHeaders[i])
-    i = i + 1
-  }
-  val signed = signRequest(
+  val signed = signedHeaders(
     methodName,
     canonicalUri,
     query,
-    signedHeaders,
+    client.host,
+    amzHeaders,
     payloadHash,
+    true,
     client.creds,
     client.region,
     "s3",
-    amzDate
+    amzDateNow()
   )
   val queryString = canonicalQuery(query)
   val url = client.origin + canonicalUri + (if queryString.length > 0 { "?" + queryString } else { "" })
@@ -495,22 +468,16 @@ pub func S3Client.send(
     case None -> ()
   }
   // `Host` is set by the HTTP client from the URL; every other signed header
-  // is sent as signed.
-  var k = 1
-  while k < signedHeaders.count {
-    match withHeader(req, signedHeaders[k].name, signedHeaders[k].value) {
+  // is sent as signed, then `Authorization`.
+  var k = 0
+  while k < signed.headers.count {
+    match withHeader(req, signed.headers[k].name, signed.headers[k].value) {
       case Ok(r) -> {
         req = r
       }
       case Err(e) -> return Err(StorageError(message = HttpError.message(e), code = "INVALID_ARGUMENT"))
     }
     k = k + 1
-  }
-  match withHeader(req, "Authorization", signed.authorization) {
-    case Ok(r) -> {
-      req = r
-    }
-    case Err(e) -> return Err(StorageError(message = HttpError.message(e), code = "INVALID_ARGUMENT"))
   }
   match sendCatching(client, req, url) {
     case Err(e) -> Err(e)
