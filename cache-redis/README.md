@@ -10,7 +10,7 @@
 | Stability | experimental (0.1.0) |
 | Interface | `Lyric.Cache` 0.1.0 (`Cache.CacheStore`); conformance suite `Testing.Conformance.Cache` from `Lyric.Testing` 0.1.0 |
 | Third-party libraries | none (`Lyric.Redis`, path dependency `../redis`) |
-| Tested against | Redis 7.0.15 |
+| Tested against | Redis 7.0.15, plain and TLS |
 
 ## Use
 
@@ -29,9 +29,33 @@ match RedisCache.connect("redis://cache.internal:6379/1", RedisCache.options("my
 `Cache.Redis` re-exports `Cache`, so `CacheStore` and the `Cache` wrappers (`get`, `set`, `setWithTtl`, `delete`, `clear`) are reachable through it, as above.
 `RedisCache.fromClient(client, options)` builds a store on an existing `Redis.RedisClient`.
 
+## TLS
+
+`RedisCache.connect` takes a `rediss://` URL: TLS with the system trust store and the URL's host as the
+server name. Everything a URL cannot carry goes through `RedisCache.connectWith(cfg, options)`, which
+takes a `Redis.RedisConfig`:
+
+```lyric
+import Redis
+import Cache.Redis as RedisCache
+
+match Redis.configFromUrl("rediss://cache.internal:6380/1") {
+  case Err(e) -> println(e.message())
+  case Ok(base) -> {
+    val cfg = Redis.withClientIdentity(Redis.withExclusiveCaCertificate(base, caPem), certPem, keyPem)
+    val store = RedisCache.connectWith(cfg, RedisCache.options("myapp:cache:"))
+  }
+}
+```
+
+The TLS options (`withExclusiveCaCertificate`, `withClientIdentity`, `withTlsServerName`,
+`withMinTlsVersion`, `withInsecureSkipVerify` and its `LYRIC_TLS_ALLOW_INSECURE` policy) are those of
+`Lyric.Redis`; see its README. An unusable TLS configuration is `InvalidConfig` and a failed handshake
+`TlsFailed`, both returned by `connect` / `connectWith`.
+
 ## Configuration
 
-Explicit values only: the URL (see `Lyric.Redis` for its form) and `RedisCacheOptions`:
+Explicit values only: the URL or `Redis.RedisConfig` (see `Lyric.Redis`) and `RedisCacheOptions`:
 
 - `keyPrefix` (required, not empty): prepended to every cache key. Give each store its own.
 - `ttlUnitMillis` (default 1000): the length of one `ttlSeconds` unit. Leave it at 1000 in production;
@@ -61,14 +85,20 @@ Explicit values only: the URL (see `Lyric.Redis` for its form) and `RedisCacheOp
 lyric test --manifest cache-redis/lyric.toml --target dotnet
 lyric test --manifest cache-redis/lyric.toml --target jvm
 
-# Integration: the CacheStore conformance suite and backend tests against a real server
+# Integration: the CacheStore conformance suite and backend tests against a real server, and the
+# conformance suite a second time over TLS with a client certificate
 redis-server --port 16379 --save "" --appendonly no --daemonize yes
-LYRIC_REDIS_URL=redis://127.0.0.1:16379 lyric test --manifest cache-redis/lyric.toml --target dotnet --features integration
-LYRIC_REDIS_URL=redis://127.0.0.1:16379 lyric test --manifest cache-redis/lyric.toml --target jvm --features integration
+export LYRIC_REDIS_URL=redis://127.0.0.1:16379
+eval "$(scripts/ci/start-redis-tls.sh)"
+lyric test --manifest cache-redis/lyric.toml --target dotnet --features integration
+lyric test --manifest cache-redis/lyric.toml --target jvm --features integration
 ```
 
 The integration module is compiled only with `--features integration` and fails with a message naming
-`LYRIC_REDIS_URL` when the variable is unset. Every key it writes carries a random prefix and is removed.
+the variable when one is unset: `LYRIC_REDIS_URL` (a plain server), and for the TLS run
+`LYRIC_REDIS_MTLS_URL` (a `rediss://` server that requires a client certificate), `LYRIC_REDIS_TLS_CA`,
+`LYRIC_REDIS_TLS_CERT` and `LYRIC_REDIS_TLS_KEY` (PEM files), which `scripts/ci/start-redis-tls.sh`
+prints. Every key it writes carries a random prefix and is removed.
 
 The conformance suite advances its clock by 26 seconds in total. The stores it runs against use
 `ttlUnitMillis = 50` and the clock hook sleeps 50 ms per second, so each expiry the suite observes is
@@ -77,8 +107,8 @@ real second. The conformance suite cannot run hermetically: there is no in-proce
 
 ## Known gaps
 
-- Everything listed under "Known gaps" of `Lyric.Redis` (no TLS, one connection, connect timeout on
-  dotnet).
+- Everything listed under "Known gaps" of `Lyric.Redis` (one connection, no Cluster or Sentinel, the
+  limits of its TLS options).
 - No entry-count limit or eviction policy of its own: configure `maxmemory` and `maxmemory-policy` on the
   server.
 - Values are text (`CacheStore` is `String` to `String`); binary values need `Lyric.Redis` directly.

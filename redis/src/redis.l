@@ -1,9 +1,9 @@
 //! Redis - a Redis client written in Lyric.
 //!
 //! The protocol (`Redis.Resp`), the URL parser (`Redis.Url`) and the client
-//! are plain Lyric; only the TCP socket is reached through a per-target
-//! kernel (`Redis.Kernel`). Every operation returns `Result[_, RedisError]`;
-//! nothing throws.
+//! are plain Lyric; only the TCP socket and the TLS layer over it are reached
+//! through a per-target kernel (`Redis.Kernel`). Every operation returns
+//! `Result[_, RedisError]`; nothing throws.
 //!
 //! ```
 //! import Redis
@@ -29,6 +29,13 @@
 //! multiplexed. A sequence of separate calls is not atomic: use `eval` for
 //! that.
 //!
+//! TLS: a `rediss://` URL (or `withTls`) connects over TLS, verifying the
+//! server certificate against the system trust store and its name against
+//! the host. `withExclusiveCaCertificate`, `withClientIdentity`,
+//! `withMinTlsVersion`, `withTlsServerName` and `withInsecureSkipVerify`
+//! adjust that; the names and the insecure policy are `Std.Http`'s
+//! (`HttpClientBuilder`), the types `Std.Tls`'s.
+//!
 //! Reconnection: a connection that breaks is closed and the next command
 //! dials again (and repeats AUTH / SELECT). A command is repeated once on a
 //! fresh connection only when it provably did not run: the write failed, or
@@ -41,9 +48,14 @@ package Redis
 
 import Std.Core
 import Std.Collections
+import Std.Console as Console
 import Std.Encoding
+import Std.Environment as Env
+import Std.File as File
+import Std.Http as Http
 import Std.Parse
 import Std.String as Str
+import Std.Tls as Tls
 import Redis.Resp as Resp
 import Redis.Url as Url
 import Redis.Kernel as Kernel
@@ -56,6 +68,10 @@ pub union RedisError {
   case InvalidConfig(message: String)
   /// The TCP connection could not be opened.
   case ConnectFailed(message: String)
+  /// The TLS handshake failed: the server certificate is not trusted, does
+  /// not carry the server name, the server refused the client certificate,
+  /// or the two sides share no protocol version.
+  case TlsFailed(message: String)
   /// The server refused the credentials (`AUTH` / `HELLO`).
   case AuthFailed(message: String)
   /// The connection broke (closed, reset or timed acc) during a command. The
@@ -77,6 +93,7 @@ pub func RedisError.message(e: in RedisError): String {
   match e {
     case InvalidConfig(m) -> "invalid Redis configuration: " + m
     case ConnectFailed(m) -> "cannot connect to Redis: " + m
+    case TlsFailed(m) -> "Redis TLS handshake failed: " + m
     case AuthFailed(m) -> "Redis authentication failed: " + m
     case ConnectionLost(m) -> "Redis connection lost: " + m
     case ProtocolViolation(m) -> "Redis protocol violation: " + m
@@ -92,6 +109,7 @@ pub func RedisError.code(e: in RedisError): String {
   match e {
     case InvalidConfig(_) -> "INVALID_CONFIG"
     case ConnectFailed(_) -> "CONNECT_FAILED"
+    case TlsFailed(_) -> "TLS_FAILED"
     case AuthFailed(_) -> "AUTH_FAILED"
     case ConnectionLost(_) -> "CONNECTION_LOST"
     case ProtocolViolation(_) -> "PROTOCOL_VIOLATION"
@@ -102,6 +120,42 @@ pub func RedisError.code(e: in RedisError): String {
 }
 
 // ─── Configuration ───────────────────────────────────────────────────────────
+/// The TLS side of a `RedisConfig`. Certificates and keys are PEM text, the
+/// only format `Std.Tls` loads; a private key is an unencrypted PKCS#8 block
+/// (`-----BEGIN PRIVATE KEY-----`). Build it with `withTls` and its siblings.
+@experimental
+pub record RedisTlsOptions {
+  /// Connect over TLS. The other fields require it.
+  enabled: Bool
+  /// The name sent as SNI and checked against the server certificate; `""`
+  /// uses the configuration's `host`.
+  serverName: String
+  /// The only certificate authority the server certificate may chain to;
+  /// `""` trusts the system trust store.
+  caCertificatePem: String
+  /// The client certificate presented for mutual TLS; `""` presents none.
+  clientCertificatePem: String
+  /// The private key of `clientCertificatePem`.
+  clientKeyPem: String
+  /// The lowest TLS version accepted. TLS 1.2 is the floor.
+  minVersion: Tls.TlsVersion
+  /// One of the two keys of the insecure policy (see `withInsecureSkipVerify`).
+  insecureSkipVerify: Bool
+  invariant: (clientCertificatePem.length == 0) == (clientKeyPem.length == 0)
+}
+
+func noTls(): RedisTlsOptions {
+  RedisTlsOptions(
+    enabled = false,
+    serverName = "",
+    caCertificatePem = "",
+    clientCertificatePem = "",
+    clientKeyPem = "",
+    minVersion = Tls.Tls12,
+    insecureSkipVerify = false
+  )
+}
+
 /// How to reach and talk to one Redis server.
 @experimental
 pub record RedisConfig {
@@ -116,14 +170,15 @@ pub record RedisConfig {
   /// RESP version: 2, or 3 (negotiated with `HELLO 3`, Redis 6 and later).
   protocol: Int
   /// Longest wait for the TCP connection, in milliseconds (`0` = no limit).
-  /// Applied on `--target jvm`; on `--target dotnet` the operating system's
-  /// connect timeout applies.
   connectTimeoutMs: Int
   /// Longest wait for one read or write, in milliseconds (`0` = no limit).
+  /// It also bounds each step of the TLS handshake.
   ioTimeoutMs: Int
   /// Repeat a command once on a fresh connection when the server had closed
   /// the idle one before the command ran.
   retryStaleConnection: Bool
+  /// TLS: off unless the URL is `rediss://` or `withTls` was applied.
+  tls: RedisTlsOptions
   invariant: host.length > 0
   invariant: port >= 1 and port <= 65535
   invariant: database >= 0
@@ -132,8 +187,8 @@ pub record RedisConfig {
   invariant: username.length == 0 or password.length > 0
 }
 
-/// A configuration for `host:port` with no credentials, database 0, RESP2 and
-/// five-second timeouts.
+/// A configuration for `host:port` with no credentials, database 0, RESP2,
+/// five-second timeouts and no TLS.
 @experimental
 pub func configFor(host: in String, port: in Int): RedisConfig
   requires: host.length > 0
@@ -148,12 +203,15 @@ pub func configFor(host: in String, port: in Int): RedisConfig
     protocol = 2,
     connectTimeoutMs = 5000,
     ioTimeoutMs = 5000,
-    retryStaleConnection = true
+    retryStaleConnection = true,
+    tls = noTls()
   )
 }
 
 /// The configuration a `redis://[user:password@]host[:port][/db]` URL names
-/// (see `Redis.Url`), with five-second timeouts.
+/// (see `Redis.Url`), with five-second timeouts. A `rediss://` URL switches
+/// TLS on with the defaults: the system trust store and the URL's host as
+/// the server name.
 @experimental
 pub func configFromUrl(url: in String): Result[RedisConfig, RedisError] {
   match Url.parseRedisUrl(url) {
@@ -168,7 +226,8 @@ pub func configFromUrl(url: in String): Result[RedisConfig, RedisError] {
         protocol = if u.protocol == 3 { 3 } else { 2 },
         connectTimeoutMs = 5000,
         ioTimeoutMs = 5000,
-        retryStaleConnection = true
+        retryStaleConnection = true,
+        tls = noTls().copy(enabled = u.tls)
       )
     )
   }
@@ -179,17 +238,7 @@ pub func configFromUrl(url: in String): Result[RedisConfig, RedisError] {
 pub func withTimeouts(cfg: in RedisConfig, connectTimeoutMs: in Int, ioTimeoutMs: in Int): RedisConfig
   requires: connectTimeoutMs >= 0 and ioTimeoutMs >= 0
 {
-  RedisConfig(
-    host = cfg.host,
-    port = cfg.port,
-    username = cfg.username,
-    password = cfg.password,
-    database = cfg.database,
-    protocol = cfg.protocol,
-    connectTimeoutMs = connectTimeoutMs,
-    ioTimeoutMs = ioTimeoutMs,
-    retryStaleConnection = cfg.retryStaleConnection
-  )
+  cfg.copy(connectTimeoutMs = connectTimeoutMs, ioTimeoutMs = ioTimeoutMs)
 }
 
 /// `cfg` with other credentials. `username = ""` authenticates as the default
@@ -198,17 +247,7 @@ pub func withTimeouts(cfg: in RedisConfig, connectTimeoutMs: in Int, ioTimeoutMs
 pub func withCredentials(cfg: in RedisConfig, username: in String, password: in String): RedisConfig
   requires: username.length == 0 or password.length > 0
 {
-  RedisConfig(
-    host = cfg.host,
-    port = cfg.port,
-    username = username,
-    password = password,
-    database = cfg.database,
-    protocol = cfg.protocol,
-    connectTimeoutMs = cfg.connectTimeoutMs,
-    ioTimeoutMs = cfg.ioTimeoutMs,
-    retryStaleConnection = cfg.retryStaleConnection
-  )
+  cfg.copy(username = username, password = password)
 }
 
 /// `cfg` selecting another database index.
@@ -216,17 +255,7 @@ pub func withCredentials(cfg: in RedisConfig, username: in String, password: in 
 pub func withDatabase(cfg: in RedisConfig, database: in Int): RedisConfig
   requires: database >= 0
 {
-  RedisConfig(
-    host = cfg.host,
-    port = cfg.port,
-    username = cfg.username,
-    password = cfg.password,
-    database = database,
-    protocol = cfg.protocol,
-    connectTimeoutMs = cfg.connectTimeoutMs,
-    ioTimeoutMs = cfg.ioTimeoutMs,
-    retryStaleConnection = cfg.retryStaleConnection
-  )
+  cfg.copy(database = database)
 }
 
 /// `cfg` speaking RESP `protocol` (2 or 3).
@@ -234,33 +263,226 @@ pub func withDatabase(cfg: in RedisConfig, database: in Int): RedisConfig
 pub func withProtocol(cfg: in RedisConfig, protocol: in Int): RedisConfig
   requires: protocol == 2 or protocol == 3
 {
-  RedisConfig(
-    host = cfg.host,
-    port = cfg.port,
-    username = cfg.username,
-    password = cfg.password,
-    database = cfg.database,
-    protocol = protocol,
-    connectTimeoutMs = cfg.connectTimeoutMs,
-    ioTimeoutMs = cfg.ioTimeoutMs,
-    retryStaleConnection = cfg.retryStaleConnection
-  )
+  cfg.copy(protocol = protocol)
 }
 
 /// `cfg` with the stale-connection retry switched on or off.
 @experimental
 pub func withStaleRetry(cfg: in RedisConfig, retry: in Bool): RedisConfig {
-  RedisConfig(
-    host = cfg.host,
-    port = cfg.port,
-    username = cfg.username,
-    password = cfg.password,
-    database = cfg.database,
-    protocol = cfg.protocol,
-    connectTimeoutMs = cfg.connectTimeoutMs,
-    ioTimeoutMs = cfg.ioTimeoutMs,
-    retryStaleConnection = retry
+  cfg.copy(retryStaleConnection = retry)
+}
+
+// ─── TLS configuration ───────────────────────────────────────────────────────
+/// `cfg` connecting over TLS (what a `rediss://` URL does): the server
+/// certificate is verified against the system trust store and must carry the
+/// host name.
+@experimental
+pub func withTls(cfg: in RedisConfig): RedisConfig {
+  cfg.copy(tls = cfg.tls.copy(enabled = true))
+}
+
+/// `cfg` trusting ONLY the certificate authority `caPem` (PEM text) for the
+/// server certificate: the system trust store is not consulted. This is the
+/// trust-replacing form, as `Std.Http`'s `withExclusiveCaCertificate`; there
+/// is no additive form. The PEM is parsed when the client first connects; an
+/// unusable certificate is `InvalidConfig` there.
+@experimental
+pub func withExclusiveCaCertificate(cfg: in RedisConfig, caPem: in String): RedisConfig
+  requires: caPem.length > 0
+{
+  cfg.copy(tls = cfg.tls.copy(caCertificatePem = caPem))
+}
+
+func readPem(what: in String, path: in String): Result[String, RedisError] {
+  if path.length == 0 {
+    return Err(InvalidConfig(message = "the path of the " + what + " is empty"))
+  }
+  match File.readText(path) {
+    case Ok(text) -> if text.length > 0 {
+      Ok(text)
+    } else {
+      Err(InvalidConfig(message = "the " + what + " file is empty: " + path))
+    }
+    case Err(_) -> Err(InvalidConfig(message = "cannot read the " + what + ": " + path))
+  }
+}
+
+/// `withExclusiveCaCertificate` reading the PEM file at `path`.
+@experimental
+pub func withExclusiveCaCertificateFile(cfg: in RedisConfig, path: in String): Result[RedisConfig, RedisError] {
+  match readPem("CA certificate", path) {
+    case Ok(pem) -> Ok(withExclusiveCaCertificate(cfg, pem))
+    case Err(e) -> Err(e)
+  }
+}
+
+/// `cfg` presenting a client certificate for mutual TLS: `certPem` and its
+/// private key `keyPem` (PEM text; the key an unencrypted PKCS#8 block). Both
+/// are parsed when the client first connects; an unusable pair is
+/// `InvalidConfig` there.
+@experimental
+pub func withClientIdentity(cfg: in RedisConfig, certPem: in String, keyPem: in String): RedisConfig
+  requires: certPem.length > 0 and keyPem.length > 0
+{
+  cfg.copy(tls = cfg.tls.copy(clientCertificatePem = certPem, clientKeyPem = keyPem))
+}
+
+/// `withClientIdentity` reading the two PEM files.
+@experimental
+pub func withClientIdentityFiles(
+  cfg: in RedisConfig, certPath: in String, keyPath: in String
+): Result[RedisConfig, RedisError] {
+  match readPem("client certificate", certPath) {
+    case Err(e) -> Err(e)
+    case Ok(certPem) -> match readPem("client private key", keyPath) {
+      case Err(e) -> Err(e)
+      case Ok(keyPem) -> Ok(withClientIdentity(cfg, certPem, keyPem))
+    }
+  }
+}
+
+/// `cfg` accepting no TLS version below `version` (`Std.Tls.TlsVersion`:
+/// `Tls12`, the default and the floor, or `Tls13`).
+@experimental
+pub func withMinTlsVersion(cfg: in RedisConfig, version: in Tls.TlsVersion): RedisConfig {
+  cfg.copy(tls = cfg.tls.copy(minVersion = version))
+}
+
+/// `cfg` sending `serverName` as SNI and checking the server certificate
+/// against it instead of against `host`: for a server reached by address, or
+/// through a tunnel, whose certificate names something else.
+@experimental
+pub func withTlsServerName(cfg: in RedisConfig, serverName: in String): RedisConfig
+  requires: serverName.length > 0
+{
+  cfg.copy(tls = cfg.tls.copy(serverName = serverName))
+}
+
+/// Request that the server certificate is not verified at all: neither its
+/// chain nor its name. This alone does NOT disable verification. As for
+/// `Std.Http`'s `withInsecureSkipVerify` (lyric-lang docs/61 section 4), the
+/// environment variable `LYRIC_TLS_ALLOW_INSECURE=1` must also be set when
+/// the client first connects:
+///
+/// | This called? | Variable set? | Effect |
+/// |---|---|---|
+/// | no | no | verification on |
+/// | no | yes | verification on: the variable alone does nothing |
+/// | yes | no | verification on, and a warning on standard error |
+/// | yes | yes | verification off for this client |
+///
+/// Never use it in production.
+@experimental
+pub func withInsecureSkipVerify(cfg: in RedisConfig): RedisConfig {
+  cfg.copy(tls = cfg.tls.copy(insecureSkipVerify = true))
+}
+
+val insecureAllowEnvVar: String = "LYRIC_TLS_ALLOW_INSECURE"
+
+func hasTlsDetails(t: in RedisTlsOptions): Bool {
+  val pinned = match t.minVersion { case Tls13 -> true; case Tls12 -> false }
+  t.serverName.length > 0 or t.caCertificatePem.length > 0 or t.clientCertificatePem.length > 0 or
+    t.clientKeyPem.length > 0 or
+    t.insecureSkipVerify or
+    pinned
+}
+
+func checkCaPem(pem: in String): Result[Unit, RedisError] {
+  match Tls.Certificate.fromPem(pem) {
+    case Ok(_) -> Ok(())
+    case Err(e) -> Err(InvalidConfig(message = "TLS CA certificate: " + e.message()))
+  }
+}
+
+func checkIdentityPem(certPem: in String, keyPem: in String): Result[Unit, RedisError] {
+  match Tls.Identity.fromPem(certPem, keyPem) {
+    case Ok(_) -> Ok(())
+    case Err(e) -> Err(InvalidConfig(message = "TLS client certificate and key: " + e.message()))
+  }
+}
+
+/// Check the TLS part of `cfg` without connecting: TLS options on a
+/// configuration that does not enable TLS, a CA or client certificate that
+/// does not parse, a private key in an unsupported format (`Std.Tls` loads
+/// unencrypted PKCS#8 only), or a key that does not belong to the
+/// certificate are `InvalidConfig`. `open` and the first command of a `lazy`
+/// client run the same check.
+@experimental
+pub func checkTls(cfg: in RedisConfig): Result[Unit, RedisError] {
+  val t = cfg.tls
+  if not t.enabled {
+    if hasTlsDetails(t) {
+      return Err(
+        InvalidConfig(message = "TLS options are set but the connection is not TLS: use a rediss:// URL or withTls")
+      )
+    }
+    return Ok(())
+  }
+  if t.caCertificatePem.length > 0 {
+    match checkCaPem(t.caCertificatePem) {
+      case Err(e) -> return Err(e)
+      case Ok(_) -> ()
+    }
+  }
+  if t.clientCertificatePem.length > 0 {
+    match checkIdentityPem(t.clientCertificatePem, t.clientKeyPem) {
+      case Err(e) -> return Err(e)
+      case Ok(_) -> ()
+    }
+  }
+  Ok(())
+}
+
+/// Whether verification is really off for a client of `cfg`, given whether
+/// the environment allows it: the dual-key policy of `withInsecureSkipVerify`
+/// (`Std.Http.resolveInsecureVerifyPolicy`).
+@pure
+@experimental
+pub func insecurePolicyFor(cfg: in RedisConfig, envAllows: in Bool): Http.InsecureVerifyPolicy {
+  Http.resolveInsecureVerifyPolicy(cfg.tls.insecureSkipVerify, envAllows)
+}
+
+// The kernel's TLS state for `cfg`, built once per client; `None` for a plain
+// connection.
+func prepareTls(cfg: in RedisConfig): Result[Option[Kernel.TlsClient], RedisError] {
+  match checkTls(cfg) {
+    case Err(e) -> return Err(e)
+    case Ok(_) -> ()
+  }
+  val t = cfg.tls
+  if not t.enabled {
+    return Ok(None)
+  }
+  val skipVerify = match insecurePolicyFor(cfg, Env.getVarOrDefault(insecureAllowEnvVar, "") == "1") {
+    case VerificationDisabled -> true
+    case VerificationEnabled -> false
+    case VerificationEnabledWarn -> {
+      Console.error(
+        "[Redis] warning: withInsecureSkipVerify() requested but " + insecureAllowEnvVar +
+          " is not set; TLS certificate verification remains ENABLED."
+      )
+      false
+    }
+  }
+  val settings = Kernel.TlsSettings(
+    caPem = t.caCertificatePem,
+    certPem = t.clientCertificatePem,
+    keyPem = t.clientKeyPem,
+    tls13Only = match t.minVersion { case Tls13 -> true; case Tls12 -> false },
+    skipVerify = skipVerify
   )
+  match Kernel.tlsPrepare(settings) {
+    case Ok(client) -> Ok(Some(value = client))
+    case Err(m) -> Err(InvalidConfig(message = "TLS: " + m))
+  }
+}
+
+func tlsServerName(cfg: in RedisConfig): String {
+  if cfg.tls.serverName.length > 0 {
+    cfg.tls.serverName
+  } else {
+    cfg.host
+  }
 }
 
 // ─── Wire exchange ───────────────────────────────────────────────────────────
@@ -377,9 +599,24 @@ func isAuthError(m: in String): Bool {
     Str.contains(m, "without any password configured")
 }
 
-func openLink(cfg: in RedisConfig): Result[Link, RedisError] {
+// Dial, and run the TLS handshake when `tls` is set.
+func dial(cfg: in RedisConfig, tls: in Option[Kernel.TlsClient]): Result[Kernel.Sock, RedisError] {
+  val endpoint = cfg.host + ":" + cfg.port.toString() + ": "
   match Kernel.sockConnect(cfg.host, cfg.port, cfg.connectTimeoutMs, cfg.ioTimeoutMs) {
-    case Err(m) -> Err(ConnectFailed(message = cfg.host + ":" + cfg.port.toString() + ": " + m))
+    case Err(m) -> Err(ConnectFailed(message = endpoint + m))
+    case Ok(plain) -> match tls {
+      case None -> Ok(plain)
+      case Some(t) -> match Kernel.sockStartTls(plain, t, tlsServerName(cfg), cfg.port) {
+        case Ok(encrypted) -> Ok(encrypted)
+        case Err(m) -> Err(TlsFailed(message = endpoint + m))
+      }
+    }
+  }
+}
+
+func openLink(cfg: in RedisConfig, tls: in Option[Kernel.TlsClient]): Result[Link, RedisError] {
+  match dial(cfg, tls) {
+    case Err(e) -> Err(e)
     case Ok(sock) -> match handshake(sock, cfg) {
       case Ok(pending) -> Ok(Link(sock = sock, pending = pending))
       case Err(e) -> {
@@ -411,6 +648,10 @@ pub protected type RedisClient {
   var link: Option[Link] = None
   var closed: Bool = false
   var connectCount: Int = 0
+  // The parsed TLS state, built by the first connection and kept for the
+  // client's life.
+  var tlsReady: Bool = false
+  var tls: Option[Kernel.TlsClient] = None
   func dropLink(): Unit {
     match link {
       case Some(l) -> Kernel.sockClose(l.sock)
@@ -419,9 +660,18 @@ pub protected type RedisClient {
     link = None
   }
   func currentLink(): Result[Link, RedisError] {
+    if not tlsReady {
+      match prepareTls(config) {
+        case Err(e) -> return Err(e)
+        case Ok(prepared) -> {
+          tls = prepared
+          tlsReady = true
+        }
+      }
+    }
     match link {
       case Some(l) -> Ok(l)
-      case None -> match openLink(config) {
+      case None -> match openLink(config, tls) {
         case Err(e) -> Err(e)
         case Ok(l) -> {
           link = Some(value = l)
@@ -544,7 +794,8 @@ pub protected type RedisClient {
 }
 
 /// A client for `cfg`, connected and authenticated before it is returned, so
-/// an unreachable server or a wrong password is reported here.
+/// an unreachable server, a failed TLS handshake or a wrong password is
+/// reported here.
 @experimental
 pub func open(cfg: in RedisConfig): Result[RedisClient, RedisError] {
   val client = RedisClient(config = cfg)
@@ -560,7 +811,7 @@ pub func lazy(cfg: in RedisConfig): RedisClient {
   RedisClient(config = cfg)
 }
 
-/// `open` for a `redis://` URL.
+/// `open` for a `redis://` or `rediss://` URL.
 @experimental
 pub func connect(url: in String): Result[RedisClient, RedisError] {
   match configFromUrl(url) {

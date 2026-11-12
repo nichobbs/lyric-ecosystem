@@ -8,6 +8,7 @@ package Cache.Redis.StoreTests
 
 import Std.Core
 import Std.Testing
+import Std.Tls as Tls
 import Cache
 import Cache.Redis as RedisCache
 import Cache.Redis.Extras as Extras
@@ -111,13 +112,39 @@ test "the Result-returning functions report the failure" {
 }
 
 test "connect reports an unusable URL and an unreachable server" {
-  match RedisCache.connect("rediss://127.0.0.1", RedisCache.options("p:")) {
-    case Err(e) -> assertEqual(e.code(), "INVALID_CONFIG", "a TLS URL")
-    case Ok(_) -> assertTrue(false, "rediss must be refused")
+  match RedisCache.connect("redis://", RedisCache.options("p:")) {
+    case Err(e) -> assertEqual(e.code(), "INVALID_CONFIG", "a URL without a host")
+    case Ok(_) -> assertTrue(false, "a URL without a host must be refused")
   }
   match RedisCache.connect("redis://127.0.0.1:" + closedPort().toString(), RedisCache.options("p:")) {
     case Err(e) -> assertEqual(e.code(), "CONNECT_FAILED", "nothing listening")
     case Ok(_) -> assertTrue(false, "nothing listens on the port")
+  }
+}
+
+test "a rediss URL is dialled, and connectWith carries the TLS options" {
+  val port = closedPort().toString()
+  match RedisCache.connect("rediss://127.0.0.1:" + port, RedisCache.options("p:")) {
+    case Err(e) -> assertEqual(e.code(), "CONNECT_FAILED", "a TLS URL is accepted and dialled")
+    case Ok(_) -> assertTrue(false, "nothing listens on the port")
+  }
+  val tls = match RedisLib.configFromUrl("rediss://127.0.0.1:" + port) {
+    case Ok(cfg) -> cfg
+    case Err(e) -> panic("the URL must parse: " + e.message())
+  }
+  val named = RedisLib.withTlsServerName(RedisLib.withMinTlsVersion(tls, Tls.Tls13), "cache.internal")
+  match RedisCache.connectWith(named, RedisCache.options("p:")) {
+    case Err(e) -> assertEqual(e.code(), "CONNECT_FAILED", "usable TLS options reach the dial")
+    case Ok(_) -> assertTrue(false, "nothing listens on the port")
+  }
+  match RedisCache.connectWith(RedisLib.withExclusiveCaCertificate(tls, "not a certificate"), RedisCache.options("p:")) {
+    case Err(e) -> assertEqual(e.code(), "INVALID_CONFIG", "an unusable CA is reported before dialling")
+    case Ok(_) -> assertTrue(false, "an unusable CA must be refused")
+  }
+  val plain = RedisLib.withTlsServerName(RedisLib.configFor("127.0.0.1", closedPort()), "cache.internal")
+  match RedisCache.connectWith(plain, RedisCache.options("p:")) {
+    case Err(e) -> assertEqual(e.code(), "INVALID_CONFIG", "TLS options without TLS are refused")
+    case Ok(_) -> assertTrue(false, "TLS options on a plain connection must be refused")
   }
 }
 

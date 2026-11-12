@@ -1,12 +1,14 @@
-//! Redis.Url - parsing of `redis://` connection URLs.
+//! Redis.Url - parsing of `redis://` and `rediss://` connection URLs.
 //!
 //!   redis://[username[:password]@]host[:port][/database][?db=N&protocol=2|3]
+//!   rediss://...   the same, over TLS
 //!
 //! `redis://:secret@host` carries a password and no user name (the classic
 //! `requirepass` form); `redis://app:secret@host` an ACL user and its
 //! password. User name and password are percent-decoded. An IPv6 host is
-//! written in brackets (`redis://[::1]:6379`). `rediss://` (TLS) is refused
-//! with an explicit error: this client does not speak TLS.
+//! written in brackets (`redis://[::1]:6379`). The `rediss` scheme only switches
+//! TLS on; certificates and the other TLS options are not URL parameters (see
+//! `Redis.withExclusiveCaCertificate` and its siblings).
 @runtime_checked
 @pure
 package Redis.Url
@@ -29,6 +31,8 @@ pub record RedisUrl {
   database: Int
   /// 2 or 3; `0` when the URL does not choose.
   protocol: Int
+  /// True for `rediss://`: the connection is made over TLS.
+  tls: Bool
 }
 
 func hexValue(unit: in Int): Int {
@@ -130,16 +134,15 @@ func parseHostPort(text: in String): Result[HostPort, String] {
   }
 }
 
-/// Parse a `redis://` URL. The error text never contains the URL's password.
+/// Parse a `redis://` or `rediss://` URL. The error text never contains the
+/// URL's password.
 @experimental
 pub func parseRedisUrl(url: in String): Result[RedisUrl, String] {
-  if url.startsWith("rediss://") {
-    return Err("rediss:// (TLS) is not supported by this client")
+  val tls = url.startsWith("rediss://")
+  if not tls and not url.startsWith("redis://") {
+    return Err("a Redis URL starts with redis:// or rediss://")
   }
-  if not url.startsWith("redis://") {
-    return Err("a Redis URL starts with redis://")
-  }
-  var rest = url.substring(8)
+  var rest = if tls { url.substring(9) } else { url.substring(8) }
   val hash = Str.indexOfRaw(rest, "#")
   if hash >= 0 {
     rest = rest.substring(0, hash)
@@ -232,7 +235,8 @@ pub func parseRedisUrl(url: in String): Result[RedisUrl, String] {
       username = username,
       password = password,
       database = database,
-      protocol = protocol
+      protocol = protocol,
+      tls = tls
     )
   )
 }

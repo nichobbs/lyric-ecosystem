@@ -18,6 +18,17 @@
 //! never runs `FLUSHDB`, so one database can hold several stores and other
 //! data.
 //!
+//! TLS: a `rediss://` URL connects over TLS with the system trust store.
+//! For a private CA, a client certificate or another server name, build a
+//! `Redis.RedisConfig` and pass it to `connectWith`:
+//!
+//! ```
+//! import Redis
+//!
+//! val cfg = Redis.withExclusiveCaCertificate(Redis.configFromUrl("rediss://cache.internal:6380/1")?, caPem)
+//! val store = RedisCache.connectWith(cfg, RedisCache.options("myapp:cache:"))?
+//! ```
+//!
 //! Failures: `CacheStore` has no error channel (`get` returns an `Option`,
 //! the writes return `Unit`), so the interface methods degrade the way a
 //! cache should: a failed `get` is a miss, a failed write is dropped, and the
@@ -102,11 +113,27 @@ pub func fromClient(client: in RedisLib.RedisClient, opts: in RedisCacheOptions)
   RedisCacheStore(client = client, options = opts, errors = CacheErrorLog())
 }
 
-/// A store on a new connection to the server a `redis://` URL names. The
-/// connection is opened and authenticated before the store is returned.
+/// A store on a new connection to the server a `redis://` or `rediss://`
+/// (TLS) URL names. The connection is opened and authenticated before the
+/// store is returned.
 @experimental
 pub func connect(url: in String, opts: in RedisCacheOptions): Result[RedisCacheStore, RedisLib.RedisError] {
   match RedisLib.connect(url) {
+    case Err(e) -> Err(e)
+    case Ok(client) -> Ok(fromClient(client, opts))
+  }
+}
+
+/// A store on a new connection described by `cfg`: everything a URL cannot
+/// carry, such as the TLS options (`Redis.withExclusiveCaCertificate`,
+/// `Redis.withClientIdentity`, `Redis.withTlsServerName`,
+/// `Redis.withMinTlsVersion`), the timeouts and the protocol version. The
+/// connection is opened and authenticated before the store is returned.
+@experimental
+pub func connectWith(
+  cfg: in RedisLib.RedisConfig, opts: in RedisCacheOptions
+): Result[RedisCacheStore, RedisLib.RedisError] {
+  match RedisLib.open(cfg) {
     case Err(e) -> Err(e)
     case Ok(client) -> Ok(fromClient(client, opts))
   }

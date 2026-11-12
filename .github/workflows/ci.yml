@@ -88,6 +88,10 @@ jobs:
         working-directory: lyric-ecosystem
         run: bash scripts/ci/start-activemq.sh
 
+      - name: Start Redis with TLS
+        working-directory: lyric-ecosystem
+        run: bash scripts/ci/start-redis-tls.sh
+
       - name: Test packages against the services
         working-directory: lyric-ecosystem
         run: bash scripts/ci/test-packages.sh ${{ matrix.target }} --integration

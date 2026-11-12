@@ -1,4 +1,4 @@
-//! tests/url_tests.l - `redis://` URL parsing.
+//! tests/url_tests.l - `redis://` and `rediss://` URL parsing.
 @test_module
 package Redis.UrlTests
 
@@ -12,7 +12,7 @@ func parsed(url: in String): RedisUrl {
     case Ok(u) -> u
     case Err(e) -> {
       assertTrue(false, "expected " + url + " to parse, got: " + e)
-      RedisUrl(host = "", port = 0, username = "", password = "", database = 0, protocol = 0)
+      RedisUrl(host = "", port = 0, username = "", password = "", database = 0, protocol = 0, tls = false)
     }
   }
 }
@@ -35,6 +35,7 @@ test "host only: default port, database 0, no credentials" {
   assertEqual(u.username, "", "no user")
   assertEqual(u.password, "", "no password")
   assertEqualInt(u.protocol, 0, "no protocol choice")
+  assertFalse(u.tls, "redis:// is not TLS")
 }
 
 test "host, port and database" {
@@ -91,8 +92,35 @@ test "query parameters choose the database and the protocol" {
   assertEqualInt(parsed("redis://localhost/1?protocol=2").protocol, 2, "protocol 2")
 }
 
-test "rediss is refused with a TLS message" {
-  assertTrue(Str.contains(errorOf("rediss://localhost:6379"), "TLS"), "the error names TLS")
+test "rediss selects TLS and parses like redis" {
+  val u = parsed("rediss://app:s3cret@redis.example.com:6380/2?protocol=3")
+  assertTrue(u.tls, "rediss:// is TLS")
+  assertEqual(u.username, "app", "user")
+  assertEqual(u.password, "s3cret", "password")
+  assertEqual(u.host, "redis.example.com", "host")
+  assertEqualInt(u.port, 6380, "port")
+  assertEqualInt(u.database, 2, "database")
+  assertEqualInt(u.protocol, 3, "protocol")
+}
+
+test "rediss keeps the default port and takes an IPv6 host" {
+  val u = parsed("rediss://cache.internal")
+  assertTrue(u.tls, "TLS")
+  assertEqual(u.host, "cache.internal", "host")
+  assertEqualInt(u.port, 6379, "default port")
+  val v6 = parsed("rediss://:pw@[::1]:6390/1")
+  assertTrue(v6.tls, "TLS")
+  assertEqual(v6.host, "::1", "host")
+  assertEqualInt(v6.port, 6390, "port")
+  assertEqual(v6.password, "pw", "password")
+}
+
+test "only the two schemes are accepted" {
+  assertTrue(Str.contains(errorOf("redisss://localhost"), "rediss://"), "the error names the schemes")
+  val _ = errorOf("rediss:/localhost")
+  val _ = errorOf("REDISS://localhost")
+  val _ = errorOf("rediss://")
+  val _ = errorOf("rediss://localhost?tls=false")
 }
 
 test "malformed URLs are rejected" {

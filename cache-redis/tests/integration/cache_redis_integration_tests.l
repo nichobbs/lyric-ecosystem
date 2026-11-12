@@ -6,6 +6,11 @@
 //!   LYRIC_REDIS_URL=redis://127.0.0.1:16379 \
 //!     lyric test --manifest cache-redis/lyric.toml --target dotnet --features integration
 //!
+//! The conformance suite runs a second time over TLS with a client
+//! certificate, against the server `scripts/ci/start-redis-tls.sh` starts:
+//! `LYRIC_REDIS_MTLS_URL` (a `rediss://` URL), `LYRIC_REDIS_TLS_CA`,
+//! `LYRIC_REDIS_TLS_CERT` and `LYRIC_REDIS_TLS_KEY` (PEM files).
+//!
 //! Every key is written under a random prefix and removed again.
 //!
 //! Time: the conformance suite advances its clock by 26 "seconds" in all.
@@ -101,6 +106,86 @@ test "RedisCacheStore conforms to CacheStore" {
     assertEqualInt(store.errors.errorCount(), 0, "no Redis failure was swallowed during conformance")
     val _ = ok(RedisCache.tryClear(store), "cleanup")
     store.client.close()
+  }
+}
+
+// ─── Conformance over TLS ────────────────────────────────────────────────────
+func requiredEnv(name: in String): String {
+  val value = Env.getVarOrDefault(name, "")
+  if value.length == 0 {
+    panic(
+      name +
+        " is not set: the TLS conformance run needs a Redis server with TLS; run scripts/ci/start-redis-tls.sh, which starts one and prints LYRIC_REDIS_MTLS_URL, LYRIC_REDIS_TLS_CA, LYRIC_REDIS_TLS_CERT and LYRIC_REDIS_TLS_KEY"
+    )
+  }
+  value
+}
+
+// The server that requires a client certificate: the custom CA and the
+// client identity both travel through `connectWith`.
+func tlsConfig(): RedisLib.RedisConfig {
+  val fromUrl = ok(RedisLib.configFromUrl(requiredEnv("LYRIC_REDIS_MTLS_URL")), "LYRIC_REDIS_MTLS_URL")
+  if not fromUrl.tls.enabled {
+    panic("LYRIC_REDIS_MTLS_URL must be a rediss:// URL")
+  }
+  val withCa = ok(
+    RedisLib.withExclusiveCaCertificateFile(fromUrl, requiredEnv("LYRIC_REDIS_TLS_CA")),
+    "LYRIC_REDIS_TLS_CA"
+  )
+  ok(
+    RedisLib.withClientIdentityFiles(withCa, requiredEnv("LYRIC_REDIS_TLS_CERT"), requiredEnv("LYRIC_REDIS_TLS_KEY")),
+    "LYRIC_REDIS_TLS_CERT / LYRIC_REDIS_TLS_KEY"
+  )
+}
+
+val tlsConformanceStores: List[RedisCache.RedisCacheStore] = newList()
+
+func tlsConformanceStore(): Cache.CacheStore {
+  val opts = RedisCache.optionsWithTtlUnit(freshPrefix(), conformanceTtlUnitMillis)
+  val store = ok(RedisCache.connectWith(tlsConfig(), opts), "connectWith over TLS")
+  tlsConformanceStores.add(store)
+  val asInterface: Cache.CacheStore = store
+  asInterface
+}
+
+test "RedisCacheStore conforms to CacheStore over TLS with a client certificate" {
+  requireConformance(
+    CacheConformance.run({ -> tlsConformanceStore() }, { seconds -> sleepMillis(seconds * conformanceTtlUnitMillis) })
+  )
+  assertTrue(tlsConformanceStores.count >= 12, "the suite built a store per case")
+  for store in tlsConformanceStores {
+    assertEqualInt(store.errors.errorCount(), 0, "no Redis failure was swallowed during conformance")
+    val _ = ok(RedisCache.tryClear(store), "cleanup")
+    store.client.close()
+  }
+}
+
+test "connectWith without the client certificate or the CA does not produce a store" {
+  val opts = RedisCache.options(freshPrefix())
+  val fromUrl = ok(RedisLib.configFromUrl(requiredEnv("LYRIC_REDIS_MTLS_URL")), "LYRIC_REDIS_MTLS_URL")
+  match RedisCache.connectWith(fromUrl, opts) {
+    case Err(e) -> assertEqual(e.code(), "TLS_FAILED", "the test CA is not a system CA")
+    case Ok(_) -> assertTrue(false, "an untrusted server must be refused")
+  }
+  match RedisCache.connect(requiredEnv("LYRIC_REDIS_MTLS_URL"), opts) {
+    case Err(e) -> assertEqual(e.code(), "TLS_FAILED", "nor through connect(url)")
+    case Ok(_) -> assertTrue(false, "an untrusted server must be refused")
+  }
+  val withCa = ok(
+    RedisLib.withExclusiveCaCertificateFile(fromUrl, requiredEnv("LYRIC_REDIS_TLS_CA")),
+    "LYRIC_REDIS_TLS_CA"
+  )
+  // The server drops a client without a certificate after the handshake, so
+  // the failure is either the open or the first command.
+  match RedisCache.connectWith(withCa, opts) {
+    case Err(e) -> assertTrue(e.code() == "TLS_FAILED" or e.code() == "CONNECTION_LOST", "refused: " + e.code())
+    case Ok(store) -> {
+      match RedisCache.tryGet(store, "k") {
+        case Err(e) -> assertTrue(e.code() == "TLS_FAILED" or e.code() == "CONNECTION_LOST", "refused: " + e.code())
+        case Ok(_) -> assertTrue(false, "a client without a certificate must be refused")
+      }
+      store.client.close()
+    }
   }
 }
 

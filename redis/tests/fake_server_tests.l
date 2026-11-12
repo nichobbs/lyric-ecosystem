@@ -552,6 +552,6 @@ test "a refused connection is ConnectFailed" {
 }
 
 test "an unusable URL is InvalidConfig" {
-  assertEqual(codeOf(Redis.connect("rediss://127.0.0.1"), "a rediss URL"), "INVALID_CONFIG", "TLS is refused")
+  assertEqual(codeOf(Redis.connect("rediss://"), "a rediss URL without a host"), "INVALID_CONFIG", "no host")
   assertEqual(codeOf(Redis.connect("127.0.0.1:6379"), "a URL without a scheme"), "INVALID_CONFIG", "no scheme")
 }

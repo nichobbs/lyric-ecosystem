@@ -10,6 +10,7 @@ import Std.Core
 import Std.Collections
 import Std.String as Str
 import Std.Testing
+import Std.Tls as Tls
 import Session
 import Session.Redis as RedisSessions
 import Session.Redis.Admin as Admin
@@ -159,12 +160,13 @@ test "save rejects a negative expiry before contacting Redis" {
 }
 
 test "connect reports an unusable URL and an unreachable server without the password" {
-  match RedisSessions.connect("rediss://app:hunter2@127.0.0.1", RedisSessions.options("p:", 60)) {
+  match RedisSessions.connect("redis://app:hunter2@127.0.0.1:notaport", RedisSessions.options("p:", 60)) {
     case Err(e) -> {
-      assertEqual(e.code, "CONNECT_FAILED", "a TLS URL")
+      assertEqual(e.code, "CONNECT_FAILED", "an unusable URL")
+      assertTrue(Str.contains(e.message, "invalid Redis configuration"), "the message says what is wrong")
       assertFalse(Str.contains(e.message, "hunter2"), "the password is not in the message")
     }
-    case Ok(_) -> assertTrue(false, "rediss must be refused")
+    case Ok(_) -> assertTrue(false, "an unusable URL must be refused")
   }
   val url = "redis://app:hunter2@127.0.0.1:" + closedPort().toString()
   match RedisSessions.connect(url, RedisSessions.options("p:", 60)) {
@@ -173,5 +175,42 @@ test "connect reports an unusable URL and an unreachable server without the pass
       assertFalse(Str.contains(e.message, "hunter2"), "the password is not in the message")
     }
     case Ok(_) -> assertTrue(false, "nothing listens on the port")
+  }
+}
+
+test "a rediss URL is dialled, and connectWith carries the TLS options" {
+  val port = closedPort().toString()
+  match RedisSessions.connect("rediss://app:hunter2@127.0.0.1:" + port, RedisSessions.options("p:", 60)) {
+    case Err(e) -> {
+      assertEqual(e.code, "CONNECT_FAILED", "a TLS URL is accepted and dialled")
+      assertTrue(Str.contains(e.message, "cannot connect to Redis"), "the failure is the dial, not the URL")
+      assertFalse(Str.contains(e.message, "hunter2"), "the password is not in the message")
+    }
+    case Ok(_) -> assertTrue(false, "nothing listens on the port")
+  }
+  val tls = match RedisLib.configFromUrl("rediss://127.0.0.1:" + port) {
+    case Ok(cfg) -> cfg
+    case Err(e) -> panic("the URL must parse: " + e.message())
+  }
+  val named = RedisLib.withTlsServerName(RedisLib.withMinTlsVersion(tls, Tls.Tls13), "sessions.internal")
+  match RedisSessions.connectWith(named, RedisSessions.options("p:", 60)) {
+    case Err(e) -> assertTrue(Str.contains(e.message, "cannot connect to Redis"), "usable TLS options reach the dial")
+    case Ok(_) -> assertTrue(false, "nothing listens on the port")
+  }
+  val badCa = RedisLib.withExclusiveCaCertificate(tls, "not a certificate")
+  match RedisSessions.connectWith(badCa, RedisSessions.options("p:", 60)) {
+    case Err(e) -> {
+      assertEqual(e.code, "CONNECT_FAILED", "the store's connect code")
+      assertTrue(Str.contains(e.message, "invalid Redis configuration"), "an unusable CA is reported before dialling")
+    }
+    case Ok(_) -> assertTrue(false, "an unusable CA must be refused")
+  }
+  val plain = RedisLib.withTlsServerName(RedisLib.configFor("127.0.0.1", closedPort()), "sessions.internal")
+  match RedisSessions.connectWith(plain, RedisSessions.options("p:", 60)) {
+    case Err(e) -> assertTrue(
+      Str.contains(e.message, "invalid Redis configuration"),
+      "TLS options without TLS are refused"
+    )
+    case Ok(_) -> assertTrue(false, "TLS options on a plain connection must be refused")
   }
 }

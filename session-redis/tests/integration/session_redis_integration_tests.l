@@ -6,6 +6,11 @@
 //!   LYRIC_REDIS_URL=redis://127.0.0.1:16379 \
 //!     lyric test --manifest session-redis/lyric.toml --target dotnet --features integration
 //!
+//! The conformance suite runs a further time over TLS with a client
+//! certificate, against the server `scripts/ci/start-redis-tls.sh` starts:
+//! `LYRIC_REDIS_MTLS_URL` (a `rediss://` URL), `LYRIC_REDIS_TLS_CA`,
+//! `LYRIC_REDIS_TLS_CERT` and `LYRIC_REDIS_TLS_KEY` (PEM files).
+//!
 //! Every session is written under a random prefix and removed again.
 @cfg(feature = "integration")
 @test_module
@@ -124,6 +129,82 @@ test "RedisSessionStore conforms to SessionStore over RESP3" {
   assertTrue(resp3Stores.count >= 15, "the suite built a store per case")
   for store in resp3Stores {
     finish(store)
+  }
+}
+
+// ─── Conformance over TLS ────────────────────────────────────────────────────
+func requiredEnv(name: in String): String {
+  val value = Env.getVarOrDefault(name, "")
+  if value.length == 0 {
+    panic(
+      name +
+        " is not set: the TLS conformance run needs a Redis server with TLS; run scripts/ci/start-redis-tls.sh, which starts one and prints LYRIC_REDIS_MTLS_URL, LYRIC_REDIS_TLS_CA, LYRIC_REDIS_TLS_CERT and LYRIC_REDIS_TLS_KEY"
+    )
+  }
+  value
+}
+
+// The server that requires a client certificate, with the custom CA and
+// without the client identity.
+func tlsConfigWithoutIdentity(): RedisLib.RedisConfig {
+  val fromUrl = redisOk(RedisLib.configFromUrl(requiredEnv("LYRIC_REDIS_MTLS_URL")), "LYRIC_REDIS_MTLS_URL")
+  if not fromUrl.tls.enabled {
+    panic("LYRIC_REDIS_MTLS_URL must be a rediss:// URL")
+  }
+  redisOk(RedisLib.withExclusiveCaCertificateFile(fromUrl, requiredEnv("LYRIC_REDIS_TLS_CA")), "LYRIC_REDIS_TLS_CA")
+}
+
+func tlsConfig(): RedisLib.RedisConfig {
+  redisOk(
+    RedisLib.withClientIdentityFiles(
+      tlsConfigWithoutIdentity(),
+      requiredEnv("LYRIC_REDIS_TLS_CERT"),
+      requiredEnv("LYRIC_REDIS_TLS_KEY")
+    ),
+    "LYRIC_REDIS_TLS_CERT / LYRIC_REDIS_TLS_KEY"
+  )
+}
+
+val tlsStores: List[RedisSessions.RedisSessionStore] = newList()
+
+func tlsStore(): SessionStore {
+  val store = ok(
+    RedisSessions.connectWith(tlsConfig(), RedisSessions.options(freshPrefix(), 600)),
+    "connectWith over TLS"
+  )
+  tlsStores.add(store)
+  val asInterface: SessionStore = store
+  asInterface
+}
+
+test "RedisSessionStore conforms to SessionStore over TLS with a client certificate" {
+  requireConformance(SessionConformance.run({ -> tlsStore() }))
+  assertTrue(tlsStores.count >= 15, "the suite built a store per case")
+  for store in tlsStores {
+    finish(store)
+  }
+}
+
+test "connectWith without the CA or the client certificate does not produce a working store" {
+  val opts = RedisSessions.options(freshPrefix(), 600)
+  match RedisSessions.connect(requiredEnv("LYRIC_REDIS_MTLS_URL"), opts) {
+    case Err(e) -> {
+      assertEqual(e.code, "CONNECT_FAILED", "the store's connect code")
+      assertTrue(e.message.startsWith("Redis TLS handshake failed"), "the test CA is not a system CA: " + e.message)
+    }
+    case Ok(_) -> assertTrue(false, "an untrusted server must be refused")
+  }
+  // The server drops a client without a certificate after the handshake, so
+  // the failure is either the connect or the first operation.
+  match RedisSessions.connectWith(tlsConfigWithoutIdentity(), opts) {
+    case Err(e) -> assertEqual(e.code, "CONNECT_FAILED", "refused at connect")
+    case Ok(store) -> {
+      match store.create() {
+        case Err(e) -> assertEqual(e.code, "CREATE_FAILED", "refused at the first operation")
+        case Ok(_) -> assertTrue(false, "a client without a certificate must be refused")
+      }
+      store.client.close()
+    }
   }
 }
 

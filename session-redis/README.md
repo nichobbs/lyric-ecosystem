@@ -11,7 +11,7 @@ requests on a session lose no update and `set` can never create a session.
 | Stability | experimental (0.1.0) |
 | Interface | `Lyric.Session` 0.1.0 (`Session.SessionStore`); conformance suite `Testing.Conformance.Session` from `Lyric.Testing` 0.1.0 |
 | Third-party libraries | none (`Lyric.Redis`, path dependency `../redis`) |
-| Tested against | Redis 7.0.15 |
+| Tested against | Redis 7.0.15, plain and TLS |
 | Server requirement | `EVAL` must be allowed for the connecting user |
 
 ## Use
@@ -32,9 +32,33 @@ match RedisSessions.connect("redis://sessions.internal:6379", RedisSessions.opti
 `Session` functions are reachable through it (`RedisSessions.SessionStore`, `RedisSessions.isValidSessionId`). `RedisSessions.fromClient(client, options)` builds a store
 on an existing `Redis.RedisClient`.
 
+## TLS
+
+`RedisSessions.connect` takes a `rediss://` URL: TLS with the system trust store and the URL's host as
+the server name. Everything a URL cannot carry goes through `RedisSessions.connectWith(cfg, options)`,
+which takes a `Redis.RedisConfig`:
+
+```lyric
+import Redis
+import Session.Redis as RedisSessions
+
+match Redis.configFromUrl("rediss://sessions.internal:6380") {
+  case Err(e) -> println(e.message())
+  case Ok(base) -> {
+    val cfg = Redis.withClientIdentity(Redis.withExclusiveCaCertificate(base, caPem), certPem, keyPem)
+    val store = RedisSessions.connectWith(cfg, RedisSessions.options("myapp:session:", 3600))
+  }
+}
+```
+
+The TLS options (`withExclusiveCaCertificate`, `withClientIdentity`, `withTlsServerName`,
+`withMinTlsVersion`, `withInsecureSkipVerify` and its `LYRIC_TLS_ALLOW_INSECURE` policy) are those of
+`Lyric.Redis`; see its README. An unusable TLS configuration and a failed handshake are both
+`SessionError` values with the code `CONNECT_FAILED` and the Redis client's message.
+
 ## Configuration
 
-Explicit values only: the URL (see `Lyric.Redis` for its form) and `RedisSessionOptions`:
+Explicit values only: the URL or `Redis.RedisConfig` (see `Lyric.Redis`) and `RedisSessionOptions`:
 
 - `keyPrefix` (required, not empty): prepended to the session id to form the Redis key.
 - `ttlSeconds` (1 to 31536000, the limit `Session.maxSessionTtlSeconds()` sets): lifetime of a session
@@ -80,20 +104,25 @@ the same name. The two layouts are different, so a deployment uses one or the ot
 lyric test --manifest session-redis/lyric.toml --target dotnet
 lyric test --manifest session-redis/lyric.toml --target jvm
 
-# Integration: the SessionStore conformance suite (RESP2 and RESP3) and backend tests against a real server
+# Integration: the SessionStore conformance suite (RESP2, RESP3, and over TLS with a client
+# certificate) and backend tests against a real server
 redis-server --port 16379 --save "" --appendonly no --daemonize yes
-LYRIC_REDIS_URL=redis://127.0.0.1:16379 lyric test --manifest session-redis/lyric.toml --target dotnet --features integration
-LYRIC_REDIS_URL=redis://127.0.0.1:16379 lyric test --manifest session-redis/lyric.toml --target jvm --features integration
+export LYRIC_REDIS_URL=redis://127.0.0.1:16379
+eval "$(scripts/ci/start-redis-tls.sh)"
+lyric test --manifest session-redis/lyric.toml --target dotnet --features integration
+lyric test --manifest session-redis/lyric.toml --target jvm --features integration
 ```
 
 The integration module is compiled only with `--features integration` and fails with a message naming
-`LYRIC_REDIS_URL` when the variable is unset. Every session it writes is under a random prefix and is
-removed. The conformance suite cannot run hermetically: there is no in-process Redis.
+the variable when one is unset: `LYRIC_REDIS_URL` (a plain server), and for the TLS run
+`LYRIC_REDIS_MTLS_URL` (a `rediss://` server that requires a client certificate), `LYRIC_REDIS_TLS_CA`,
+`LYRIC_REDIS_TLS_CERT` and `LYRIC_REDIS_TLS_KEY` (PEM files), which `scripts/ci/start-redis-tls.sh`
+prints. Every session it writes is under a random prefix and is removed. The conformance suite cannot run hermetically: there is no in-process Redis.
 
 ## Known gaps
 
-- Everything listed under "Known gaps" of `Lyric.Redis` (no TLS, one connection, connect timeout on
-  dotnet).
+- Everything listed under "Known gaps" of `Lyric.Redis` (one connection, no Cluster or Sentinel, the
+  limits of its TLS options).
 - Scripts are sent with `EVAL` on every call (no `EVALSHA`). Each script touches one key, so it is valid
   on Redis Cluster, but the client itself has no Cluster support.
 - The option contracts spell the one-year TTL limit as the literal `31536000`: calling

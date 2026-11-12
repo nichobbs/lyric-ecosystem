@@ -18,6 +18,12 @@
 //! Redis expiry is the session's expiry, so an expired session is removed by
 //! Redis itself.
 //!
+//! TLS: a `rediss://` URL connects over TLS with the system trust store.
+//! For a private CA, a client certificate or another server name, build a
+//! `Redis.RedisConfig` (`Redis.withExclusiveCaCertificate`,
+//! `Redis.withClientIdentity`, `Redis.withTlsServerName`) and pass it to
+//! `connectWith`.
+//!
 //! Atomicity: every operation that reads before it writes (`create`, `set`,
 //! `delete`, `clear`, `touch`, `save`, `load`) is one Lua script (`EVAL`), so
 //! concurrent requests on one session never lose an update, and `set` on an
@@ -91,11 +97,29 @@ pub func fromClient(client: in RedisLib.RedisClient, opts: in RedisSessionOption
   RedisSessionStore(client = client, options = opts)
 }
 
-/// A store on a new connection to the server a `redis://` URL names. The
-/// connection is opened and authenticated before the store is returned.
+/// A store on a new connection to the server a `redis://` or `rediss://`
+/// (TLS) URL names. The connection is opened and authenticated before the
+/// store is returned.
 @experimental
 pub func connect(url: in String, opts: in RedisSessionOptions): Result[RedisSessionStore, SessionError] {
   match RedisLib.connect(url) {
+    case Err(e) -> Err(SessionError(message = e.message(), code = "CONNECT_FAILED"))
+    case Ok(client) -> Ok(fromClient(client, opts))
+  }
+}
+
+/// A store on a new connection described by `cfg`: everything a URL cannot
+/// carry, such as the TLS options (`Redis.withExclusiveCaCertificate`,
+/// `Redis.withClientIdentity`, `Redis.withTlsServerName`,
+/// `Redis.withMinTlsVersion`), the timeouts and the protocol version. The
+/// connection is opened and authenticated before the store is returned; a
+/// failure, an unusable TLS configuration included, has the code
+/// `CONNECT_FAILED`.
+@experimental
+pub func connectWith(
+  cfg: in RedisLib.RedisConfig, opts: in RedisSessionOptions
+): Result[RedisSessionStore, SessionError] {
+  match RedisLib.open(cfg) {
     case Err(e) -> Err(SessionError(message = e.message(), code = "CONNECT_FAILED"))
     case Ok(client) -> Ok(fromClient(client, opts))
   }

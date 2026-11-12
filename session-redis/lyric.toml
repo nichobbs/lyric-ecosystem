@@ -24,7 +24,7 @@ output_assembly = "Session.Redis.dll"
 
 [features]
 default     = []
-integration = []   # run tests/integration against the server named by LYRIC_REDIS_URL
+integration = []   # run tests/integration against the servers named by LYRIC_REDIS_URL and LYRIC_REDIS_MTLS_URL
 
 [dependencies]
 # The interface and its conformance suite, resolved through the root
