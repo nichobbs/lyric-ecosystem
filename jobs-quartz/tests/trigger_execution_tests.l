@@ -359,6 +359,63 @@ test "a finite job whose last firing is skipped fails when its running firing fa
   assertEqual(statusAfterSkippedLastFiring(true), "Failed", "final status")
 }
 
+// One worker thread, and the first firing holds it until the two later
+// firings are later than the misfire threshold: Quartz then drops them and
+// ends the trigger without calling the job again.  The job must still finish,
+// with the outcome of the firing that ran, and leave Quartz.
+func statusAfterDroppedLastFirings(fail: in Bool): String {
+  val s = created(testConfig().copy(workerThreads = 1, misfireThresholdMs = 500))
+  val gate = Gate()
+  Quartz.registerHandler(s, "held", Held(gate = gate, fail = fail))
+  begin(s)
+  val spec = mustSpec(Triggers.interval(300i64, 200i64, 2, Triggers.MisfirePolicy.Skip))
+  val id = mustId(Quartz.scheduleTrigger(s, "held", "", spec, 1, 600000))
+  var waited = 0
+  while gate.count() < 1 and waited < 30000 {
+    Jobs.sleepMs(10)
+    waited = waited + 10
+  }
+  assertEqualInt(gate.count(), 1, "the first firing started")
+  // The firings 200 ms and 400 ms after the first become misfires.
+  Jobs.sleepMs(1500)
+  assertEqual(statusName(s.status(id)), "Running", "the first firing is still running")
+  gate.release()
+  val final = statusName(Quartz.awaitFinished(s, id, 30000))
+  assertEqualInt(gate.count(), 1, "the later firings were dropped")
+  assertEqualInt(Quartz.timesFired(s, id), 1, "timesFired")
+  assertEqualInt(resultsOf(s, id).length, 1, "one attempt recorded")
+  assertTrue(waitUntilDropped(s, id, 30000), "Quartz no longer stores the finished job")
+  stop(s)
+  final
+}
+
+test "a finite job whose remaining firings are dropped as misfires succeeds when the firing that ran succeeded" {
+  assertEqual(statusAfterDroppedLastFirings(false), "Succeeded", "final status")
+}
+
+test "a finite job whose remaining firings are dropped as misfires fails when the firing that ran failed" {
+  assertEqual(statusAfterDroppedLastFirings(true), "Failed", "final status")
+}
+
+test "a finite job whose every firing is dropped as a misfire ends Cancelled without running" {
+  val s = created(testConfig().copy(workerThreads = 1, misfireThresholdMs = 100))
+  val counter = Counter()
+  Quartz.registerHandler(s, "tick", ticker(counter))
+  val spec = mustSpec(Triggers.interval(0i64, 100i64, 2, Triggers.MisfirePolicy.Skip))
+  val id = mustId(Quartz.scheduleTrigger(s, "tick", "", spec, 1, 30000))
+  // All three firings pass the misfire threshold while the scheduler is in standby.
+  Jobs.sleepMs(1000)
+  assertEqual(statusName(s.status(id)), "Pending", "nothing fires in standby")
+  begin(s)
+  assertEqual(statusName(Quartz.awaitFinished(s, id, 30000)), "Cancelled", "final status of a job that never ran")
+  assertEqualInt(counter.count(), 0, "the handler was never called")
+  assertEqualInt(Quartz.timesFired(s, id), 0, "timesFired")
+  assertEqualInt(Quartz.attemptsRun(s, id), 0, "attemptsRun")
+  assertEqualInt(resultsOf(s, id).length, 0, "no attempt recorded")
+  assertTrue(waitUntilDropped(s, id, 30000), "Quartz no longer stores the finished job")
+  stop(s)
+}
+
 // ─── Misfire policy ───────────────────────────────────────────────────────────
 // Ten firings of a 200 ms interval are missed while the scheduler is in
 // standby; the count shortly after `start` shows what the policy did with them.

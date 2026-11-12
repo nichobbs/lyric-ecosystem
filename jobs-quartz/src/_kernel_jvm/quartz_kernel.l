@@ -8,6 +8,9 @@
 //!   - `DispatchJob` / `DispatchFactory`, Lyric records that implement
 //!     `org.quartz.Job` and `org.quartz.spi.JobFactory`, so every firing on a
 //!     Quartz worker thread calls back into a Lyric closure,
+//!   - `TriggerWatch`, a Lyric record that implements
+//!     `org.quartz.SchedulerListener`, so the Lyric side hears of every
+//!     trigger Quartz ends, including one it ends without firing the job,
 //!   - trigger construction (one-shot, cron, fixed interval) and job removal.
 //!
 //! No Quartz or JDK exception leaves this file: every entry point returns
@@ -56,6 +59,14 @@ extern type JTriggerBuilder = "org.quartz.TriggerBuilder"
 
 extern type JTrigger = "org.quartz.Trigger"
 
+extern type JTriggerKey = "org.quartz.TriggerKey"
+
+extern type JSchedulerListener = "org.quartz.SchedulerListener"
+
+extern type JListenerManager = "org.quartz.ListenerManager"
+
+extern type JSchedulerException = "org.quartz.SchedulerException"
+
 extern type JScheduleBuilder = "org.quartz.ScheduleBuilder"
 
 extern type JSimpleScheduleBuilder = "org.quartz.SimpleScheduleBuilder"
@@ -85,11 +96,12 @@ func describe(typeName: in String, message: in String): String {
 }
 
 // ─── Job dispatch ─────────────────────────────────────────────────────────────
-// `run(jobId, scheduledFireMs, mayFireAgain)` is the Lyric side of a firing.
-// Quartz asks the `JobFactory` for a `Job` each time a trigger fires and then
-// calls `execute` on a worker thread.
+// `run(jobId, triggerName, scheduledFireMs, mayFireAgain)` is the Lyric side
+// of a firing.  Quartz asks the `JobFactory` for a `Job` each time a trigger
+// fires and then calls `execute` on a worker thread.  `run` answers true when
+// the job has reached its final status and is to be removed from Quartz.
 record DispatchJob {
-  run: (String, Long, Bool) -> Unit
+  run: (String, String, Long, Bool) -> Bool
 }
 
 func scheduledFireMs(ctx: in JJobExecutionContext): Long {
@@ -104,13 +116,27 @@ func firedJobId(ctx: in JJobExecutionContext): String {
   ctx.getJobDetail().getKey().getName()
 }
 
+func firedTriggerName(ctx: in JJobExecutionContext): String {
+  ctx.getTrigger().getKey().getName()
+}
+
+// Quartz drops a job by itself only when its last trigger ends by firing; a
+// trigger ended as a misfire stays stored, and the job with it.  A failure
+// has nobody to report to, and leaves nothing behind after `shutdown`.
+func dropFinished(s: in JScheduler, jobId: in String): Unit {
+  val _ = deleteJob(s, jobId)
+}
+
 impl JJob for DispatchJob {
   func execute(ctx: in JJobExecutionContext): Unit {
     // A throwable escaping `execute` would be logged by Quartz and, for a
     // `JobExecutionException`, could alter the trigger; the Lyric side owns
     // retries and outcomes, so nothing is allowed out.
     try {
-      self.run(firedJobId(ctx), scheduledFireMs(ctx), mayFireAgain(ctx))
+      val jobId = firedJobId(ctx)
+      if self.run(jobId, firedTriggerName(ctx), scheduledFireMs(ctx), mayFireAgain(ctx)) {
+        dropFinished(ctx.getScheduler(), jobId)
+      }
     } catch Bug as _ {
       ()
     }
@@ -118,7 +144,7 @@ impl JJob for DispatchJob {
 }
 
 record DispatchFactory {
-  run: (String, Long, Bool) -> Unit
+  run: (String, String, Long, Bool) -> Bool
 }
 
 impl JJobFactory for DispatchFactory {
@@ -128,19 +154,132 @@ impl JJobFactory for DispatchFactory {
   }
 }
 
+// ─── Trigger end ──────────────────────────────────────────────────────────────
+// `ended(jobId, triggerName)` is the Lyric side of `triggerFinalized`: Quartz
+// calls it for a trigger that will never fire again, after the trigger's last
+// firing has run (worker thread) or when a misfire policy drops its remaining
+// firings (scheduler thread, with no call to the job at all).  `ended`
+// answers true when that gave the job its final status and it is to be
+// removed from Quartz.  Every other notification is ignored.
+record TriggerWatch {
+  scheduler: JScheduler
+  ended: (String, String) -> Bool
+}
+
+func triggerJobId(t: in JTrigger): String {
+  t.getJobKey().getName()
+}
+
+func triggerName(t: in JTrigger): String {
+  t.getKey().getName()
+}
+
+impl JSchedulerListener for TriggerWatch {
+  func triggerFinalized(trigger: in JTrigger): Unit {
+    try {
+      val jobId = triggerJobId(trigger)
+      if self.ended(jobId, triggerName(trigger)) {
+        dropFinished(self.scheduler, jobId)
+      }
+    } catch Bug as _ {
+      ()
+    }
+  }
+
+  func jobScheduled(trigger: in JTrigger): Unit {
+    ()
+  }
+
+  func jobUnscheduled(key: in JTriggerKey): Unit {
+    ()
+  }
+
+  func triggerPaused(key: in JTriggerKey): Unit {
+    ()
+  }
+
+  func triggersPaused(group: in String): Unit {
+    ()
+  }
+
+  func triggerResumed(key: in JTriggerKey): Unit {
+    ()
+  }
+
+  func triggersResumed(group: in String): Unit {
+    ()
+  }
+
+  func jobAdded(detail: in JJobDetail): Unit {
+    ()
+  }
+
+  func jobDeleted(key: in JJobKey): Unit {
+    ()
+  }
+
+  func jobPaused(key: in JJobKey): Unit {
+    ()
+  }
+
+  func jobsPaused(group: in String): Unit {
+    ()
+  }
+
+  func jobResumed(key: in JJobKey): Unit {
+    ()
+  }
+
+  func jobsResumed(group: in String): Unit {
+    ()
+  }
+
+  func schedulerError(message: in String, cause: in JSchedulerException): Unit {
+    ()
+  }
+
+  func schedulerInStandbyMode(): Unit {
+    ()
+  }
+
+  func schedulerStarted(): Unit {
+    ()
+  }
+
+  func schedulerStarting(): Unit {
+    ()
+  }
+
+  func schedulerShutdown(): Unit {
+    ()
+  }
+
+  func schedulerShuttingdown(): Unit {
+    ()
+  }
+
+  func schedulingDataCleared(): Unit {
+    ()
+  }
+}
+
 func classOf(o: in JObject): JClass {
   o.getClass()
 }
 
-func discardFiring(id: in String, at: in Long, again: in Bool): Unit {
-  ()
+func discardFiring(id: in String, trigger: in String, at: in Long, again: in Bool): Bool {
+  false
 }
 
 // `JobBuilder.newJob` wants the `Class` of the job; the factory above ignores
 // it and builds the instance itself, but Quartz still checks it implements
 // `Job`, so it is the class of the record that does.
 func dispatchJobClass(): JClass {
-  val probe: JJob = DispatchJob(run = { id: String, at: Long, again: Bool -> discardFiring(id, at, again) })
+  val probe: JJob = DispatchJob(
+    run = { id: String, trigger: String, at: Long, again: Bool ->
+      discardFiring(id, trigger, at, again)
+    }
+  )
   classOf(probe)
 }
 
@@ -162,7 +301,8 @@ func setProp(props: in JProperties, key: in String, value: in String): Unit {
 }
 
 /// Build a scheduler in standby (no trigger fires until `startScheduler`).
-/// `run` is called on a worker thread for every firing.  Quartz keeps a
+/// `run` is called on a worker thread for every firing, `ended` for every
+/// trigger Quartz ends (see `DispatchJob` and `TriggerWatch`).  Quartz keeps a
 /// process-wide registry of schedulers by name and would silently hand back
 /// the existing one, so a name already in use is an `Err`.
 pub func newScheduler(
@@ -170,7 +310,8 @@ pub func newScheduler(
   workerThreads: in Int,
   daemonThreads: in Bool,
   misfireThresholdMs: in Int,
-  run: in (String, Long, Bool) -> Unit,
+  run: in (String, String, Long, Bool) -> Bool,
+  ended: in (String, String) -> Bool,
 ): Result[JScheduler, String]
   requires: instanceName.length > 0
   requires: workerThreads >= 1
@@ -191,6 +332,8 @@ pub func newScheduler(
     val sched = JStdSchedulerFactory.new(props).getScheduler()
     val factory: JJobFactory = DispatchFactory(run = run)
     sched.setJobFactory(factory)
+    val watch: JSchedulerListener = TriggerWatch(scheduler = sched, ended = ended)
+    sched.getListenerManager().addSchedulerListener(watch)
     Ok(sched)
   } catch Bug as b {
     Err(describe(b.typeName, b.message))
@@ -330,7 +473,7 @@ pub func validQuartzCron(expr: in String): Bool {
 
 // ─── Jobs ─────────────────────────────────────────────────────────────────────
 /// Store job `jobId` with all of `triggers`, atomically.  The job is not
-/// durable: Quartz drops it once its last trigger has finished.
+/// durable: Quartz drops it once its last trigger has fired for the last time.
 pub func submitJob(s: in JScheduler, jobId: in String, triggers: in slice[JTrigger]): Result[Unit, String]
   requires: jobId.length > 0
   requires: triggers.length > 0

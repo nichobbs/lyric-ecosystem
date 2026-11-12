@@ -22,9 +22,13 @@
 //!   Pending    waiting for a trigger to fire (a recurring job is `Pending`
 //!              again between firings)
 //!   Running    a worker thread is running the handler
-//!   Succeeded  the last possible firing ended with an `Ok` attempt
-//!   Failed     the last possible firing used up `maxAttempts`
-//!   Cancelled  `cancel` was called before the job reached a final status
+//!   Succeeded  no trigger of the job can fire again, and the last firing
+//!              that ran ended with an `Ok` attempt
+//!   Failed     no trigger of the job can fire again, and the last firing
+//!              that ran used up `maxAttempts`
+//!   Cancelled  `cancel` was called before the job reached a final status,
+//!              or Quartz dropped every firing as a misfire and the job
+//!              never ran
 //!
 //! `results` holds one `JobResult` per attempt, oldest first (`Succeeded`
 //! with the handler's output, or `Failed` with the error), capped at
@@ -41,8 +45,9 @@
 //! and a retry delay in progress ends.
 //!
 //! A recurring job whose previous firing is still running skips the firing.
-//! When the skipped firing was the trigger's last, the running firing is the
-//! job's last and decides its final status.
+//! A job finishes when its last trigger has ended, whether the trigger's last
+//! firing ran, was skipped, or was dropped by Quartz as a misfire; the last
+//! firing that ran decides the final status.
 //!
 //! Quartz-only scheduling (native cron, intervals, delays, misfire policy) is
 //! described by `Jobs.Quartz.Triggers` and submitted with `scheduleTrigger`.
@@ -103,9 +108,21 @@ ref record JobEntry {
   var attempts: Int
   var firings: Int
   var lastFireMs: Long
-  // The last firing its trigger will ever make came while an earlier firing
-  // was running and was skipped: the running firing is the job's last.
-  var exhausted: Bool
+  var lastFiringOk: Bool
+  // Names of the job's triggers that can still fire.  The job is over once
+  // this is empty and no firing is running.
+  var liveTriggers: List[String]
+}
+
+// The trigger named `trigger` will never fire again.
+func retireTrigger(e: in JobEntry, trigger: in String): Unit {
+  var i = e.liveTriggers.count - 1
+  while i >= 0 {
+    if e.liveTriggers[i] == trigger {
+      e.liveTriggers.removeAt(i)
+    }
+    i = i - 1
+  }
 }
 
 func isFinal(s: in Jobs.JobStatus): Bool {
@@ -181,21 +198,13 @@ protected type JobTable {
   }
   // Claim one firing.  `None` when the job is unknown, already final, still
   // running an earlier firing, or has already run for this scheduled time
-  // (two triggers of one job selecting the same instant).  A skipped firing
-  // that was the trigger's last leaves it to the running firing to close the
-  // job.
-  entry beginFiring(id: in String, scheduledMs: in Long, mayFireAgain: in Bool): Option[Jobs.JobSpec] {
+  // (two triggers of one job selecting the same instant).
+  entry beginFiring(id: in String, scheduledMs: in Long): Option[Jobs.JobSpec] {
     if not jobs.containsKey(id) {
       return None
     }
     val e: JobEntry = jobs[id]
-    if inFlight(e.status) {
-      if not mayFireAgain {
-        e.exhausted = true
-      }
-      return None
-    }
-    if isFinal(e.status) or e.lastFireMs == scheduledMs {
+    if inFlight(e.status) or isFinal(e.status) or e.lastFireMs == scheduledMs {
       return None
     }
     e.status = Jobs.JobStatus.Running
@@ -231,21 +240,50 @@ protected type JobTable {
       }
     }
   }
-  // Close a firing.  A cancelled job stays cancelled.  The job goes back to
-  // `Pending` only when a later firing can still come and run.
-  entry endFiring(id: in String, succeeded: in Bool, mayFireAgain: in Bool) {
-    if jobs.containsKey(id) {
-      val e: JobEntry = jobs[id]
-      if inFlight(e.status) {
-        if mayFireAgain and not e.exhausted {
-          e.status = Jobs.JobStatus.Pending
-        } else if succeeded {
-          e.status = Jobs.JobStatus.Succeeded
-        } else {
-          e.status = Jobs.JobStatus.Failed
-        }
-      }
+  // Close a firing made by `trigger`.  A cancelled job stays cancelled.  The
+  // job goes back to `Pending` while any of its triggers can still fire;
+  // otherwise this firing was its last.  True when the job became final here.
+  entry endFiring(id: in String, trigger: in String, succeeded: in Bool, mayFireAgain: in Bool): Bool {
+    if not jobs.containsKey(id) {
+      return false
     }
+    val e: JobEntry = jobs[id]
+    if not mayFireAgain {
+      retireTrigger(e, trigger)
+    }
+    if not inFlight(e.status) {
+      return false
+    }
+    e.lastFiringOk = succeeded
+    if e.liveTriggers.count > 0 {
+      e.status = Jobs.JobStatus.Pending
+      return false
+    }
+    e.status = if succeeded { Jobs.JobStatus.Succeeded } else { Jobs.JobStatus.Failed }
+    return true
+  }
+  // `trigger` will never fire again and is not running a firing of its own:
+  // its last firing was skipped, or Quartz ended it.  When that was the job's
+  // last live trigger and no firing is running (a running one closes the job
+  // in `endFiring`), the job is over: the last firing that ran decides, and
+  // a job that never ran is `Cancelled`.  True when the job became final here.
+  entry triggerEnded(id: in String, trigger: in String): Bool {
+    if not jobs.containsKey(id) {
+      return false
+    }
+    val e: JobEntry = jobs[id]
+    retireTrigger(e, trigger)
+    if inFlight(e.status) or isFinal(e.status) or e.liveTriggers.count > 0 {
+      return false
+    }
+    if e.firings == 0 {
+      e.status = Jobs.JobStatus.Cancelled
+    } else if e.lastFiringOk {
+      e.status = Jobs.JobStatus.Succeeded
+    } else {
+      e.status = Jobs.JobStatus.Failed
+    }
+    return true
   }
   entry purgeFinal(): Int {
     val doomed: List[String] = newList()
@@ -381,16 +419,26 @@ func attemptResult(spec: in Jobs.JobSpec, outcome: in AttemptOutcome, startedAt:
   }
 }
 
+// One firing of `jobId` by `trigger`.  True when the job reached its final
+// status here and Quartz may forget it.
 func runFiring(
   table: in JobTable,
   handlers: in HandlerRegistry,
   config: in QuartzConfig,
   jobId: in String,
+  trigger: in String,
   scheduledMs: in Long,
   mayFireAgain: in Bool,
-): Unit {
-  match table.beginFiring(jobId, scheduledMs, mayFireAgain) {
-    case None -> ()
+): Bool {
+  match table.beginFiring(jobId, scheduledMs) {
+    case None -> {
+      // Skipped.  A trigger skipped on its last firing has ended.
+      if mayFireAgain {
+        false
+      } else {
+        table.triggerEnded(jobId, trigger)
+      }
+    }
     case Some(claimed) -> {
       val spec: Jobs.JobSpec = claimed
       var succeeded = false
@@ -424,7 +472,7 @@ func runFiring(
           }
         }
       }
-      table.endFiring(jobId, succeeded, mayFireAgain)
+      table.endFiring(jobId, trigger, succeeded, mayFireAgain)
     }
   }
 }
@@ -450,10 +498,11 @@ pub record QuartzJobScheduler {
 pub func create(config: in QuartzConfig): Result[QuartzJobScheduler, String] {
   val table = JobTable()
   val handlers = HandlerRegistry()
-  val run: (String, Long, Bool) -> Unit = { id: String, at: Long, again: Bool ->
-    runFiring(table, handlers, config, id, at, again)
+  val run: (String, String, Long, Bool) -> Bool = { id: String, trigger: String, at: Long, again: Bool ->
+    runFiring(table, handlers, config, id, trigger, at, again)
   }
-  match Kernel.newScheduler(config.instanceName, config.workerThreads, config.daemonThreads, config.misfireThresholdMs, run) {
+  val ended: (String, String) -> Bool = { id: String, trigger: String -> table.triggerEnded(id, trigger) }
+  match Kernel.newScheduler(config.instanceName, config.workerThreads, config.daemonThreads, config.misfireThresholdMs, run, ended) {
     case Err(e) -> Err("quartz: cannot create scheduler: " + e)
     case Ok(q) -> Ok(
       QuartzJobScheduler(
@@ -522,12 +571,23 @@ pub func unregisterHandler(s: in QuartzJobScheduler, name: in String): Unit
   s.state.handlers.drop(name)
 }
 
-func buildTriggers(jobId: in String, specs: in slice[TriggerSpec]): Result[slice[Kernel.JTrigger], String] {
+// The Quartz name of each of a job's triggers, by position in `specs`.
+func triggerNames(jobId: in String, count: in Int): List[String] {
+  val names: List[String] = newList()
+  var i = 0
+  while i < count {
+    names.add(jobId + "#" + i.toString())
+    i = i + 1
+  }
+  names
+}
+
+func buildTriggers(names: in List[String], specs: in slice[TriggerSpec]): Result[slice[Kernel.JTrigger], String] {
   val built: List[Kernel.JTrigger] = newList()
   var i = 0
   while i < specs.length {
     val spec = specs[i]
-    val name = jobId + "#" + i.toString()
+    val name = names[i]
     val made = match spec.kind {
       case TriggerKind.Once -> Kernel.onceTrigger(name, spec.delayMs)
       case TriggerKind.Cron -> Kernel.cronTrigger(name, spec.cron, misfireCode(spec.misfire))
@@ -557,7 +617,8 @@ func submit(
   timeoutMs: in Int,
 ): Result[String, String] {
   val id = "quartz-" + uuidToString(newUuid())
-  match buildTriggers(id, specs) {
+  val names = triggerNames(id, specs.length)
+  match buildTriggers(names, specs) {
     case Err(e) -> Err("quartz: " + e)
     case Ok(triggers) -> {
       // Registered before Quartz sees the job: a trigger may fire on a worker
@@ -574,7 +635,8 @@ func submit(
           attempts = 0,
           firings = 0,
           lastFireMs = -1i64,
-          exhausted = false
+          lastFiringOk = false,
+          liveTriggers = names
         )
       )
       match Kernel.submitJob(s.state.quartz, id, triggers) {
@@ -715,8 +777,8 @@ pub func timesFired(s: in QuartzJobScheduler, jobId: in String): Int {
   s.state.table.firingsOf(jobId)
 }
 
-/// Whether Quartz itself still holds `jobId` (it drops a job when its last
-/// trigger has finished, and when the job is cancelled).
+/// Whether Quartz itself still holds `jobId` (the job is dropped when it
+/// reaches a final status).
 pub func heldByQuartz(s: in QuartzJobScheduler, jobId: in String): Result[Bool, String]
   requires: jobId.length > 0
 {

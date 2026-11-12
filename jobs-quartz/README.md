@@ -84,7 +84,8 @@ Variations:
   and `Quartz.isShutDown` report the state.
 - **Introspection.** `Quartz.awaitFinished(sched, id, timeoutMs)` blocks (polling every 5 ms) until the
   job is `Succeeded`, `Failed` or `Cancelled`. `Quartz.attemptsRun` and `Quartz.timesFired` count
-  handler attempts and firings, `Quartz.heldByQuartz` tells whether Quartz still stores the job, and
+  handler attempts and firings, `Quartz.heldByQuartz` tells whether Quartz still stores the job (it
+  does until the job is finished), and
   `Quartz.purgeFinished(sched)` forgets every finished job and returns how many.
 - **Quartz-only triggers** (`import Jobs.Quartz.Triggers`), submitted with `Quartz.scheduleTrigger`:
 
@@ -126,16 +127,22 @@ SLF4J prints its "No SLF4J providers were found" notice once and discards Quartz
 
 Status and results:
 
-- **A recurring job is `Pending` between firings**, and reaches `Succeeded` or `Failed` only after its
-  last possible firing; the outcome of the last firing that ran alone decides which. When the
-  trigger's last firing is skipped because an earlier firing is still running (see below), that
-  earlier firing is the last one that ran, and the job finishes when it ends. A cron job has no last
-  firing, so it never finishes: `awaitFinished` on it times out unless the job is cancelled.
-- **A finite interval job whose remaining firings are dropped as misfires stays `Pending`.** With
-  `MisfirePolicy.Skip`, when every remaining firing is later than `misfireThresholdMs` (no worker was
-  free, or the scheduler was in standby), Quartz ends the trigger without firing it again; nothing
-  closes the job, and Quartz keeps holding it (`heldByQuartz` is `Ok(true)`). Cancel such a job. See
-  Known gaps.
+- **A recurring job is `Pending` between firings**, and reaches a final status only when none of its
+  triggers can fire again; the outcome of the last firing that ran alone decides between `Succeeded`
+  and `Failed`. It does not matter how the trigger ended. When its last firing is skipped because an
+  earlier firing is still running (see below), that earlier firing is the last one that ran, and the
+  job finishes when it ends. When Quartz drops the remaining firings as misfires (`MisfirePolicy.Skip`
+  and every remaining firing later than `misfireThresholdMs`, because no worker was free or the
+  scheduler was in standby), the job finishes then, or when its running firing ends. A cron job
+  without a year field has no last firing, so it never finishes: `awaitFinished` on it times out
+  unless the job is cancelled.
+- **A job whose every firing was dropped as a misfire is `Cancelled`**, although nobody called
+  `cancel`: the handler was never called, `results` is empty, and `attemptsRun` and `timesFired` are
+  0. `Failed` always comes with a failed attempt in `results`, and there is none here; `Cancelled` is
+  the interface's status for a job that ended without running (in `Jobs.InProcessJobScheduler` too,
+  a job that leaves the queue without running is `Cancelled`).
+- **A finished job leaves Quartz.** `heldByQuartz` is `Ok(false)` once a job is `Succeeded`, `Failed`
+  or `Cancelled`, however its triggers ended.
 - **A newly enqueued job is not reliably `Pending`** on a started scheduler: the trigger fires as soon
   as a worker is free, possibly before `enqueue` returns. It is `Pending` for certain only in standby
   or while every worker is busy.
@@ -229,8 +236,11 @@ id it returns works with `status`, `results` and `cancel` like any other.
 `Skip` (drop the missed firings) and `IgnoreMisfires` (run every missed firing back to back).
 
 `Jobs.Quartz.Kernel.Jvm` is the extern boundary: `extern type` declarations bound by auto-FFI against
-the Quartz JAR. `DispatchJob` and `DispatchFactory` are Lyric records implementing `org.quartz.Job` and
-`org.quartz.spi.JobFactory`; there is no Java shim. Every job and trigger lives in the Quartz group
+the Quartz JAR. `DispatchJob`, `DispatchFactory` and `TriggerWatch` are Lyric records implementing
+`org.quartz.Job`, `org.quartz.spi.JobFactory` and `org.quartz.SchedulerListener`; there is no Java
+shim. `TriggerWatch` is how the scheduler learns that Quartz ended a trigger (`triggerFinalized`),
+including one it ended without firing the job; a job is finished when its last trigger has ended and
+no firing is running. Every job and trigger lives in the Quartz group
 `lyric`, and a job's Quartz name is its Lyric job id (`quartz-<uuid>`). One daemon thread per JVM,
 `lyric-quartz-watchdog`, delivers the timeout interrupts for all schedulers.
 
@@ -253,8 +263,9 @@ two minutes.
   panics, timeouts, cancellation before a run, during a run and between two attempts, handler lookup,
   lifecycle.
 - `tests/trigger_execution_tests.l`: Quartz cron at seconds resolution, interval and delayed triggers,
-  overlap skipping (including a skipped last firing), misfire policies, and `schedule` with a 5-field expression firing at the next minute
-  (this one test waits up to 65 s).
+  overlap skipping (including a skipped last firing), misfire policies, finite jobs whose remaining or
+  whole firings are dropped as misfires, and `schedule` with a 5-field expression firing at the next
+  minute (this one test waits up to 65 s).
 - `tests/triggers_tests.l`: the cron translation and trigger validation, checked against Quartz's parser.
 
 `lyric build --manifest jobs-quartz/lyric.toml --target dotnet` fails with `F0054`, as intended.
@@ -274,9 +285,6 @@ two minutes.
 - Cron expressions use the JVM default time zone; there is no per-job time zone.
 - `schedule` always uses `MisfirePolicy.Smart`; choose another policy with `Triggers.quartzCron` and
   `scheduleTrigger`.
-- A finite interval job with `MisfirePolicy.Skip` whose remaining firings are all dropped as misfires
-  stays `Pending` and stays stored in Quartz until it is cancelled (see Surprises). Closing it needs
-  a Quartz `SchedulerListener` (`triggerFinalized`), which the kernel does not register yet.
 - Compiler issues met while writing this package (tracked in `nichobbs/lyric-lang`):
   - `impl Interface for T` where `T` is a `pub opaque type` does not produce a working implementation
     on either target, so `QuartzJobScheduler` is a `pub record` whose internals sit in the opaque
