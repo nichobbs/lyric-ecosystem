@@ -9,7 +9,7 @@ over it come from the host platform, so there is no RabbitMQ client SDK dependen
 | Package | `Lyric.Mq.RabbitMq` (Lyric packages `Mq.RabbitMq`, `Mq.RabbitMq.Extras`, `Mq.RabbitMq.Amqp`, `Mq.RabbitMq.Url`) |
 | Targets | `dotnet`, `jvm` |
 | Stability | `experimental` |
-| Broker | RabbitMQ over AMQP 0-9-1. Tested against RabbitMQ 3.12.1 on Erlang/OTP 25 (the Ubuntu 24.04 package). |
+| Broker | RabbitMQ over AMQP 0-9-1. Tested against RabbitMQ 3.12.1 (Erlang/OTP 25, the Ubuntu 24.04 package; every suite, both targets, on a development machine) and 4.0.5 (the Ubuntu 26.04 package, in CI). See "RabbitMQ 3.x and 4.x". |
 | Transport | plain TCP, or TLS 1.2 / 1.3 (`SslStream` on dotnet, `SSLSocket` on jvm) |
 | SDK dependencies | none (`[nuget]` and `[maven]` are empty) |
 | Interface | `Lyric.Mq` 0.1.0 |
@@ -160,9 +160,24 @@ Message mapping:
   unique; `ack`/`nack` settle the oldest unsettled delivery with that id. Settling an id with no
   unsettled delivery is an `Err`. A message from another producer without a `message-id` is
   delivered with the id `delivery-N`, N being its delivery tag on this channel.
-- `Message.headers` is the `headers` table, each value a long string. Order and repeated keys
-  survive (verified against RabbitMQ 3.12). A key is 1 to 255 bytes; anything else is an `Err`
-  from `publish` before a byte is sent.
+- `Message.headers` is an ordered list that may repeat keys; an AMQP `headers` table is not
+  reliably either (RabbitMQ 4 keeps one entry per key and does not keep their order). So the
+  headers travel twice in the `headers` table:
+  - exactly, as one entry named `lyric_headers` (`HEADER_HEADERS`) whose value is a JSON array of
+    `[key, value]` string pairs. This is what a consumer using this package reads, so order,
+    repeated keys and every key and value (empty, longer than 255 bytes, any character) survive
+    on every broker version by construction. A message without headers has no such entry.
+  - for interoperability, as one plain long-string entry per distinct key, holding the first
+    value of that key. Other AMQP clients read these, and a `headers` exchange matches on them.
+    A key that cannot be a table name (empty, over 255 bytes, or `lyric_headers` itself) has no
+    plain entry.
+- On consume (`headersOf`): when `lyric_headers` is present and holds a header list, that list is
+  `Message.headers`. Plain entries whose key the list does not name (added by the broker, such as
+  `x-death`, or by something that forwarded the message) follow it in the broker's order. A plain
+  entry whose key the list does name is ignored, even if its value was changed on the way: the
+  list wins. When `lyric_headers` is absent (a message from another producer) or is not a header
+  list, every table entry is a header, as text, in the order the broker sent them; repeated keys
+  are then not possible on RabbitMQ 4 and the order is the broker's.
 - `Message.body` is UTF-8 text. No `content-type` is set; `Extras.publishWith` can set one.
 - `Message.deliveryCount` is the `x-delivery-count` header when the broker sends one (quorum
   queues), else 1 when the delivery is flagged `redelivered`, else 0. `x-delivery-count` is not
@@ -238,7 +253,8 @@ Behaviour a user would not expect from the `Mq` interfaces alone:
 - **`deliveryCount` stops at 1 on a classic queue.** RabbitMQ records only a `redelivered` flag
   there. Quorum queues count (`Extras.withQuorumQueue()`), and `Extras.withDeliveryLimit(n)` makes
   the broker dead-letter a poison message; do not build poison detection on `deliveryCount` with a
-  classic queue.
+  classic queue. RabbitMQ 4 applies a delivery limit of 20 to quorum queues by default: without a
+  dead-letter exchange, a message requeued more often than that is dropped by the broker.
 - **`nack(id, false)` destroys the message unless the queue has a dead-letter exchange**
   (`Extras.withDeadLetter`). The same happens to a delivery this client cannot represent: a body
   that is not UTF-8, or one larger than `maxMessageBytes`, is rejected without requeueing so that
@@ -278,6 +294,10 @@ Behaviour a user would not expect from the `Mq` interfaces alone:
   `publish` panics with a contract violation on both targets. `publishBatch` panics on jvm and
   returns `Err("rabbitmq: empty message id")` on dotnet, because the inherited `requires:` clause
   is only enforced on jvm (see "Known gaps"). `ack("")` and `nack("")` are an `Err` on both.
+- **Messages carry a `lyric_headers` header** next to the plain ones whenever `Message.headers`
+  is not empty; other consumers of the queue see it. A consumer using this package that receives
+  a message whose plain header was rewritten in transit (a shovel or a plugin, say) gets the
+  original value from `lyric_headers`, not the rewritten one.
 - **Floating-point header values** are rendered with the platform's number formatting, which can
   differ between dotnet and jvm for values that are not short decimals. Everything else is
   identical on both targets.
@@ -288,6 +308,28 @@ Behaviour a user would not expect from the `Mq` interfaces alone:
 - **`DeadLetterStore` is not implemented.** The interface is an append/list/count store with a
   capacity; a RabbitMQ dead-letter queue can only be consumed, so it does not map. Read dead
   letters by connecting to the dead-letter queue, or use `Mq.inProcessDeadLetterStore`.
+
+## RabbitMQ 3.x and 4.x
+
+The package does not depend on the broker version; where the brokers differ, this is what it
+relies on and what was seen.
+
+| Behaviour | 3.12.1 | 4.0.5 | What the package does |
+|---|---|---|---|
+| order and repeated keys of the `headers` table | kept as sent | one entry per key, order not kept | carries the list in `lyric_headers`; not affected |
+| classic queue redelivery | `redelivered` flag only | the same | `deliveryCount` 0 or 1 |
+| quorum queue `x-delivery-count` after `nack(id, true)` | 1, 2, 3, ... | the same in the integration suite | `deliveryCount` is that header |
+| quorum queue delivery limit | none unless `x-delivery-limit` is set | a default limit of 20 (RabbitMQ documentation; not exercised by the suite) | nothing: a message requeued more often than the limit is dead-lettered or dropped by the broker. Set `withDeliveryLimit` and `withDeadLetter` deliberately. |
+| position of a requeued message | classic: head of the queue | classic: head of the queue | tested on classic queues only; on a quorum queue the position depends on the version and on whether a delivery limit applies, and nothing here relies on it |
+| queue type when no `x-queue-type` is sent | the virtual host's default, classic on a stock broker | the same, and the node can set `default_queue_type` | sends `x-queue-type` only for `withQuorumQueue()`. A broker whose default is quorum refuses `durable = false` and `autoDelete = true`. |
+| `durable = false` on a shared queue | accepted | accepted, deprecated (`transient_nonexcl_queues`) and may be refused by a later version | keeps `durable = true` as the default |
+| largest message | 128 MiB by default | 16 MiB by default (`max_message_size`) | a larger publish is a `406 PRECONDITION_FAILED` channel error from the broker |
+| dead-letter `x-death` header | array of tables | the same in the integration suite | delivered as JSON text |
+
+The 4.0.5 column comes from the CI run (dotnet integration suite) and the RabbitMQ documentation;
+no 4.x broker was available on the development machine. The hermetic suite has a broker that
+reshapes header tables the way RabbitMQ 4 does (one entry per key, order changed), and the whole
+conformance suite runs against it, so the header mapping cannot regress on a 3.x-only machine.
 
 ## RabbitMQ-specific features (`Mq.RabbitMq.Extras`)
 

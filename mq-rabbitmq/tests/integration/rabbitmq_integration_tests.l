@@ -628,25 +628,35 @@ test "header values of other types are delivered as text" {
   dispose(q)
 }
 
-test "two headers with one key both arrive, in order" {
+test "repeated keys, awkward keys and the order of headers survive the broker" {
   val q = openQueue()
-  val sent = Mq.Message(
-    id = "dup",
-    body = "x",
-    headers = [
-      Mq.MessageHeader(key = "k", value = "1"),
-      Mq.MessageHeader(key = "other", value = "o"),
-      Mq.MessageHeader(key = "k", value = "2")
-    ],
-    deliveryCount = 0
-  )
-  mustPublish(q, sent)
-  val got = mustTake(q)
-  assertEqualInt(got.headers.length, 3, "all three headers")
-  assertEqual(got.headers[0].key + "=" + got.headers[0].value, "k=1", "first")
-  assertEqual(got.headers[1].key + "=" + got.headers[1].value, "other=o", "second")
-  assertEqual(got.headers[2].key + "=" + got.headers[2].value, "k=2", "third")
-  assertTrue(isOk(q.ack(got.id)), "ack")
+  val sent = [
+    Mq.MessageHeader(key = "k", value = "1"),
+    Mq.MessageHeader(key = "other", value = "o"),
+    Mq.MessageHeader(key = "k", value = "2"),
+    Mq.MessageHeader(key = "", value = "an empty key"),
+    Mq.MessageHeader(key = Str.repeat("k", 300), value = "a key over 255 bytes"),
+    Mq.MessageHeader(key = "quote\"back\\slash\nline", value = "café 世 😀"),
+    Mq.MessageHeader(key = "a", value = "last, and first in the alphabet")
+  ]
+  mustPublish(q, Mq.Message(id = "dup", body = "x", headers = sent, deliveryCount = 0))
+  var round = 0
+  while round < 2 {
+    val got = mustTake(q)
+    assertEqualInt(got.headers.length, sent.length, "every header, round " + round.toString())
+    var i = 0
+    while i < got.headers.length and i < sent.length {
+      assertEqual(got.headers[i].key, sent[i].key, "key " + i.toString() + ", round " + round.toString())
+      assertEqual(got.headers[i].value, sent[i].value, "value " + i.toString() + ", round " + round.toString())
+      i += 1
+    }
+    if round == 0 {
+      assertTrue(isOk(q.nack(got.id, true)), "requeue")
+    } else {
+      assertTrue(isOk(q.ack(got.id)), "ack")
+    }
+    round += 1
+  }
   dispose(q)
 }
 
@@ -810,13 +820,11 @@ test "invalid publish options are refused before anything is sent" {
     "expirationMs",
     "expiration"
   )
-  val longKey = Mq.Message(
-    id = "m",
-    body = "x",
-    headers = [Mq.MessageHeader(key = Str.repeat("k", 256), value = "v")],
-    deliveryCount = 0
+  expectContains(
+    errorOf(q.publish(message(Str.repeat("i", 256), "x")), "a long message id"),
+    "exceeds the AMQP limit of 255",
+    "message id length"
   )
-  expectContains(errorOf(q.publish(longKey), "a long header key"), "exceeds the AMQP limit of 255", "header key length")
   expectNothing(q, 300, "nothing was published")
   dispose(q)
 }

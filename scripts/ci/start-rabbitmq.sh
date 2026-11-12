@@ -55,6 +55,18 @@ fi
 [ -x "$server" ] || { echo "error: $server is not installed" >&2; exit 1; }
 command -v openssl > /dev/null || { echo "error: openssl is not installed" >&2; exit 1; }
 
+listening() {
+  (echo > "/dev/tcp/127.0.0.1/$1") 2> /dev/null
+}
+
+# A node that cannot bind fails slowly and obscurely; say so at once.
+for p in "$port" "$tls_port" "$mtls_port" "$((epmd_port + 1))" "$((epmd_port + 2))"; do
+  if listening "$p"; then
+    echo "error: port $p on 127.0.0.1 is already in use (another run of this script?); stop it or set LYRIC_RABBITMQ_PORT, LYRIC_RABBITMQ_TLS_PORT, LYRIC_RABBITMQ_MTLS_PORT and LYRIC_RABBITMQ_EPMD_PORT" >&2
+    exit 1
+  fi
+done
+
 work="$(mktemp -d)"
 password="$(head -c 12 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
@@ -117,10 +129,6 @@ start_node() {
 
 start_node a "$((epmd_port + 1))" "$(printf 'listeners.tcp.1 = 127.0.0.1:%s\nlisteners.ssl.1 = 127.0.0.1:%s\nssl_options.fail_if_no_peer_cert = false' "$port" "$tls_port")"
 start_node b "$((epmd_port + 2))" "$(printf 'listeners.tcp = none\nlisteners.ssl.1 = 127.0.0.1:%s\nssl_options.fail_if_no_peer_cert = true' "$mtls_port")"
-
-listening() {
-  (echo > "/dev/tcp/127.0.0.1/$1") 2> /dev/null
-}
 
 # A listener that accepts TCP is not yet a node that has created its user; the
 # pid file is written once boot has finished.

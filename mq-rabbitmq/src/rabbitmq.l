@@ -23,8 +23,12 @@
 //!   `basic.return` (the message could not be routed) is an `Err`.
 //!   `publishBatch` sends the whole batch and then waits for every confirm.
 //!   Confirms are per message: a batch is not atomic.
-//! - A message's `id` is the `message-id` property, its headers are the
-//!   `headers` table (each value a long string) and its body is UTF-8 text.
+//! - A message's `id` is the `message-id` property and its body is UTF-8
+//!   text. Its headers travel twice in the `headers` table: exactly (order
+//!   and repeated keys included) as a JSON array in the `lyric_headers`
+//!   entry, which is what a consumer of this package reads, and as one plain
+//!   long-string entry per distinct key for other AMQP consumers and for
+//!   `headers` exchanges. See `headersOf`.
 //! - The first `consume` sets the prefetch window (`basic.qos`) and starts a
 //!   consumer (`basic.consume`, manual acknowledgement). The broker pushes
 //!   deliveries; `consume` hands the handler the oldest one not yet handed
@@ -104,6 +108,12 @@ pub val INSECURE_ALLOW_ENV: String = "LYRIC_TLS_ALLOW_INSECURE"
 /// The header a quorum queue adds to a redelivered message. It is reported
 /// as `Message.deliveryCount` and not as a header.
 pub val HEADER_DELIVERY_COUNT: String = "x-delivery-count"
+
+/// The header-table entry that carries `Message.headers` exactly: a JSON
+/// array of `[key, value]` pairs. A broker may reorder a table's entries and
+/// merge entries with one key (RabbitMQ 4 does both); it cannot touch the
+/// inside of one value.
+pub val HEADER_HEADERS: String = "lyric_headers"
 
 /// The version this client reports to the broker.
 pub val CLIENT_VERSION: String = "0.1.0"
@@ -1428,11 +1438,211 @@ pub func fieldText(value: in Amqp.FieldValue): String {
 }
 
 // ─── Publishing ──────────────────────────────────────────────────────────────
-func headerTable(headers: in slice[Mq.MessageHeader]): slice[Amqp.TableEntry] {
-  val entries: List[Amqp.TableEntry] = newList()
+// The JSON array of [key, value] pairs that carries `headers` exactly.
+func encodeHeaderList(headers: in slice[Mq.MessageHeader]): String {
+  val parts: List[String] = newList()
   for h in headers {
-    entries.add(Amqp.entry(h.key, Amqp.fText(h.value)))
+    parts.add("[" + jsonString(h.key) + "," + jsonString(h.value) + "]")
   }
+  "[" + Str.joinList(",", parts) + "]"
+}
+
+// A cursor over the carrier's text.
+ref record JsonCursor {
+  text: String
+  var pos: Int
+}
+
+func skipSpace(c: in JsonCursor): Unit {
+  while c.pos < c.text.length {
+    val unit = c.text.codeUnitAt(c.pos)
+    if unit != 32 and unit != 9 and unit != 10 and unit != 13 {
+      return
+    }
+    c.pos += 1
+  }
+}
+
+// Consume `unit` (after white space); false when something else is there.
+func accept(c: in JsonCursor, unit: in Int): Bool {
+  skipSpace(c)
+  if c.pos < c.text.length and c.text.codeUnitAt(c.pos) == unit {
+    c.pos += 1
+    return true
+  }
+  false
+}
+
+func hexDigit(unit: in Int): Int {
+  if unit >= 48 and unit <= 57 {
+    unit - 48
+  } else if unit >= 65 and unit <= 70 {
+    unit - 55
+  } else if unit >= 97 and unit <= 102 {
+    unit - 87
+  } else {
+    -1
+  }
+}
+
+// The four hexadecimal digits at the cursor, -1 when they are not there.
+func hex4(c: in JsonCursor): Int {
+  if c.pos + 4 > c.text.length {
+    return -1
+  }
+  var value = 0
+  var i = 0
+  while i < 4 {
+    val digit = hexDigit(c.text.codeUnitAt(c.pos + i))
+    if digit < 0 {
+      return -1
+    }
+    value = value * 16 + digit
+    i += 1
+  }
+  c.pos += 4
+  value
+}
+
+// A JSON string at the cursor; `None` when there is none or it is malformed.
+func jsonStringAt(c: in JsonCursor): Option[String] {
+  if not accept(c, 34) {
+    return None
+  }
+  val sb = Str.StringBuilder.new()
+  var start = c.pos
+  while c.pos < c.text.length {
+    val unit = c.text.codeUnitAt(c.pos)
+    if unit == 34 {
+      sb.append(Str.substring(c.text, start, c.pos - start))
+      c.pos += 1
+      return Some(value = sb.toString())
+    }
+    if unit < 32 {
+      return None
+    }
+    if unit == 92 {
+      sb.append(Str.substring(c.text, start, c.pos - start))
+      if c.pos + 1 >= c.text.length {
+        return None
+      }
+      val escape = c.text.codeUnitAt(c.pos + 1)
+      c.pos += 2
+      if escape == 117 {
+        var code = hex4(c)
+        if code < 0 {
+          return None
+        }
+        if code >= 55296 and code <= 56319 {
+          // A high surrogate must be followed by an escaped low one.
+          if not (c.pos + 1 < c.text.length and c.text.codeUnitAt(c.pos) == 92 and c.text.codeUnitAt(c.pos + 1) == 117) {
+            return None
+          }
+          c.pos += 2
+          val low = hex4(c)
+          if low < 56320 or low > 57343 {
+            return None
+          }
+          code = 65536 + (code - 55296) * 1024 + (low - 56320)
+        } else if code >= 56320 and code <= 57343 {
+          return None
+        }
+        sb.append(codepointToString(code))
+      } else if escape == 34 {
+        sb.append("\"")
+      } else if escape == 92 {
+        sb.append("\\")
+      } else if escape == 47 {
+        sb.append("/")
+      } else if escape == 110 {
+        sb.append("\n")
+      } else if escape == 114 {
+        sb.append("\r")
+      } else if escape == 116 {
+        sb.append("\t")
+      } else if escape == 98 {
+        sb.append(codepointToString(8))
+      } else if escape == 102 {
+        sb.append(codepointToString(12))
+      } else {
+        return None
+      }
+      start = c.pos
+    } else {
+      c.pos += 1
+    }
+  }
+  None
+}
+
+/// The header list in a `lyric_headers` value: a JSON array of
+/// `[key, value]` string pairs. `None` when the text is anything else.
+pub func decodeHeaderList(text: in String): Option[slice[Mq.MessageHeader]] {
+  val c = JsonCursor(text = text, pos = 0)
+  val headers: List[Mq.MessageHeader] = newList()
+  if not accept(c, 91) {
+    return None
+  }
+  if not accept(c, 93) {
+    var more = true
+    while more {
+      if not accept(c, 91) {
+        return None
+      }
+      val key = match jsonStringAt(c) { case Some(k) -> k; case None -> return None }
+      if not accept(c, 44) {
+        return None
+      }
+      val value = match jsonStringAt(c) { case Some(v) -> v; case None -> return None }
+      if not accept(c, 93) {
+        return None
+      }
+      headers.add(Mq.MessageHeader(key = key, value = value))
+      if accept(c, 93) {
+        more = false
+      } else if not accept(c, 44) {
+        return None
+      }
+    }
+  }
+  skipSpace(c)
+  if c.pos != c.text.length {
+    return None
+  }
+  Some(value = headers.toArray())
+}
+
+func hasEntry(table: in List[Amqp.TableEntry], name: in String): Bool {
+  for e in table.toArray() {
+    if e.name == name {
+      return true
+    }
+  }
+  false
+}
+
+// The `headers` table of a message: the entries of `base`, one plain entry
+// per distinct key of `headers` (its first value; for other AMQP consumers
+// and for `headers` exchanges) and the carrier entry that holds the list
+// exactly. A key that cannot be a table name (empty, over 255 bytes, the
+// carrier's own name) travels in the carrier only.
+func headerTable(base: in slice[Amqp.TableEntry], headers: in slice[Mq.MessageHeader]): slice[Amqp.TableEntry] {
+  if headers.length == 0 {
+    return base
+  }
+  val entries: List[Amqp.TableEntry] = newList()
+  for e in base {
+    if e.name != HEADER_HEADERS {
+      entries.add(e)
+    }
+  }
+  for h in headers {
+    val fits = h.key.length > 0 and h.key != HEADER_HEADERS and encodeUtf8(h.key).length <= 255
+    if fits and not hasEntry(entries, h.key) {
+      entries.add(Amqp.entry(h.key, Amqp.fText(h.value)))
+    }
+  }
+  entries.add(Amqp.entry(HEADER_HEADERS, Amqp.fText(encodeHeaderList(headers))))
   entries.toArray()
 }
 
@@ -1440,9 +1650,7 @@ func headerTable(headers: in slice[Mq.MessageHeader]): slice[Amqp.TableEntry] {
 // `base` chose one) the delivery mode of the connection.
 func propertiesFor(q: in RabbitMqQueue, message: in Mq.Message, base: in Amqp.Properties): Amqp.Properties {
   val mode = if base.deliveryMode != 0 { base.deliveryMode } else if q.options.persistent { 2 } else { 1 }
-  val extra = headerTable(message.headers)
-  val headers: slice[Amqp.TableEntry] = if base.headers.length == 0 { extra } else { base.headers.concat(extra) }
-  base.copy(messageId = message.id, headers = headers, deliveryMode = mode)
+  base.copy(messageId = message.id, headers = headerTable(base.headers, message.headers), deliveryMode = mode)
 }
 
 func sendMessage(
@@ -1722,6 +1930,56 @@ func deliveryCountOf(delivery: in Delivery): Int {
   }
 }
 
+func namesKey(headers: in slice[Mq.MessageHeader], key: in String): Bool {
+  for h in headers {
+    if h.key == key {
+      return true
+    }
+  }
+  false
+}
+
+/// The `Message.headers` of a message with this `headers` table.
+///
+/// With a `lyric_headers` entry (a message this client published) the list
+/// in it is the answer, in its order and with its repeated keys, whatever
+/// the broker did to the plain entries. Plain entries whose key the list
+/// does not name (added by the broker, such as `x-death`, or by whatever
+/// forwarded the message) follow it, as text. A plain entry whose key the
+/// list does name is ignored, even when its value differs.
+///
+/// Without the entry, or when its value is not a header list, every entry is
+/// a header, as text and in the order the broker sent them.
+///
+/// `x-delivery-count` is never a header; it is `Message.deliveryCount`.
+pub func headersOf(table: in slice[Amqp.TableEntry]): slice[Mq.MessageHeader] {
+  val carried: Option[slice[Mq.MessageHeader]] = match Amqp.tableGet(table, HEADER_HEADERS) {
+    case Some(FString(bytes)) -> decodeHeaderList(bytesText(bytes))
+    case _ -> None
+  }
+  val headers: List[Mq.MessageHeader] = newList()
+  match carried {
+    case Some(list) -> {
+      for h in list {
+        headers.add(h)
+      }
+      for e in table {
+        if e.name != HEADER_DELIVERY_COUNT and e.name != HEADER_HEADERS and not namesKey(list, e.name) {
+          headers.add(Mq.MessageHeader(key = e.name, value = fieldText(e.value)))
+        }
+      }
+    }
+    case None -> {
+      for e in table {
+        if e.name != HEADER_DELIVERY_COUNT {
+          headers.add(Mq.MessageHeader(key = e.name, value = fieldText(e.value)))
+        }
+      }
+    }
+  }
+  headers.toArray()
+}
+
 /// The `Mq.Message` a delivery is handed to a handler as. `Err` when the
 /// body is not UTF-8 text.
 pub func messageOf(delivery: in Delivery): Result[Mq.Message, String] {
@@ -1729,18 +1987,13 @@ pub func messageOf(delivery: in Delivery): Result[Mq.Message, String] {
     case Some(s) -> s
     case None -> return Err("its body is not UTF-8 text")
   }
-  val headers: List[Mq.MessageHeader] = newList()
-  for e in delivery.properties.headers {
-    if e.name != HEADER_DELIVERY_COUNT {
-      headers.add(Mq.MessageHeader(key = e.name, value = fieldText(e.value)))
-    }
-  }
+  val headers = headersOf(delivery.properties.headers)
   val id = if delivery.properties.messageId.length > 0 {
     delivery.properties.messageId
   } else {
     "delivery-" + delivery.tag.toString()
   }
-  Ok(Mq.Message(id = id, body = body, headers = headers.toArray(), deliveryCount = deliveryCountOf(delivery)))
+  Ok(Mq.Message(id = id, body = body, headers = headers, deliveryCount = deliveryCountOf(delivery)))
 }
 
 // Turn a delivery into a tracked message. One this client cannot represent

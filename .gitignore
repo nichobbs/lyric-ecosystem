@@ -8,3 +8,4 @@ target/
 .lyric-check/
 .lyric-release/
 lyric.lock
+erl_crash.dump

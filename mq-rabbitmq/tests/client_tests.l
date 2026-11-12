@@ -89,6 +89,8 @@ ref record FakeBroker {
   var bindings: List[Binding]
   // Knobs.
   var mode: String
+  // Store headers the way RabbitMQ 4 does: one entry per key, order not kept.
+  var reshape: Bool
   var frameMax: Int
   var heartbeat: Int
   // What the broker saw.
@@ -320,11 +322,37 @@ func route(b: in FakeBroker, exchange: in String, key: in String): Result[List[S
   Ok(targets)
 }
 
+// A header table as a broker with a map-shaped message store keeps it: the
+// first entry of each name survives, and the order is reversed.
+func reshaped(table: in slice[Amqp.TableEntry]): slice[Amqp.TableEntry] {
+  val kept: List[Amqp.TableEntry] = newList()
+  var i = table.length - 1
+  while i >= 0 {
+    var first = true
+    var j = 0
+    while j < i {
+      if table[j].name == table[i].name {
+        first = false
+      }
+      j += 1
+    }
+    if first {
+      kept.add(table[i])
+    }
+    i -= 1
+  }
+  kept.toArray()
+}
+
 // A complete publish has arrived. False ends the connection.
 func finishPublish(s: in Session): Bool {
   val b = s.broker
   val body: slice[Byte] = Amqp.joinChunks(s.pubChunks)
-  val properties = s.pubProperties
+  val properties = if b.reshape {
+    s.pubProperties.copy(headers = reshaped(s.pubProperties.headers))
+  } else {
+    s.pubProperties
+  }
   val exchange = s.pubExchange
   val key = s.pubKey
   s.pubActive = false
@@ -866,6 +894,7 @@ func startBrokerWith(secured: in Bool, tls: in K.ServerTls): FakeBroker {
     exchanges = newMap(),
     bindings = newList(),
     mode = "",
+    reshape = false,
     frameMax = 131072,
     heartbeat = 60,
     heartbeatsSeen = 0,
@@ -1648,32 +1677,231 @@ func ignoreResult(r: in Result[Unit, String]): Unit {
   ()
 }
 
-test "a message that cannot be encoded is refused before anything is sent" {
+test "a message id that cannot be encoded is refused before anything is sent" {
   val q = openFresh()
-  val longKey = Mq.Message(
-    id = "m",
-    body = "x",
-    headers = [Mq.MessageHeader(key = Str.repeat("k", 256), value = "v")],
-    deliveryCount = 0
-  )
-  expectContains(errorOf(q.publish(longKey), "a long header key"), "message 'm' cannot be sent", "names the message")
-  expectContains(errorOf(q.publish(longKey), "a long header key"), "exceeds the AMQP limit of 255", "says why")
-  val emptyKey = Mq.Message(
-    id = "m",
-    body = "x",
-    headers = [Mq.MessageHeader(key = "", value = "v")],
-    deliveryCount = 0
-  )
-  expectContains(errorOf(q.publish(emptyKey), "an empty header key"), "empty name", "an empty header key")
-  expectContains(
-    errorOf(q.publish(message(Str.repeat("i", 256), "x")), "a long id"),
-    "exceeds the AMQP limit of 255",
-    "a long id"
-  )
+  val e = errorOf(q.publish(message(Str.repeat("i", 256), "x")), "a long id")
+  expectContains(e, "cannot be sent", "names the problem")
+  expectContains(e, "exceeds the AMQP limit of 255", "says why")
   assertTrue(RabbitMq.isOpen(q), "nothing was written")
   mustPublish(q, message("good", "x"))
   assertEqual(mustTake(q).id, "good", "still usable")
   q.close()
+}
+
+// ─── Headers ─────────────────────────────────────────────────────────────────
+func awkwardHeaders(): slice[Mq.MessageHeader] {
+  [
+    Mq.MessageHeader(key = "b", value = "1"),
+    Mq.MessageHeader(key = "a", value = "2"),
+    Mq.MessageHeader(key = "b", value = "3"),
+    Mq.MessageHeader(key = "", value = "an empty key"),
+    Mq.MessageHeader(key = Str.repeat("k", 300), value = "a key over 255 bytes"),
+    Mq.MessageHeader(key = "lyric_headers", value = "the carrier's own name"),
+    Mq.MessageHeader(key = "x-delivery-count", value = "not the broker's"),
+    Mq.MessageHeader(key = "quote\"back\\slash\nline\u{0001}", value = "café 世 😀"),
+    Mq.MessageHeader(key = "a", value = "")
+  ]
+}
+
+func expectSameHeaders(got: in slice[Mq.MessageHeader], sent: in slice[Mq.MessageHeader], label: in String): Unit {
+  assertEqualInt(got.length, sent.length, label + ": header count")
+  var i = 0
+  while i < got.length and i < sent.length {
+    assertEqual(got[i].key, sent[i].key, label + ": key " + i.toString())
+    assertEqual(got[i].value, sent[i].value, label + ": value " + i.toString())
+    i += 1
+  }
+}
+
+func storedHeaders(b: in FakeBroker, queue: in String): slice[Amqp.TableEntry] {
+  K.lockEnter(b.lock)
+  val waiting = b.queues.containsKey(queue) and b.queues[queue].ready.count > 0
+  val table = if waiting { b.queues[queue].ready[0].properties.headers } else { Amqp.emptyTable() }
+  K.lockExit(b.lock)
+  if not waiting {
+    panic("no message waits in " + queue)
+  }
+  table
+}
+
+func entryText(table: in slice[Amqp.TableEntry], name: in String): String {
+  match Amqp.tableGet(table, name) {
+    case Some(v) -> RabbitMq.fieldText(v)
+    case None -> "<absent>"
+  }
+}
+
+test "headers travel as the lyric_headers list and as one plain entry per distinct key" {
+  val name = freshName()
+  val q = open(optionsFor(name))
+  mustPublish(q, Mq.Message(id = "h", body = "x", headers = awkwardHeaders(), deliveryCount = 0))
+  K.sleepMs(100)
+  val table = storedHeaders(broker(), name)
+  assertEqualInt(table.length, 5, "b, a, x-delivery-count, the awkward key, and the carrier")
+  assertEqual(table[0].name, "b", "plain entries in first-appearance order")
+  assertEqual(entryText(table, "b"), "1", "the first value of a repeated key")
+  assertEqual(entryText(table, "a"), "2", "the first value of a repeated key")
+  assertEqual(table[4].name, "lyric_headers", "the carrier comes last")
+  expectContains(
+    entryText(table, "lyric_headers"),
+    "[[\"b\",\"1\"],[\"a\",\"2\"],[\"b\",\"3\"],[\"\",\"an empty key\"]",
+    "a JSON array of pairs"
+  )
+  expectSameHeaders(mustTake(q).headers, awkwardHeaders(), "on a broker that keeps tables as sent")
+  val bare = openFresh()
+  mustPublish(bare, message("none", "x"))
+  K.sleepMs(100)
+  assertEqualInt(
+    storedHeaders(broker(), RabbitMq.queueName(bare)).length,
+    0,
+    "a message without headers has no carrier"
+  )
+  bare.close()
+  q.close()
+}
+
+func makeReshapedEnds(b: in FakeBroker): MqConformance.QueueEnds {
+  val q = open(optionsOn(K.serverPort(b.server), freshName()))
+  opened.queues.add(q)
+  val publisher: Mq.MessageQueue = q
+  val consumer: Mq.QueueConsumer = q
+  MqConformance.QueueEnds(publisher = publisher, consumer = consumer)
+}
+
+test "headers survive a broker that reorders table entries and merges repeated keys, as RabbitMQ 4 does" {
+  val b = startBrokerWith(false, serverTls(""))
+  b.reshape = true
+  val name = freshName()
+  val q = open(optionsOn(K.serverPort(b.server), name))
+  val sent = [
+    Mq.MessageHeader(key = "content-type", value = "text/plain"),
+    Mq.MessageHeader(key = "k:colon\nnewline", value = "v\\backslash"),
+    Mq.MessageHeader(key = "empty", value = ""),
+    Mq.MessageHeader(key = "content-type", value = "a repeated key")
+  ]
+  mustPublish(q, Mq.Message(id = "r", body = "x", headers = sent, deliveryCount = 0))
+  K.sleepMs(100)
+  val table = storedHeaders(b, name)
+  assertEqual(table[0].name, "lyric_headers", "the fake really reordered the table")
+  assertEqualInt(table.length, 4, "and holds one entry per name")
+  var round = 0
+  while round < 3 {
+    val got = mustTake(q)
+    expectSameHeaders(got.headers, sent, "round " + round.toString())
+    assertTrue(isOk(q.nack(got.id, true)), "requeue")
+    round += 1
+  }
+  assertTrue(isOk(q.ack(mustTake(q).id)), "ack")
+  mustPublish(q, Mq.Message(id = "h", body = "x", headers = awkwardHeaders(), deliveryCount = 0))
+  expectSameHeaders(mustTake(q).headers, awkwardHeaders(), "every awkward key")
+  q.close()
+  requireConformance(conformance({ -> makeReshapedEnds(b) }))
+  K.serverClose(b.server)
+}
+
+test "the carrier wins over plain entries; entries it does not name follow it; without it every entry is a header" {
+  val q = openFresh()
+  val name = RabbitMq.queueName(q)
+  val carried = "[[\"k\",\"1\"],[\"k\",\"2\"],[\"other\",\"o\"]]"
+  val both: slice[Amqp.TableEntry] = [
+    Amqp.entry("x-death", Amqp.fText("added by the broker")),
+    Amqp.entry("k", Amqp.fText("changed on the way")),
+    Amqp.entry("lyric_headers", Amqp.fText(carried)),
+    Amqp.entry("x-delivery-count", Amqp.fLong(2i64)),
+    Amqp.entry("added", Amqp.fInt(7))
+  ]
+  inject(name, Amqp.noProperties().copy(messageId = "both", headers = both), encodeUtf8("x"))
+  val got = mustTake(q)
+  assertEqualInt(got.headers.length, 5, "three carried, two the carrier does not name")
+  assertEqual(got.headers[0].key + "=" + got.headers[0].value, "k=1", "the carried list first, in its order")
+  assertEqual(got.headers[1].key + "=" + got.headers[1].value, "k=2", "with its repeated key")
+  assertEqual(got.headers[2].key + "=" + got.headers[2].value, "other=o", "also when the plain entry is gone")
+  assertEqual(
+    got.headers[3].key + "=" + got.headers[3].value,
+    "x-death=added by the broker",
+    "then the unnamed entries"
+  )
+  assertEqual(got.headers[4].key + "=" + got.headers[4].value, "added=7", "as text")
+  assertEqualInt(got.deliveryCount, 2, "x-delivery-count is still the delivery count")
+  val malformed: slice[Amqp.TableEntry] = [
+    Amqp.entry("z", Amqp.fText("1")),
+    Amqp.entry("lyric_headers", Amqp.fText("[[\"k\"]]")),
+    Amqp.entry("a", Amqp.fText("2"))
+  ]
+  inject(name, Amqp.noProperties().copy(messageId = "malformed", headers = malformed), encodeUtf8("x"))
+  val fallback = mustTake(q)
+  assertEqualInt(fallback.headers.length, 3, "a carrier that is not a header list is an ordinary header")
+  assertEqual(fallback.headers[0].key, "z", "in the order the broker sent them")
+  assertEqual(headerOf(fallback, "lyric_headers"), "[[\"k\"]]", "nothing is lost")
+  val typedCarrier: slice[Amqp.TableEntry] = [
+    Amqp.entry("lyric_headers", Amqp.fInt(1)),
+    Amqp.entry("a", Amqp.fText("2"))
+  ]
+  inject(name, Amqp.noProperties().copy(messageId = "typed", headers = typedCarrier), encodeUtf8("x"))
+  assertEqualInt(mustTake(q).headers.length, 2, "nor is a carrier of another type")
+  q.close()
+}
+
+test "publishTo keeps the caller's typed entries beside the message's headers" {
+  val name = freshName()
+  val q = open(optionsFor(name))
+  val base: slice[Amqp.TableEntry] = [
+    Amqp.entry("tenant", Amqp.fInt(7)),
+    Amqp.entry("shared", Amqp.fText("from base")),
+    Amqp.entry("lyric_headers", Amqp.fText("stale"))
+  ]
+  val sent = Mq.Message(
+    id = "typed",
+    body = "x",
+    headers = [
+      Mq.MessageHeader(key = "shared", value = "from message"),
+      Mq.MessageHeader(key = "text", value = "plain")
+    ],
+    deliveryCount = 0
+  )
+  assertTrue(isOk(RabbitMq.publishTo(q, "", name, true, sent, Amqp.noProperties().copy(headers = base))), "publish")
+  K.sleepMs(100)
+  val table = storedHeaders(broker(), name)
+  assertEqualInt(table.length, 4, "tenant, shared, text and one carrier")
+  assertEqual(entryText(table, "shared"), "from base", "the caller's entry is the plain one")
+  val got = mustTake(q)
+  assertEqualInt(got.headers.length, 3, "the message's two headers and the caller's extra entry")
+  assertEqual(
+    got.headers[0].key + "=" + got.headers[0].value,
+    "shared=from message",
+    "the message's value is what is delivered"
+  )
+  assertEqual(got.headers[1].key + "=" + got.headers[1].value, "text=plain", "in the message's order")
+  assertEqual(got.headers[2].key + "=" + got.headers[2].value, "tenant=7", "then the caller's entry")
+  q.close()
+}
+
+func decodedPairs(text: in String): String {
+  match RabbitMq.decodeHeaderList(text) {
+    case None -> "<not a header list>"
+    case Some(headers) -> {
+      val parts: List[String] = newList()
+      for h in headers {
+        parts.add(h.key + "=" + h.value)
+      }
+      Str.joinList("|", parts)
+    }
+  }
+}
+
+test "decodeHeaderList reads JSON pairs with every escape and refuses anything else" {
+  assertEqual(decodedPairs("[]"), "", "an empty list")
+  assertEqual(decodedPairs(" [ [ \"a\" , \"1\" ] , [\"b\",\"2\"] ] "), "a=1|b=2", "white space")
+  assertEqual(decodedPairs("[[\"a\\\"b\\\\c\\/d\",\"\\n\\r\\t\"]]"), "a\"b\\c/d=\n\r\t", "simple escapes")
+  assertEqual(
+    decodedPairs("[[\"\\u00e9\\u4e16\",\"\\ud83d\\ude00\"]]"),
+    "é世=😀",
+    "unicode escapes and a surrogate pair"
+  )
+  assertEqual(decodedPairs("[[\"café\",\"😀\"]]"), "café=😀", "unescaped non-ASCII text")
+  for bad in ["", "[", "{}", "[[\"a\"]]", "[[\"a\",\"b\",\"c\"]]", "[[\"a\",1]]", "[[\"a\",\"b\"],]", "[[\"a\",\"b\"]] x", "[[\"a\",\"b]]", "[[\"\\q\",\"b\"]]", "[[\"\\u12\",\"b\"]]", "[[\"\\ud83d\",\"b\"]]", "[[\"\\ude00\",\"b\"]]", "[[\"a\nb\",\"c\"]]", "[\"a\",\"b\"]"] {
+    assertEqual(decodedPairs(bad), "<not a header list>", "refused: " + bad)
+  }
 }
 
 test "publishBatch pipelines the batch and delivers it in order" {
