@@ -41,18 +41,16 @@ That is expected and legitimate. Handle it as follows.
    `StorageBucket`, `CacheStore` and friends are defined there with a conformance suite in
    `lyric-testing`. A backend here implements the interface; it does not redefine it.
 2. **Name by interface and backend**: `lyric-jobs-quartz`, `lyric-mq-rabbitmq`, `lyric-storage-s3`.
-3. **Declare supported targets in the manifest.** Each backend's `lyric.toml` carries a `[package]
-   targets = ["jvm"]` field (subset of `dotnet`, `jvm`, `native`), mirrored in the README. A JVM-only
-   package is a first-class citizen, not a gap. The field does not exist in `Lyric.Manifest` yet: it is
-   a `lyric-lang` feature to add first (manifest parser, `lyric build`/`lyric test`/`lyric publish`
-   enforcement, registry metadata for `lyric search`), tracked as an issue there. Until it lands, gate
-   the whole package behind a feature (as `lyric-lambda` does with `feature = "jvm"`) and record the
-   intended `targets` value in the README.
-4. **Fail loudly on an unsupported target.** Building a package with a `--target` outside its `targets`
-   must produce a clear build-time diagnostic (not a runtime failure), and a dependent application
-   resolving it for the wrong target must fail at restore/build. Never ship a stub that returns
-   `NOT_IMPLEMENTED`/`NotImplemented` at runtime (D552 removed these from public APIs; do not
-   reintroduce them).
+3. **Declare supported targets in the manifest.** Each backend's `lyric.toml` carries `[package]
+   targets = ["jvm"]` (subset of `dotnet`, `jvm`, `native`; lyric-lang#9030, D601), mirrored in the
+   README. A JVM-only package is a first-class citizen, not a gap. Omit the field only for a package
+   that really supports every target.
+4. **Fail loudly on an unsupported target.** `lyric build`/`test`/`run` of a package outside its
+   `targets` fails with `F0054`, and an application with such a package as a path or workspace
+   dependency (direct or transitive) fails with `F0055`. Registry and git dependencies are not
+   checked yet (lyric-lang#9031): until that lands, CI must build every example application on each
+   target it claims. Never ship a stub that returns `NOT_IMPLEMENTED`/`NotImplemented` at runtime
+   (D552 removed these from public APIs; do not reintroduce them).
 5. **Same capability, two SDKs = two packages, one interface.** If a capability has a good backend on
    each target (for example Quartz on JVM, Hangfire or Quartz.NET on .NET), publish
    `lyric-jobs-quartz` and `lyric-jobs-hangfire` separately. Applications depend on the interface and
@@ -63,6 +61,19 @@ That is expected and legitimate. Handle it as follows.
 7. **No lowest-common-denominator API.** Backend-specific features (Quartz cron triggers, S3 presigned
    multipart, Kafka partitions) go in a backend-specific module of that package, clearly separate from
    the interface implementation.
+
+## Dependencies between packages
+
+- Package level is transitive: an application that depends on a backend gets the backend's
+  dependencies (the interface package included) restored and linked without declaring them.
+- Name level is not (D309, D311): `import Backend` makes visible only what the backend declares or
+  re-exports with `pub use`. A type from the interface that the application names, but that the
+  backend merely imports, is `T0010`/`T0020`.
+- Therefore a backend package `pub use`s its interface package (`pub use Lyric.Jobs`), so
+  applications can name `JobScheduler` through it. An application that wires several backends, or
+  that names interface types itself, should also declare and import the interface directly.
+- A backend's `[dependencies]` entry for the interface carries the SemVer range described under
+  "Stability and versioning".
 
 ## Kernels and FFI
 
