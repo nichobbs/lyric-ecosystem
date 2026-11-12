@@ -9,8 +9,10 @@
 //! Failures are `SqsError` values. `code` is the SQS error code of the
 //! response (`QueueDoesNotExist`, `InvalidSignatureException`,
 //! `ReceiptHandleIsInvalid`); a failed response without an error document is
-//! `HTTP_<status>`; a request that got no response is `CONNECTION_FAILED`, one
-//! that could not be built `INVALID_ARGUMENT`, a configuration that cannot be
+//! `HTTP_<status>`; a request that was not answered within its deadline is
+//! `TIMEOUT`, one that failed for any other reason before a response arrived
+//! (refused, reset, TLS) `CONNECTION_FAILED`, one that could not be built
+//! `INVALID_ARGUMENT`, a configuration that cannot be
 //! used `INVALID_CONFIG`, and a successful response this client cannot read
 //! `MALFORMED_RESPONSE`.
 //!
@@ -300,6 +302,35 @@ func invalidArgument(message: in String): SqsError {
   SqsError(code = "INVALID_ARGUMENT", message = message, status = 0)
 }
 
+/// True when `cause`, the message of an `HttpError.ConnectionFailed`, is one
+/// of the texts the host HTTP client uses for a request that ran out of
+/// time.
+///
+/// `Std.Http` reports every transport failure as `ConnectionFailed` and has
+/// no timeout variant in use. The request deadline is a cancellation token,
+/// and a cancelled token is the first evidence of a timeout; but on the JVM
+/// the deadline is enforced by the JDK's own request timer, which fires up
+/// to a millisecond before the token's deadline is reached, so the token
+/// still reads "not cancelled" for about a third of the timeouts there. The
+/// JDK's two messages for that timer are matched exactly: `request timed
+/// out` (`HttpTimeoutException`) and `HTTP connect timed out`
+/// (`HttpConnectTimeoutException`, when the time ran out while connecting).
+/// On .NET the token is always cancelled when its timer ends a request; the
+/// one other timer there is `HttpClient.Timeout` (100 seconds), whose message
+/// names it.
+@pure
+pub func isTimeoutCause(cause: in String): Bool {
+  cause == "request timed out" or cause == "HTTP connect timed out" or Str.contains(cause, "HttpClient.Timeout")
+}
+
+func timeoutError(action: in String, timeoutMs: in Int, origin: in String): SqsError {
+  SqsError(
+    code = "TIMEOUT",
+    message = action + " timed out after " + timeoutMs.toString() + " ms at " + origin,
+    status = 0
+  )
+}
+
 // Plain (non-`async`) so it may `await` in place and still wrap the send in
 // `try` (V0012 forbids `await` inside `try` in an `async func`).
 func sendCatching(
@@ -312,14 +343,22 @@ func sendCatching(
   } catch Bug as bug {
     Err(error = ConnectionFailed(url = client.origin, message = bug.message))
   }
-  val timedOut = isCancelled(tok)
+  val deadlinePassed = isCancelled(tok)
   disposeSource(src)
   match sent {
     case Ok(resp) -> Ok(resp)
-    case Err(e) -> if timedOut {
-      Err(transportError(action + " timed out after " + timeoutMs.toString() + " ms at " + client.origin))
-    } else {
-      Err(transportError(action + " got no response from " + client.origin + ": " + HttpError.message(e)))
+    case Err(e) -> {
+      val timedOut = deadlinePassed or
+        match e {
+          case ConnectionFailed(_, cause) -> isTimeoutCause(cause)
+          case Timeout(_, _) -> true
+          case _ -> false
+        }
+      if timedOut {
+        Err(timeoutError(action, timeoutMs, client.origin))
+      } else {
+        Err(transportError(action + " got no response from " + client.origin + ": " + HttpError.message(e)))
+      }
     }
   }
 }

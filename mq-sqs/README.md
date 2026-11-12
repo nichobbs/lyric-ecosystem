@@ -249,7 +249,8 @@ Error codes (`SqsError.code`):
 |---|---|
 | the SQS code, verbatim (`QueueDoesNotExist`, `InvalidSignatureException`, `UnrecognizedClientException`, `RequestThrottled`, `ReceiptHandleIsInvalid`, `QueueNameExists`, `BatchRequestTooLong`, `InvalidMessageContents`, ...) | `__type` of the error document, without its namespace |
 | `HTTP_<status>` | a failed response without an error document (a proxy's HTML page, a redirect) |
-| `CONNECTION_FAILED` | no response: refused, reset, or the request deadline passed |
+| `TIMEOUT` | no response within the request deadline (`requestTimeoutMs`, plus the wait of a long poll). The request may have reached SQS and been applied |
+| `CONNECTION_FAILED` | no response for any other reason: refused, reset, TLS failure |
 | `MALFORMED_RESPONSE` | a 200 this client cannot read |
 | `INVALID_CONFIG`, `INVALID_ARGUMENT` | refused before anything was sent |
 | `NOT_IN_FLIGHT`, `CLOSED` | `extendVisibility` and `publishWith` on a delivery or queue that is gone |
@@ -337,6 +338,15 @@ Waiting and failures:
   message that a long poll would find.
 - **A `consume` cannot be interrupted**, and a long poll holds its HTTP connection for up to 20 s
   plus `requestTimeoutMs`.
+- **A timeout is its own outcome, with one message on both targets**: code `TIMEOUT`, text
+  `<Action> timed out after <n> ms at <endpoint>`. It means the request may have been applied: a
+  `publish` that timed out may be in the queue, a `publishBatch` reports that it is not known whether
+  SQS accepted the messages of that request, and a `consume` whose `ReceiveMessage` timed out may
+  have put messages in flight that this consumer never saw (they return after the visibility
+  timeout). `CONNECTION_FAILED` (text `<Action> got no response from <endpoint>: ...`) is every other
+  transport failure; `publishBatch` treats it as unknown too, because a connection can also break
+  after the request was sent. A slow `ReceiveMessage` is never reported as the interface's
+  `"timeout"`, which only means the queue had nothing.
 - **Nothing is retried.** Throttling (`RequestThrottled`, `ThrottlingException`), 5xx responses and
   transport errors are returned as they are.
 - **Redirects are not followed**: a redirect would send a signed request to a host the signature
@@ -386,19 +396,21 @@ lyric test --manifest mq-sqs/lyric.toml --target jvm
   in AWS host names.
 - `tests/wire_tests.l` (13 tests): every request body against literal JSON, the response parsers
   on the documents Amazon SQS and ElasticMQ send, the message encoding, the batch split.
-- `tests/config_tests.l` (8 tests): what `openClient`, `connectWith`, `configFromEnv` and
+- `tests/config_tests.l` (9 tests): what `openClient`, `connectWith`, `configFromEnv` and
   `connectFromEnv` accept, derive and refuse. They set and restore the `AWS_*` and
   `LYRIC_CONFIG_MQ_SQS_*` variables.
 - `tests/reexport_tests.l` (1 test), `tests/readme_tests.l` (1 test).
-- `tests/fake_sqs_tests.l` (13 tests): the client over real HTTP against an SQS server written in
+- `tests/fake_sqs_tests.l` (14 tests): the client over real HTTP against an SQS server written in
   the test on `Std.HttpServer`. The server verifies the SigV4 signature of every request (and the
   session token of temporary credentials), implements visibility timeouts, receive counts, receipt
   handles, long polling, FIFO group blocking and deduplication, redrive policies and SQS's limits.
   It runs `Testing.Conformance.Mq` on FIFO queues, the standard-queue ordering check described
   above, and the backend's own behaviour: characters, settlement, batches (the ten-message and byte
   splits, partial failures), timeouts, visibility expiry, dead letters, FIFO, `Auto` mode, `close`,
-  signature and error mapping, queue management, messages from other producers. It listens on
-  127.0.0.1 ports 19801 to 19812. The whole hermetic run takes about half a minute on dotnet and a
+  signature and error mapping, queue management, messages from other producers, and timeouts (a
+  listener that accepts and never answers, 40 short deadlines in a row, every call path) against
+  refused connections (port 1). It listens on
+  127.0.0.1 ports 19801 to 19813. The whole hermetic run takes about half a minute on dotnet and a
   minute and a half on jvm.
 
 The run reports the integration module as gated (`0 test(s), module gated by inactive @cfg`).
@@ -453,6 +465,20 @@ There is no third-party library (`[nuget]` and `[maven]` are empty). What the su
 - `Mq.DeadLetterStore` is not implemented: dead letters are a queue (`deadLetterQueueUrl`, or SQS's
   redrive policy), not a store this package can list.
 - A blocked `consume` cannot be cancelled.
+- **Timeouts are recognised partly by message text.** `Std.Http` reports every transport failure as
+  `HttpError.ConnectionFailed` and never produces `HttpError.Timeout`. The client first asks the
+  deadline's cancellation token; on `--target jvm` that is not enough, because the JDK's request
+  timer ends the request up to a millisecond before the token reads as cancelled (about a third of
+  the timeouts in a measurement), so `Mq.Sqs.Client.isTimeoutCause` also matches the JDK's two
+  timeout messages exactly (`request timed out`, `HTTP connect timed out`) and, on dotnet, the
+  message of `HttpClient.Timeout` (its 100 s cap, reachable only with `requestTimeoutMs` above
+  80000). A host runtime that words these differently would turn a `TIMEOUT` into
+  `CONNECTION_FAILED`. Not yet filed in lyric-lang; the fix belongs in `Std.Http` (produce
+  `HttpError.Timeout`).
+- On `--target jvm` the request deadline covers the time until the response headers arrive, not the
+  reading of the body (`Std.Http`'s JVM kernel reads the body after the JDK's timer has stopped). A
+  server that sends headers and then stalls would hold the call. SQS responses are small and sent
+  whole, so this has not been observed. Not filed.
 - Compiler issues met while writing this package, in `nichobbs/lyric-lang`:
   - lyric-lang#9043: on `--target jvm` the interface's inherited `requires: allHaveIds(messages)`
     is resolved in the implementing package. This package declares a private `allHaveIds` helper,

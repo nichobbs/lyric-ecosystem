@@ -525,15 +525,17 @@ func publishBatchOf(q: in SqsQueue, messages: in slice[Mq.Message]): Result[Unit
           unknown.add(messages[start + j].id)
           j = j + 1
         }
-        // A response with an SQS error code refused the whole request; no
-        // response at all leaves its fate unknown.
-        val fate = if e.status > 0 { "none of " } else { "it is not known whether SQS accepted " }
+        // An error response refused the whole request. No response (a
+        // timeout, a failed connection) or one that cannot be read leaves
+        // its fate unknown.
+        val refusedBySqs = e.status > 0 and e.status != 200
+        val fate = if refusedBySqs { "none of " } else { "it is not known whether SQS accepted " }
         return Err(
           "sqs: publishBatch: request " + (request + 1).toString() + " of " + plan.count.toString() + ": " + e.message +
             "; " +
             fate +
             quoted(unknown) +
-            (if e.status > 0 { " was accepted" } else { "" }) +
+            (if refusedBySqs { " was accepted" } else { "" }) +
             tail
         )
       }

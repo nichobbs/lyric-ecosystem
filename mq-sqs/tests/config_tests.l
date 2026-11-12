@@ -298,3 +298,26 @@ test "errors render as the Err text of an Mq operation" {
   assertEqual(bare.code, "HTTP_503", "no document")
   assertEqual(bare.message, "DeleteMessage failed: SQS answered HTTP 503", "no document message")
 }
+
+test "the host HTTP clients' timeout texts are recognised, and nothing else" {
+  // --target jvm: the JDK request timer, which can fire before the deadline
+  // token reads as cancelled.
+  assertTrue(isTimeoutCause("request timed out"), "java.net.http.HttpTimeoutException")
+  assertTrue(isTimeoutCause("HTTP connect timed out"), "java.net.http.HttpConnectTimeoutException")
+  // --target dotnet: the 100 s cap of HttpClient itself.
+  assertTrue(
+    isTimeoutCause(
+      "One or more errors occurred. (The request was canceled due to the configured HttpClient.Timeout of 100 seconds elapsing.)"
+    ),
+    "HttpClient.Timeout"
+  )
+  // What a refused or broken connection looks like on each target.
+  assertTrue(not isTimeoutCause("java.net.ConnectException"), "jvm: connection refused")
+  assertTrue(
+    not isTimeoutCause("One or more errors occurred. (Connection refused (127.0.0.1:1))"),
+    "dotnet: connection refused"
+  )
+  assertTrue(not isTimeoutCause("Connection reset"), "a reset")
+  assertTrue(not isTimeoutCause("the request timed out of patience"), "only the exact JDK text")
+  assertTrue(not isTimeoutCause(""), "no cause")
+}

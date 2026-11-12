@@ -2176,7 +2176,7 @@ test "every request is signed for sqs, and failures keep SQS's code" {
   check(lines, "html", "sqs: SendMessage failed: SQS answered HTTP 502")
   checkContains(lines, "garbage", "sqs: SendMessage: the response is not JSON: ")
   check(lines, "redirect", "sqs: SendMessage failed: SQS answered HTTP 307")
-  checkContains(lines, "slow", "sqs: SendMessage timed out after 300 ms at http://127.0.0.1:19810")
+  check(lines, "slow", "sqs: SendMessage timed out after 300 ms at http://127.0.0.1:19810")
   check(lines, "noMessageId", "sqs: SendMessage: the response has no MessageId")
   checkContains(lines, "nothingListening", "sqs: SendMessage got no response from http://127.0.0.1:1: ")
   check(
@@ -2185,8 +2185,12 @@ test "every request is signed for sqs, and failures keep SQS's code" {
     "sqs: publishBatch: request 1 of 1: SendMessageBatch failed: RequestThrottled (HTTP 400): Rate exceeded; " +
       "none of 't-1', 't-2' was accepted; 0 messages of earlier requests stay published and 0 later messages were not sent"
   )
-  checkContains(lines, "batchUnknown", "sqs: publishBatch: request 1 of 1: SendMessageBatch timed out after 300 ms")
-  checkContains(lines, "batchUnknown", "; it is not known whether SQS accepted 'u-1'; ")
+  check(
+    lines,
+    "batchUnknown",
+    "sqs: publishBatch: request 1 of 1: SendMessageBatch timed out after 300 ms at http://127.0.0.1:19810; " +
+      "it is not known whether SQS accepted 'u-1'; 0 messages of earlier requests stay published and 0 later messages were not sent"
+  )
   check(lines, "lookupCode", "QueueDoesNotExist/400")
   check(lines, "htmlCode", "HTTP_502/502")
   check(lines, "garbageCode", "MALFORMED_RESPONSE/200")
@@ -2341,4 +2345,104 @@ test "a message from another producer is delivered; an undecodable one is report
   check(lines, "inFlight", "1")
   check(lines, "dropBroken", "ok")
   check(lines, "empty", "timeout")
+}
+
+// ─── Timeouts and refused connections ────────────────────────────────────────
+// A listener nobody pulls requests from accepts a connection, reads the
+// request and never answers: every request to it ends at its deadline.
+// Nothing listens on port 1: every request to it is refused at once.
+func silentConfig(timeoutMs: in Int): SqsConfig {
+  endpointConfig("http://127.0.0.1:19813", "http://127.0.0.1:19813/" + ACCOUNT + "/silent", REGION, ACCESS_KEY, SECRET_KEY).withRequestTimeout(
+    timeoutMs
+  )
+}
+
+func refusedConfig(): SqsConfig {
+  endpointConfig("http://127.0.0.1:1", "http://127.0.0.1:1/" + ACCOUNT + "/q", REGION, ACCESS_KEY, SECRET_KEY).withRequestTimeout(
+    5000
+  )
+}
+
+func codeOf(r: in Result[Map[String, String], SqsError]): String {
+  match r {
+    case Ok(_) -> "ok"
+    case Err(e) -> e.code + "/" + e.status.toString()
+  }
+}
+
+test "a request that is not answered in time is a TIMEOUT on every attempt; a refused one is CONNECTION_FAILED" {
+  val silent = startListener("http://127.0.0.1:19813/")
+  // Short deadlines of varying length, many times: on --target jvm the JDK's
+  // timer and the deadline token disagree about a third of the time, and
+  // every attempt must still be reported as the same timeout.
+  var i = 0
+  while i < 40 {
+    val ms = 20 + i % 7
+    val q = open(silentConfig(ms))
+    assertEqual(
+      outcome(q.publish(message("t", "x"))),
+      "sqs: SendMessage timed out after " + ms.toString() + " ms at http://127.0.0.1:19813",
+      "attempt " + i.toString()
+    )
+    i = i + 1
+  }
+  val q = open(silentConfig(60))
+  val client = q.client
+  // Every call path goes through the same classification.
+  assertEqual(take(q, 0), "sqs: ReceiveMessage timed out after 60 ms at http://127.0.0.1:19813", "a short poll")
+  // A long poll's deadline is the request timeout plus the seconds it waits;
+  // a slow answer is an error, never the interface's "timeout".
+  assertEqual(take(q, 1000), "sqs: ReceiveMessage timed out after 1060 ms at http://127.0.0.1:19813", "a long poll")
+  assertEqual(
+    outcome(q.publishBatch([message("u-1", "x"), message("u-2", "x")])),
+    "sqs: publishBatch: request 1 of 1: SendMessageBatch timed out after 60 ms at http://127.0.0.1:19813; " +
+      "it is not known whether SQS accepted 'u-1', 'u-2'; 0 messages of earlier requests stay published and 0 later messages were not sent",
+    "a batch whose fate is unknown"
+  )
+  assertEqual(
+    sqsOutcome(client.deleteMessage(q.queue.url, "rh")),
+    "TIMEOUT: DeleteMessage timed out after 60 ms at http://127.0.0.1:19813",
+    "DeleteMessage"
+  )
+  assertEqual(
+    sqsOutcome(client.changeVisibility(q.queue.url, "rh", 0)),
+    "TIMEOUT: ChangeMessageVisibility timed out after 60 ms at http://127.0.0.1:19813",
+    "ChangeMessageVisibility"
+  )
+  assertEqual(codeOf(queueAttributes(client, q.queue.url)), "TIMEOUT/0", "Extras: GetQueueAttributes")
+  assertEqual(
+    sentOutcome(createQueue(client, "new-queue", standardQueue())),
+    "TIMEOUT: CreateQueue timed out after 60 ms at http://127.0.0.1:19813",
+    "Extras: CreateQueue"
+  )
+  assertEqual(
+    sqsOutcome(purgeQueue(client, q.queue.url)),
+    "TIMEOUT: PurgeQueue timed out after 60 ms at http://127.0.0.1:19813",
+    "Extras: PurgeQueue"
+  )
+  stopListener(silent)
+
+  val refused = open(refusedConfig())
+  var k = 0
+  while k < 5 {
+    val text = outcome(refused.publish(message("r", "x")))
+    assertTrue(
+      Str.startsWith(text, "sqs: SendMessage got no response from http://127.0.0.1:1: "),
+      "a refused connection is not a timeout: " + text
+    )
+    k = k + 1
+  }
+  assertEqual(
+    codeOf(queueAttributes(refused.client, refused.queue.url)),
+    "CONNECTION_FAILED/0",
+    "the code of a refusal"
+  )
+  val batch = outcome(refused.publishBatch([message("u-1", "x")]))
+  assertTrue(
+    Str.startsWith(
+      batch,
+      "sqs: publishBatch: request 1 of 1: SendMessageBatch got no response from http://127.0.0.1:1: "
+    ),
+    "a refused batch: " + batch
+  )
 }
