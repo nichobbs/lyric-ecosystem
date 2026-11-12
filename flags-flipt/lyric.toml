@@ -1,0 +1,44 @@
+[package]
+name        = "Lyric.Flags.Flipt"
+version     = "0.1.0"
+stability   = "experimental"
+authors     = ["Lyric Contributors"]
+license     = "MIT"
+description = "Flipt backend for the Lyric Flags.FlagStore interface, in pure Lyric (Flipt's v1 REST API over Std.Http)."
+targets     = ["dotnet", "jvm"]
+
+[project]
+name            = "Lyric.Flags.Flipt"
+output          = "single"
+output_assembly = "Flags.Flipt.dll"
+
+[project.packages]
+# A package is listed after the packages it imports (see "Known gaps" in the
+# README: an enum of a package listed later is miscompiled on dotnet).
+"Flags.Flipt.Wire"   = "src/wire.l"
+"Flags.Flipt.Client" = "src/client.l"
+"Flags.Flipt"        = "src/flipt.l"
+"Flags.Flipt.Extras" = "src/extras.l"
+"Flags.Flipt.Admin"  = "src/admin.l"
+
+[project.tests]
+"Flags.Flipt.WireTests"   = "tests/wire_tests.l"
+"Flags.Flipt.ConfigTests" = "tests/config_tests.l"
+"Flags.Flipt.ReexportTests" = "tests/reexport_tests.l"
+"Flags.Flipt.ReadmeTests" = "tests/readme_tests.l"
+# The conformance suite and the backend's own behaviour over real HTTP, against
+# an in-process Flipt server (tests/fake_flipt_tests.l) that checks the token.
+"Flags.Flipt.FakeFliptTests" = "tests/fake_flipt_tests.l"
+# Needs a real Flipt server: file-level `@cfg(feature = "integration")`, so a
+# plain `lyric test` reports the module as gated and stays hermetic.
+"Flags.Flipt.IntegrationTests" = "tests/integration/flipt_integration_tests.l"
+
+[features]
+default     = []
+integration = []   # run tests/integration against the server named by LYRIC_FLIPT_URL
+
+[dependencies]
+# The interface and its conformance suite, resolved through the root
+# [workspace.overrides].
+"Lyric.Testing" = { workspace = true }
+"Lyric.Flags"   = { workspace = true }

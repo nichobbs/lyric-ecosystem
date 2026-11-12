@@ -117,6 +117,16 @@ jobs:
         working-directory: lyric-ecosystem
         run: bash scripts/ci/start-azurite.sh
 
+      - name: Cache the Flipt binary
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/lyric-ci/flipt
+          key: flipt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('lyric-ecosystem/scripts/ci/start-flipt.sh') }}
+
+      - name: Start Flipt
+        working-directory: lyric-ecosystem
+        run: bash scripts/ci/start-flipt.sh
+
       - name: Test packages against the services
         working-directory: lyric-ecosystem
         run: bash scripts/ci/test-packages.sh ${{ matrix.target }} --integration

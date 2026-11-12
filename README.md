@@ -2,7 +2,7 @@
 
 Out-of-tree libraries for [Lyric](https://github.com/nichobbs/lyric-lang): backends that bind a
 Lyric library interface to an external service or SDK. The interfaces (`JobScheduler`,
-`MessageQueue`, `StorageBucket`, `CacheStore`, `SessionStore`) and their conformance suites live in
+`MessageQueue`, `StorageBucket`, `CacheStore`, `SessionStore`, `FlagStore`) and their conformance suites live in
 `lyric-lang`; each package here implements one interface against one backend and passes that
 interface's conformance suite on every target it claims.
 
@@ -19,6 +19,7 @@ interface's conformance suite on every target it claims.
 | `Lyric.Redis` | `redis/` | (client) | Redis | dotnet, jvm | pure Lyric (RESP over TCP) |
 | `Lyric.Cache.Redis` | `cache-redis/` | `Cache.CacheStore` | Redis | dotnet, jvm | on `Lyric.Redis` |
 | `Lyric.Session.Redis` | `session-redis/` | `Session.SessionStore` | Redis | dotnet, jvm | on `Lyric.Redis` |
+| `Lyric.Flags.Flipt` | `flags-flipt/` | `Flags.FlagStore` | Flipt | dotnet, jvm | pure Lyric (Flipt v1 REST over `Std.Http`) |
 | `Lyric.Mq.RabbitMq` | `mq-rabbitmq/` | `Mq.MessageQueue`, `Mq.QueueConsumer` | RabbitMQ | dotnet, jvm | pure Lyric (AMQP 0-9-1 over TCP) |
 | `Lyric.Mq.Sqs` | `mq-sqs/` | `Mq.MessageQueue`, `Mq.QueueConsumer` | Amazon SQS | dotnet, jvm | pure Lyric (JSON 1.0 over `Std.Http`, SigV4) |
 | `Lyric.Mq.ActiveMq` | `mq-activemq/` | `Mq.MessageQueue`, `Mq.QueueConsumer` | Apache ActiveMQ | dotnet, jvm | pure Lyric (STOMP 1.2 over TCP) |
