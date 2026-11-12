@@ -42,15 +42,18 @@ That is expected and legitimate. Handle it as follows.
    `lyric-testing`. A backend here implements the interface; it does not redefine it.
 2. **Name by interface and backend**: `lyric-jobs-quartz`, `lyric-mq-rabbitmq`, `lyric-storage-s3`.
 3. **Declare supported targets in the manifest.** Each backend's `lyric.toml` carries `[package]
-   targets = ["jvm"]` (subset of `dotnet`, `jvm`, `native`; lyric-lang#9030, D601), mirrored in the
+   targets = ["jvm"]` (subset of `dotnet`, `jvm`, `native`; lyric-lang#9030, D603), mirrored in the
    README. A JVM-only package is a first-class citizen, not a gap. Omit the field only for a package
    that really supports every target.
 4. **Fail loudly on an unsupported target.** `lyric build`/`test`/`run` of a package outside its
-   `targets` fails with `F0054`, and an application with such a package as a path or workspace
-   dependency (direct or transitive) fails with `F0055`. Registry and git dependencies are not
-   checked yet (lyric-lang#9031): until that lands, CI must build every example application on each
-   target it claims. Never ship a stub that returns `NOT_IMPLEMENTED`/`NotImplemented` at runtime
-   (D552 removed these from public APIs; do not reintroduce them).
+   `targets` fails with `F0054`, and an application with such a package as a dependency fails with
+   `F0055`: path and workspace dependencies transitively, restored registry packages from the
+   `lyric-target-<t>` tags `lyric publish` writes into their nuspec, git dependencies from their
+   `lyric.toml`; `lyric restore --target <t>` applies the same check (D602). The registry check runs
+   after the package is downloaded, and only the application's own declared dependencies are
+   checked (lyric-lang#9031), so CI must still build every example application on each target it
+   claims. Never ship a stub that returns `NOT_IMPLEMENTED`/`NotImplemented` at runtime (D552
+   removed these from public APIs; do not reintroduce them).
 5. **Same capability, two SDKs = two packages, one interface.** If a capability has a good backend on
    each target (for example Quartz on JVM, Hangfire or Quartz.NET on .NET), publish
    `lyric-jobs-quartz` and `lyric-jobs-hangfire` separately. Applications depend on the interface and
@@ -117,6 +120,8 @@ Same bar as `lyric-lang`: nothing here is bootstrap-grade.
   in package manifests unless a package needs a specific language feature, in which case state the
   minimum and why in the README.
 - Publishing flows through `lyric publish` to the registry (docs/39). Do not hand-roll release scripts.
+  Publish tags the package with `lyric-target-<t>` for every supported target, so `lyric search
+  <term> --target jvm` finds it.
 
 ## Working conventions
 
