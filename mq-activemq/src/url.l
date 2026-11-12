@@ -1,11 +1,12 @@
 //! Mq.ActiveMq.Url - broker URLs of the form
-//! `stomp://[login[:passcode]@]host[:port]`.
+//! `stomp://[login[:passcode]@]host[:port]` (plain TCP) and
+//! `stomp+ssl://[login[:passcode]@]host[:port]` (TLS).
 //!
 //! The login and passcode are percent-decoded, so a passcode may hold `@`,
 //! `:` or `/` written as `%40`, `%3A`, `%2F`. An IPv6 literal is written in
-//! brackets (`stomp://[::1]:61613`). The port defaults to 61613, the STOMP
-//! port of a stock ActiveMQ. `stomp+ssl`, `stomps` and `ssl` URLs are refused:
-//! this client speaks plain TCP only.
+//! brackets (`stomp://[::1]:61613`). The port defaults to 61613 for `stomp`
+//! and 61614 for `stomp+ssl`, the ports of a stock ActiveMQ. Other schemes
+//! are refused.
 @runtime_checked
 package Mq.ActiveMq.Url
 
@@ -18,12 +19,17 @@ import Std.String as Str
 /// The STOMP port of a stock ActiveMQ broker.
 pub val DEFAULT_PORT: Int = 61613
 
+/// The STOMP-over-TLS port of a stock ActiveMQ broker.
+pub val DEFAULT_TLS_PORT: Int = 61614
+
 /// Where a broker listens and who connects to it.
 pub record BrokerAddress {
   host: String
   port: Int
   login: String
   passcode: String
+  /// `true` for a `stomp+ssl://` URL.
+  tls: Bool
 }
 
 func hexValue(unit: in Int): Int {
@@ -86,18 +92,17 @@ func parsePort(text: in String): Result[Int, String] {
   }
 }
 
-/// Parse a `stomp://` broker URL. The passcode never appears in an error.
+/// Parse a `stomp://` or `stomp+ssl://` broker URL. The passcode never
+/// appears in an error.
 pub func parseUrl(url: in String): Result[BrokerAddress, String] {
   val schemeEnd = Str.indexOfRaw(url, "://")
   if schemeEnd < 0 {
-    return Err(invalid("expected stomp://host[:port]"))
+    return Err(invalid("expected stomp://host[:port] or stomp+ssl://host[:port]"))
   }
   val scheme = Str.toLower(Str.substring(url, 0, schemeEnd))
-  if scheme == "stomp+ssl" or scheme == "stomps" or scheme == "ssl" or scheme == "stomp+nio+ssl" {
-    return Err(invalid("TLS is not supported by this client; use a stomp:// connector"))
-  }
-  if scheme != "stomp" {
-    return Err(invalid("unsupported scheme '" + scheme + "', expected stomp"))
+  val tls = scheme == "stomp+ssl"
+  if not tls and scheme != "stomp" {
+    return Err(invalid("unsupported scheme '" + scheme + "', expected stomp or stomp+ssl"))
   }
   var rest = Str.substring(url, schemeEnd + 3)
   if Str.endsWith(rest, "/") {
@@ -122,7 +127,7 @@ pub func parseUrl(url: in String): Result[BrokerAddress, String] {
     }
   }
   var host = rest
-  var port = DEFAULT_PORT
+  var port = if tls { DEFAULT_TLS_PORT } else { DEFAULT_PORT }
   if Str.startsWith(rest, "[") {
     val close = Str.indexOfRaw(rest, "]")
     if close < 0 {
@@ -146,5 +151,5 @@ pub func parseUrl(url: in String): Result[BrokerAddress, String] {
   if host.length == 0 {
     return Err(invalid("the host is empty"))
   }
-  Ok(BrokerAddress(host = host, port = port, login = login, passcode = passcode))
+  Ok(BrokerAddress(host = host, port = port, login = login, passcode = passcode, tls = tls))
 }

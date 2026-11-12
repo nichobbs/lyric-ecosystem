@@ -27,6 +27,23 @@ test "host only takes the default port and no credentials" {
   assertEqualInt(a.port, 61613, "default port")
   assertEqual(a.login, "", "login")
   assertEqual(a.passcode, "", "passcode")
+  assertTrue(not a.tls, "stomp:// is plain TCP")
+}
+
+test "stomp+ssl selects TLS and the TLS default port" {
+  val a = parsed("stomp+ssl://broker.example")
+  assertTrue(a.tls, "TLS")
+  assertEqual(a.host, "broker.example", "host")
+  assertEqualInt(a.port, 61614, "default TLS port")
+  val b = parsed("STOMP+SSL://lyric:s%40cret@[::1]:61700/")
+  assertTrue(b.tls, "an upper-case scheme")
+  assertEqual(b.host, "::1", "IPv6 host")
+  assertEqualInt(b.port, 61700, "explicit port")
+  assertEqual(b.login, "lyric", "login")
+  assertEqual(b.passcode, "s@cret", "passcode")
+  val c = parsed("stomp+ssl://u@h:61613")
+  assertTrue(c.tls, "the scheme decides, not the port")
+  assertEqualInt(c.port, 61613, "port as written")
 }
 
 test "host, port, login and passcode" {
@@ -66,8 +83,12 @@ test "an IPv6 literal in brackets" {
 
 test "malformed URLs are rejected with a reason" {
   assertTrue(Str.contains(rejected("localhost:61613"), "expected stomp://"), "no scheme")
+  assertTrue(Str.contains(rejected("stomp+ssl:h"), "expected stomp://"), "TLS scheme without //")
   assertTrue(Str.contains(rejected("amqp://h"), "unsupported scheme"), "another protocol")
-  assertTrue(Str.contains(rejected("stomp+ssl://h"), "TLS is not supported"), "TLS")
+  assertTrue(Str.contains(rejected("ssl://h"), "unsupported scheme 'ssl'"), "a transport scheme")
+  assertTrue(Str.contains(rejected("stomps://h"), "expected stomp or stomp+ssl"), "an unknown TLS spelling")
+  assertTrue(Str.contains(rejected("stomp+ssl://"), "host is empty"), "TLS without a host")
+  assertTrue(Str.contains(rejected("stomp+ssl://h:0"), "out of range"), "TLS port 0")
   assertTrue(Str.contains(rejected("stomp://"), "host is empty"), "no host")
   assertTrue(Str.contains(rejected("stomp://h:abc"), "not a number"), "non-numeric port")
   assertTrue(Str.contains(rejected("stomp://h:0"), "out of range"), "port 0")

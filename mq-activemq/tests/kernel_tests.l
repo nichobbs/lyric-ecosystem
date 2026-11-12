@@ -73,6 +73,48 @@ test "a write is echoed back, then the peer's close reads as Eof" {
   K.serverClose(server)
 }
 
+func writeThenClose(server: in K.ServerSock, text: in String): Unit {
+  match K.serverAccept(server) {
+    case Err(_) -> ()
+    case Ok(peer) -> {
+      val _ = K.sockWrite(peer, encodeUtf8(text))
+      K.sockClose(peer)
+    }
+  }
+}
+
+func readText(sock: in K.Sock, maxBytes: in Int): String {
+  match K.sockRead(sock, maxBytes, 2000) {
+    case Ok(Data(bytes)) -> match tryDecodeUtf8(bytes) { case Some(s) -> s; case None -> "<not UTF-8>" }
+    case Ok(TimedOut) -> "<timed out>"
+    case Ok(Eof) -> "<eof>"
+    case Err(e) -> "<error: " + e + ">"
+  }
+}
+
+test "a read never returns more than it was asked for, and loses nothing" {
+  val server = unwrapServer()
+  val bg = K.startBackground({ -> writeThenClose(server, "0123456789") })
+  match K.sockConnect("127.0.0.1", K.serverPort(server), 2000) {
+    case Err(e) -> assertTrue(false, "connect failed: " + e)
+    case Ok(sock) -> {
+      K.waitBackground(bg)
+      var all = ""
+      var rounds = 0
+      while all.length < 10 and rounds < 10 {
+        val part = readText(sock, 4)
+        assertTrue(part.length >= 1 and part.length <= 4, "at most 4 bytes: " + part)
+        all = all + part
+        rounds += 1
+      }
+      assertEqual(all, "0123456789", "every byte, in order")
+      assertEqual(readText(sock, 4), "<eof>", "then the close")
+      K.sockClose(sock)
+    }
+  }
+  K.serverClose(server)
+}
+
 test "a refused connection is an Err" {
   val server = unwrapServer()
   val port = K.serverPort(server)

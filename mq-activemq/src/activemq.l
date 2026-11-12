@@ -1,8 +1,8 @@
 //! Mq.ActiveMq - Apache ActiveMQ backend for `Mq.MessageQueue` and
 //! `Mq.QueueConsumer`, over a pure-Lyric STOMP 1.2 client.
 //!
-//! One `ActiveMqQueue` is one TCP connection to the broker's STOMP connector
-//! and one destination. It implements both interfaces, so the same value
+//! One `ActiveMqQueue` is one connection to the broker's STOMP connector
+//! (plain TCP for `stomp://`, TLS for `stomp+ssl://`) and one destination. It implements both interfaces, so the same value
 //! publishes and consumes.
 //!
 //!   import Mq.ActiveMq
@@ -55,6 +55,21 @@
 //!
 //! There is no automatic reconnect. After a transport failure every operation
 //! returns `Err`; open a new connection.
+//!
+//! TLS: a `stomp+ssl://` URL, or `withTls()` on the options, runs a TLS
+//! handshake before the STOMP `CONNECT`. The server certificate is verified
+//! against the platform trust store and its name against the host, unless
+//! the options say otherwise:
+//!
+//!   val options = Mq.ActiveMq.optionsFromUrl("stomp+ssl://app:secret@broker:61614", "orders")?
+//!     .withCaCertificate(caPem)
+//!     .withClientIdentity(certPem, keyPem)
+//!   val queue = Mq.ActiveMq.connectWith(options)?
+//!
+//! The option names and the rule for skipping verification
+//! (`withInsecureSkipVerify()` and `LYRIC_TLS_ALLOW_INSECURE=1` together) are
+//! those of `Std.Http.HttpClientBuilder`. Everything above the handshake is
+//! the same code for both transports.
 @runtime_checked
 @io
 package Mq.ActiveMq
@@ -65,6 +80,9 @@ import Std.Json
 import Std.Parse
 import Std.String as Str
 import Std.Environment as Env
+import Std.Console as Console
+import Std.File as File
+import Std.Tls as Tls
 import Mq.ActiveMq.Kernel as K
 import Mq.ActiveMq.Stomp as Stomp
 import Mq.ActiveMq.Url as Url
@@ -80,6 +98,49 @@ pub val HEADER_HEADERS: String = "lyric_headers"
 
 /// The header that carries the number of earlier deliveries.
 pub val HEADER_DELIVERY_COUNT: String = "lyric_delivery_count"
+
+/// The environment variable that must be `1` for `withInsecureSkipVerify()`
+/// to take effect (the standard library's, docs/61 §4 in lyric-lang).
+pub val INSECURE_ALLOW_ENV: String = "LYRIC_TLS_ALLOW_INSECURE"
+
+/// TLS settings of a connection. PEM text; an empty string means "not
+/// configured". Build one with the `with...` functions on `ConnectOptions`.
+pub record TlsOptions {
+  /// Whether the connection is TLS at all.
+  enabled: Bool
+  /// The name sent as SNI and checked against the server certificate; empty
+  /// uses the `host` field.
+  serverName: String
+  /// A trust anchor accepted in addition to the platform trust store.
+  caCertificatePem: String
+  /// A trust anchor that replaces the platform trust store. Wins over
+  /// `caCertificatePem` when both are set.
+  exclusiveCaCertificatePem: String
+  /// The client certificate and its private key, for a connector that
+  /// requires client authentication (`needClientAuth`). The key is an
+  /// unencrypted PKCS8 `PRIVATE KEY` block, as for `Std.Tls.Identity`.
+  clientCertificatePem: String
+  clientKeyPem: String
+  /// `Tls12` (the default) accepts TLS 1.2 and later; `Tls13` only TLS 1.3.
+  minVersion: Tls.TlsVersion
+  /// A request to skip certificate and name verification. Takes effect only
+  /// when `LYRIC_TLS_ALLOW_INSECURE=1` is also set in the environment.
+  insecureSkipVerify: Bool
+}
+
+/// No TLS: the connection is plain TCP.
+pub func plainTcp(): TlsOptions {
+  TlsOptions(
+    enabled = false,
+    serverName = "",
+    caCertificatePem = "",
+    exclusiveCaCertificatePem = "",
+    clientCertificatePem = "",
+    clientKeyPem = "",
+    minVersion = Tls.TlsVersion.Tls12,
+    insecureSkipVerify = false
+  )
+}
 
 /// How to reach a broker and which destination to use.
 pub record ConnectOptions {
@@ -104,17 +165,21 @@ pub record ConnectOptions {
   /// The broker's dispatch window for the subscription
   /// (`activemq.prefetchSize`); 0 keeps the broker's default.
   prefetchSize: Int
-  /// Milliseconds to wait for the TCP connection; 0 = the system's limit.
+  /// Milliseconds to wait for the TCP connection, and again for the TLS
+  /// handshake of a TLS connection; 0 = the system's limit.
   connectTimeoutMs: Int
   /// Milliseconds to wait for the broker to answer a frame.
   requestTimeoutMs: Int
   /// The largest message body accepted from the broker, in bytes.
   maxFrameBytes: Int
+  /// TLS settings; `plainTcp()` for a `stomp://` connector.
+  tls: TlsOptions
 }
 
-/// Options for `destination` on `host:port` with the defaults: no
+/// Options for `destination` on `host:port` with the defaults: plain TCP, no
 /// credentials, manual acknowledgement, persistent messages, a 10 s connect
-/// and request timeout and a 16 MiB frame limit. Adjust with `.copy(...)`.
+/// and request timeout and a 16 MiB frame limit. Adjust with `.copy(...)`
+/// and the `with...` functions below.
 pub func defaultOptions(host: in String, port: in Int, destination: in String): ConnectOptions {
   ConnectOptions(
     host = host,
@@ -129,8 +194,54 @@ pub func defaultOptions(host: in String, port: in Int, destination: in String): 
     prefetchSize = 0,
     connectTimeoutMs = 10000,
     requestTimeoutMs = 10000,
-    maxFrameBytes = 16777216
+    maxFrameBytes = 16777216,
+    tls = plainTcp()
   )
+}
+
+/// Connect over TLS, verifying the server certificate against the platform
+/// trust store and its name against `host`.
+pub func ConnectOptions.withTls(o: in ConnectOptions): ConnectOptions {
+  o.copy(tls = o.tls.copy(enabled = true))
+}
+
+/// Check the server certificate against `name` instead of `host`, and send
+/// `name` as SNI. For a broker reached by address or through a tunnel.
+pub func ConnectOptions.withTlsServerName(o: in ConnectOptions, name: in String): ConnectOptions {
+  o.copy(tls = o.tls.copy(serverName = name))
+}
+
+/// Trust the CA certificate in `pem` in addition to the platform trust
+/// store. `pem` holds one certificate.
+pub func ConnectOptions.withCaCertificate(o: in ConnectOptions, pem: in String): ConnectOptions {
+  o.copy(tls = o.tls.copy(caCertificatePem = pem))
+}
+
+/// Trust only the CA certificate in `pem`; the platform trust store is not
+/// consulted. Wins over `withCaCertificate`.
+pub func ConnectOptions.withExclusiveCaCertificate(o: in ConnectOptions, pem: in String): ConnectOptions {
+  o.copy(tls = o.tls.copy(exclusiveCaCertificatePem = pem))
+}
+
+/// Present a client certificate (mutual TLS). `keyPem` is the certificate's
+/// unencrypted PKCS8 private key.
+pub func ConnectOptions.withClientIdentity(
+  o: in ConnectOptions, certificatePem: in String, keyPem: in String
+): ConnectOptions {
+  o.copy(tls = o.tls.copy(clientCertificatePem = certificatePem, clientKeyPem = keyPem))
+}
+
+/// Refuse a TLS version older than `version`.
+pub func ConnectOptions.withMinTlsVersion(o: in ConnectOptions, version: in Tls.TlsVersion): ConnectOptions {
+  o.copy(tls = o.tls.copy(minVersion = version))
+}
+
+/// Ask for certificate and name verification to be skipped. This alone does
+/// nothing: `LYRIC_TLS_ALLOW_INSECURE=1` must also be set when the
+/// connection is opened, otherwise verification stays on and a warning goes
+/// to standard error. Never for production.
+pub func ConnectOptions.withInsecureSkipVerify(o: in ConnectOptions): ConnectOptions {
+  o.copy(tls = o.tls.copy(insecureSkipVerify = true))
 }
 
 /// The STOMP destination for `name`: a name that starts with `/` is already
@@ -320,7 +431,105 @@ func validate(options: in ConnectOptions): Result[Unit, String] {
   if options.maxFrameBytes < 1 {
     return Err("activemq: maxFrameBytes must be at least 1")
   }
-  Ok(())
+  validateTls(options.tls)
+}
+
+func hasTlsSettings(tls: in TlsOptions): Bool {
+  tls.serverName.length > 0 or tls.caCertificatePem.length > 0 or tls.exclusiveCaCertificatePem.length > 0 or
+    tls.clientCertificatePem.length > 0 or
+    tls.clientKeyPem.length > 0 or
+    tls.insecureSkipVerify or
+    (match tls.minVersion { case Tls13 -> true; case Tls12 -> false })
+}
+
+func checkCertificate(label: in String, pem: in String): Result[Unit, String] {
+  if pem.length == 0 {
+    return Ok(())
+  }
+  match Tls.Certificate.fromPem(pem) {
+    case Ok(_) -> Ok(())
+    case Err(e) -> Err("activemq: TLS " + label + ": " + e.message())
+  }
+}
+
+// The PEM is parsed here with the standard library's loaders, so a bad
+// certificate or key is reported before any connection is made and with the
+// same rules on both targets.
+func validateTls(tls: in TlsOptions): Result[Unit, String] {
+  if not tls.enabled {
+    if hasTlsSettings(tls) {
+      return Err("activemq: TLS options are set but the connection is not TLS; use a stomp+ssl:// URL or withTls()")
+    }
+    return Ok(())
+  }
+  match checkCertificate("CA certificate", tls.caCertificatePem) {
+    case Err(e) -> return Err(e)
+    case Ok(_) -> ()
+  }
+  match checkCertificate("exclusive CA certificate", tls.exclusiveCaCertificatePem) {
+    case Err(e) -> return Err(e)
+    case Ok(_) -> ()
+  }
+  if tls.clientCertificatePem.length == 0 and tls.clientKeyPem.length == 0 {
+    return Ok(())
+  }
+  if tls.clientCertificatePem.length == 0 {
+    return Err("activemq: TLS client identity: a private key is set without its certificate")
+  }
+  if tls.clientKeyPem.length == 0 {
+    return Err("activemq: TLS client identity: a certificate is set without its private key")
+  }
+  match Tls.Identity.fromPem(tls.clientCertificatePem, tls.clientKeyPem) {
+    case Ok(_) -> Ok(())
+    case Err(e) -> Err("activemq: TLS client identity: " + e.message())
+  }
+}
+
+/// Whether the environment holds the second key of the insecure policy
+/// (`LYRIC_TLS_ALLOW_INSECURE=1`).
+pub func insecureAllowedByEnvironment(): Bool {
+  Env.getVarOrDefault(INSECURE_ALLOW_ENV, "") == "1"
+}
+
+/// Whether a connection opened with `tls` now would skip verification: only
+/// when the options ask for it and the environment allows it.
+pub func skipsVerification(tls: in TlsOptions): Bool {
+  tls.enabled and tls.insecureSkipVerify and insecureAllowedByEnvironment()
+}
+
+func kernelTls(options: in ConnectOptions): K.ClientTls {
+  val tls = options.tls
+  val exclusive = tls.exclusiveCaCertificatePem.length > 0
+  K.ClientTls(
+    serverName = if tls.serverName.length > 0 { tls.serverName } else { options.host },
+    caPem = if exclusive { tls.exclusiveCaCertificatePem } else { tls.caCertificatePem },
+    exclusiveCa = exclusive,
+    certPem = tls.clientCertificatePem,
+    keyPem = tls.clientKeyPem,
+    tls13Only = match tls.minVersion { case Tls13 -> true; case Tls12 -> false },
+    skipVerify = skipsVerification(tls)
+  )
+}
+
+// The transport: a TCP connection, secured when the options say so.
+func openTransport(options: in ConnectOptions, endpoint: in String): Result[K.Sock, String] {
+  val plain = match K.sockConnect(options.host, options.port, options.connectTimeoutMs) {
+    case Ok(s) -> s
+    case Err(e) -> return Err("activemq: cannot connect to " + endpoint + ": " + e)
+  }
+  if not options.tls.enabled {
+    return Ok(plain)
+  }
+  if options.tls.insecureSkipVerify and not insecureAllowedByEnvironment() {
+    Console.error(
+      "[Mq.ActiveMq] warning: withInsecureSkipVerify() requested but " + INSECURE_ALLOW_ENV +
+        " is not set; TLS certificate verification remains ENABLED."
+    )
+  }
+  match K.sockStartTls(plain, kernelTls(options), options.connectTimeoutMs) {
+    case Ok(s) -> Ok(s)
+    case Err(e) -> Err("activemq: TLS handshake with " + endpoint + " failed: " + e)
+  }
 }
 
 /// Connect to the broker and authenticate. The subscription is opened by the
@@ -331,10 +540,7 @@ pub func connectWith(options: in ConnectOptions): Result[ActiveMqQueue, String] 
     case Ok(_) -> ()
   }
   val endpoint = options.host + ":" + options.port.toString()
-  val sock = match K.sockConnect(options.host, options.port, options.connectTimeoutMs) {
-    case Ok(s) -> s
-    case Err(e) -> return Err("activemq: cannot connect to " + endpoint + ": " + e)
-  }
+  val sock = match openTransport(options, endpoint) { case Ok(s) -> s; case Err(e) -> return Err(e) }
   val q = ActiveMqQueue(
     options = options,
     sock = sock,
@@ -385,33 +591,124 @@ pub func connectWith(options: in ConnectOptions): Result[ActiveMqQueue, String] 
   Ok(q)
 }
 
-/// Connect to the broker named by a `stomp://[login[:passcode]@]host[:port]`
-/// URL and use `queueName`: a bare name is a queue, `/queue/NAME` and
-/// `/topic/NAME` are taken as written.
-pub func connectUrl(url: in String, queueName: in String): Result[ActiveMqQueue, String] {
+/// The options for the broker named by a
+/// `stomp://[login[:passcode]@]host[:port]` or
+/// `stomp+ssl://[login[:passcode]@]host[:port]` URL and for `queueName`: a
+/// bare name is a queue, `/queue/NAME` and `/topic/NAME` are taken as
+/// written. A `stomp+ssl` URL turns TLS on with the defaults (platform trust
+/// store, name checked against the host); add a CA or a client identity with
+/// the `with...` functions before `connectWith`.
+pub func optionsFromUrl(url: in String, queueName: in String): Result[ConnectOptions, String] {
   if queueName.length == 0 {
     return Err("activemq: no queue name configured")
   }
   val address = match Url.parseUrl(url) { case Ok(a) -> a; case Err(e) -> return Err(e) }
   val base = defaultOptions(address.host, address.port, resolveDestination(queueName))
-  connectWith(base.copy(login = address.login, passcode = address.passcode))
+  val withLogin = base.copy(login = address.login, passcode = address.passcode)
+  if address.tls {
+    Ok(withLogin.withTls())
+  } else {
+    Ok(withLogin)
+  }
 }
 
-/// Connect using the environment:
+/// Connect to the broker named by a `stomp://` or `stomp+ssl://` URL (see
+/// `optionsFromUrl`) and use `queueName`.
+pub func connectUrl(url: in String, queueName: in String): Result[ActiveMqQueue, String] {
+  match optionsFromUrl(url, queueName) {
+    case Ok(options) -> connectWith(options)
+    case Err(e) -> Err(e)
+  }
+}
+
+func envName(field: in String): String {
+  "LYRIC_CONFIG_MQ_ACTIVEMQ_" + field
+}
+
+// The variable `field`, or `fallback` when it is unset or empty.
+func envOr(field: in String, fallback: in String): String {
+  val value = Env.getVarOrDefault(envName(field), "")
+  if value.length > 0 {
+    value
+  } else {
+    fallback
+  }
+}
+
+// The text of the PEM file named by the variable `field`; `Ok("")` when the
+// variable is unset.
+func pemFromEnv(field: in String): Result[String, String] {
+  val path = envOr(field, "")
+  if path.length == 0 {
+    return Ok("")
+  }
+  match File.readText(path) {
+    case Ok(text) -> Ok(text)
+    case Err(_) -> Err("activemq: cannot read the file named by " + envName(field) + " (" + path + ")")
+  }
+}
+
+// The TLS settings of `connectFromEnv`, applied to `base`.
+func tlsFromEnv(base: in ConnectOptions): Result[ConnectOptions, String] {
+  var options = base
+  val ca = match pemFromEnv("TLSCAFILE") { case Ok(t) -> t; case Err(e) -> return Err(e) }
+  val exclusiveText = Str.toLower(envOr("TLSCAEXCLUSIVE", "false"))
+  if exclusiveText != "true" and exclusiveText != "false" {
+    return Err("activemq: " + envName("TLSCAEXCLUSIVE") + " must be true or false")
+  }
+  if ca.length > 0 {
+    options = if exclusiveText == "true" { options.withExclusiveCaCertificate(ca) } else { options.withCaCertificate(ca) }
+  } else if exclusiveText == "true" {
+    return Err("activemq: " + envName("TLSCAEXCLUSIVE") + " is set without " + envName("TLSCAFILE"))
+  }
+  val certificate = match pemFromEnv("TLSCERTFILE") { case Ok(t) -> t; case Err(e) -> return Err(e) }
+  val key = match pemFromEnv("TLSKEYFILE") { case Ok(t) -> t; case Err(e) -> return Err(e) }
+  if certificate.length > 0 or key.length > 0 {
+    options = options.withClientIdentity(certificate, key)
+  }
+  val serverName = envOr("TLSSERVERNAME", "")
+  if serverName.length > 0 {
+    options = options.withTlsServerName(serverName)
+  }
+  val versionText = envOr("TLSMINVERSION", "1.2")
+  if versionText == "1.3" {
+    options = options.withMinTlsVersion(Tls.TlsVersion.Tls13)
+  } else if versionText != "1.2" {
+    return Err("activemq: " + envName("TLSMINVERSION") + " must be 1.2 or 1.3")
+  }
+  Ok(options)
+}
+
+/// Connect using the environment (a variable that is empty counts as
+/// unset):
 ///
 /// - `LYRIC_CONFIG_MQ_ACTIVEMQ_URL`: the broker URL (required)
 /// - `LYRIC_CONFIG_MQ_ACTIVEMQ_QUEUENAME`: the queue or destination (required)
 /// - `LYRIC_CONFIG_MQ_ACTIVEMQ_ACKMODE`: `Manual` (default) or `Auto`
+///
+/// and, for a `stomp+ssl://` URL:
+///
+/// - `LYRIC_CONFIG_MQ_ACTIVEMQ_TLSCAFILE`: a PEM file with a CA certificate
+///   to trust in addition to the platform trust store
+/// - `LYRIC_CONFIG_MQ_ACTIVEMQ_TLSCAEXCLUSIVE`: `true` to trust only that CA
+/// - `LYRIC_CONFIG_MQ_ACTIVEMQ_TLSCERTFILE`, `..._TLSKEYFILE`: PEM files with
+///   the client certificate and its PKCS8 private key (mutual TLS)
+/// - `LYRIC_CONFIG_MQ_ACTIVEMQ_TLSSERVERNAME`: the name to check the server
+///   certificate against, when it is not the URL's host
+/// - `LYRIC_CONFIG_MQ_ACTIVEMQ_TLSMINVERSION`: `1.2` (default) or `1.3`
+///
+/// Verification cannot be switched off from the environment; that takes
+/// `withInsecureSkipVerify()` in code as well as `LYRIC_TLS_ALLOW_INSECURE=1`.
 pub func connectFromEnv(): Result[ActiveMqQueue, String] {
-  val url = Env.getVarOrDefault("LYRIC_CONFIG_MQ_ACTIVEMQ_URL", "")
+  val url = envOr("URL", "")
   if url.length == 0 {
     return Err("activemq: no broker URL configured (set LYRIC_CONFIG_MQ_ACTIVEMQ_URL)")
   }
-  val queueName = Env.getVarOrDefault("LYRIC_CONFIG_MQ_ACTIVEMQ_QUEUENAME", "")
+  val queueName = envOr("QUEUENAME", "")
   if queueName.length == 0 {
     return Err("activemq: no queue name configured (set LYRIC_CONFIG_MQ_ACTIVEMQ_QUEUENAME)")
   }
-  val modeText = Str.toLower(Env.getVarOrDefault("LYRIC_CONFIG_MQ_ACTIVEMQ_ACKMODE", "manual"))
+  val modeText = Str.toLower(envOr("ACKMODE", "manual"))
   val mode = if modeText == "manual" {
     Mq.AckMode.Manual
   } else if modeText == "auto" {
@@ -419,9 +716,11 @@ pub func connectFromEnv(): Result[ActiveMqQueue, String] {
   } else {
     return Err("activemq: LYRIC_CONFIG_MQ_ACTIVEMQ_ACKMODE must be Manual or Auto")
   }
-  val address = match Url.parseUrl(url) { case Ok(a) -> a; case Err(e) -> return Err(e) }
-  val base = defaultOptions(address.host, address.port, resolveDestination(queueName))
-  connectWith(base.copy(login = address.login, passcode = address.passcode, ackMode = mode))
+  val base = match optionsFromUrl(url, queueName) { case Ok(o) -> o; case Err(e) -> return Err(e) }
+  match tlsFromEnv(base.copy(ackMode = mode)) {
+    case Ok(options) -> connectWith(options)
+    case Err(e) -> Err(e)
+  }
 }
 
 // ─── Publishing ──────────────────────────────────────────────────────────────

@@ -17,6 +17,10 @@
 //!   /queue/fail.silent            SEND is accepted but never receipted
 //!   /queue/fail.dropconsume       SUBSCRIBE is receipted, then the socket closes
 //!
+//! The broker is started three times: on plain TCP, behind TLS, and behind
+//! TLS with a required client certificate. The TLS ones use the TEST-ONLY
+//! certificates at the end of this file.
+//!
 //! The same suite runs against a real ActiveMQ in
 //! `tests/integration/activemq_integration_tests.l`.
 @test_module
@@ -28,6 +32,8 @@ import Std.Testing
 import Std.Encoding
 import Std.String as Str
 import Std.Environment as Env
+import Std.File as File
+import Std.Tls as Tls
 import Testing.Conformance
 import Testing.Conformance.Mq as MqConformance
 import Mq
@@ -45,6 +51,9 @@ record Stored {
 
 ref record FakeBroker {
   server: K.ServerSock
+  // Whether every accepted connection starts with a TLS handshake.
+  secured: Bool
+  tls: K.ServerTls
   lock: K.Lock
   var queues: Map[String, List[Stored]]
   var counter: Int
@@ -316,12 +325,24 @@ func serve(b: in FakeBroker, sock: in K.Sock): Unit {
   K.sockClose(sock)
 }
 
+// A connection whose handshake fails is dropped; the broker keeps listening.
+func serveAccepted(b: in FakeBroker, accepted: in K.Sock): Unit {
+  if not b.secured {
+    serve(b, accepted)
+    return
+  }
+  match K.sockAcceptTls(accepted, b.tls, 5000) {
+    case Ok(sock) -> serve(b, sock)
+    case Err(_) -> ()
+  }
+}
+
 func acceptLoop(b: in FakeBroker): Unit {
   var listening = true
   while listening {
     match K.serverAccept(b.server) {
       case Ok(sock) -> {
-        val _ = K.startBackground({ -> serve(b, sock) })
+        val _ = K.startBackground({ -> serveAccepted(b, sock) })
       }
       case Err(_) -> {
         listening = false
@@ -330,30 +351,61 @@ func acceptLoop(b: in FakeBroker): Unit {
   }
 }
 
-func startBroker(): FakeBroker {
+func startBrokerWith(secured: in Bool, tls: in K.ServerTls): FakeBroker {
   val server = match K.serverListen("127.0.0.1", 0) {
     case Ok(s) -> s
     case Err(e) -> panic("the fake broker cannot listen: " + e)
   }
-  val b = FakeBroker(server = server, lock = K.newLock(), queues = newMap(), counter = 0)
+  val b = FakeBroker(server = server, secured = secured, tls = tls, lock = K.newLock(), queues = newMap(), counter = 0)
   val _ = K.startBackground({ -> acceptLoop(b) })
   b
 }
 
-// One broker for the whole module, started by the first test that needs it.
+func serverTls(clientCaPem: in String): K.ServerTls {
+  K.ServerTls(certPem = TEST_ONLY_SERVER_CERT, keyPem = TEST_ONLY_SERVER_KEY, clientCaPem = clientCaPem)
+}
+
+// One broker of each kind for the whole module, started by the first test
+// that needs it.
 ref record BrokerSlot {
   var broker: Option[FakeBroker]
+  var tlsBroker: Option[FakeBroker]
+  var mutualTlsBroker: Option[FakeBroker]
   var names: Int
 }
 
-val slot: BrokerSlot = BrokerSlot(broker = None, names = 0)
+val slot: BrokerSlot = BrokerSlot(broker = None, tlsBroker = None, mutualTlsBroker = None, names = 0)
 
 func brokerPort(): Int {
   match slot.broker {
     case Some(b) -> K.serverPort(b.server)
     case None -> {
-      val b = startBroker()
+      val b = startBrokerWith(false, serverTls(""))
       slot.broker = Some(value = b)
+      K.serverPort(b.server)
+    }
+  }
+}
+
+// The broker behind TLS (server certificate only).
+func tlsBrokerPort(): Int {
+  match slot.tlsBroker {
+    case Some(b) -> K.serverPort(b.server)
+    case None -> {
+      val b = startBrokerWith(true, serverTls(""))
+      slot.tlsBroker = Some(value = b)
+      K.serverPort(b.server)
+    }
+  }
+}
+
+// The broker behind TLS that requires a client certificate from the CA.
+func mutualTlsBrokerPort(): Int {
+  match slot.mutualTlsBroker {
+    case Some(b) -> K.serverPort(b.server)
+    case None -> {
+      val b = startBrokerWith(true, serverTls(TEST_ONLY_CA))
+      slot.mutualTlsBroker = Some(value = b)
       K.serverPort(b.server)
     }
   }
@@ -965,3 +1017,325 @@ test "a publisher thread and a consuming thread share one connection" {
   assertEqualInt(ActiveMq.unsettledCount(q), 0, "all settled")
   q.close()
 }
+
+// ─── TLS ─────────────────────────────────────────────────────────────────────
+// Options for the TLS broker that trust only the test CA.
+func tlsOptionsFor(destination: in String): ActiveMq.ConnectOptions {
+  val base = ActiveMq.defaultOptions("127.0.0.1", tlsBrokerPort(), destination)
+  base.copy(login = "lyric", passcode = "secret", requestTimeoutMs = 3000, connectTimeoutMs = 5000).withTls().withExclusiveCaCertificate(
+    TEST_ONLY_CA
+  )
+}
+
+func mutualTlsOptionsFor(destination: in String): ActiveMq.ConnectOptions {
+  tlsOptionsFor(destination).copy(port = mutualTlsBrokerPort())
+}
+
+func makeTlsEnds(): MqConformance.QueueEnds {
+  val q = open(tlsOptionsFor(freshName()))
+  val publisher: Mq.MessageQueue = q
+  val consumer: Mq.QueueConsumer = q
+  MqConformance.QueueEnds(publisher = publisher, consumer = consumer)
+}
+
+func expectRoundTrip(options: in ActiveMq.ConnectOptions, label: in String): Unit {
+  match ActiveMq.connectWith(options) {
+    case Err(e) -> assertTrue(false, label + ": " + e)
+    case Ok(q) -> {
+      mustPublish(q, message("tls-1", label))
+      val m = mustTake(q)
+      assertEqual(m.body, label, label)
+      match q.ack(m.id) {
+        case Ok(_) -> ()
+        case Err(e) -> assertTrue(false, label + ": ack: " + e)
+      }
+      q.close()
+    }
+  }
+}
+
+func expectHandshakeFailure(options: in ActiveMq.ConnectOptions, label: in String): Unit {
+  val e = errorOfConnect(options)
+  expectContains(e, "activemq: TLS handshake with 127.0.0.1:", label)
+  assertTrue(not Str.contains(e, "secret"), label + ": the passcode is not echoed")
+}
+
+test "the backend conforms to MessageQueue and QueueConsumer over TLS" {
+  requireConformance(MqConformance.runQueue({ -> makeTlsEnds() }))
+}
+
+test "TLS: the server is verified against a configured CA, exclusive or additional" {
+  expectRoundTrip(tlsOptionsFor(freshName()), "exclusive CA")
+  val additional = ActiveMq.defaultOptions("127.0.0.1", tlsBrokerPort(), freshName()).copy(login = "lyric", passcode = "secret", requestTimeoutMs = 3000).withTls().withCaCertificate(
+    TEST_ONLY_CA
+  )
+  expectRoundTrip(additional, "additional CA")
+  val q = open(tlsOptionsFor(freshName()))
+  assertEqual(ActiveMq.serverInfo(q), "FakeMQ/1.0", "the CONNECTED frame came through TLS")
+  q.close()
+}
+
+test "TLS: a server whose CA is not trusted is refused" {
+  val untrusted = ActiveMq.defaultOptions("127.0.0.1", tlsBrokerPort(), freshName()).copy(login = "lyric", passcode = "secret", connectTimeoutMs = 5000).withTls()
+  expectHandshakeFailure(untrusted, "platform trust store only")
+  expectHandshakeFailure(untrusted.withExclusiveCaCertificate(TEST_ONLY_OTHER_CA), "another CA")
+  expectHandshakeFailure(untrusted.withCaCertificate(TEST_ONLY_OTHER_CA), "another CA, additional")
+}
+
+test "TLS: the certificate name is checked against the host or the configured server name" {
+  // The certificate names localhost and 127.0.0.1.
+  expectRoundTrip(tlsOptionsFor(freshName()).withTlsServerName("localhost"), "server name override")
+  expectHandshakeFailure(tlsOptionsFor(freshName()).withTlsServerName("broker.invalid"), "a name the certificate lacks")
+}
+
+test "TLS: verification is skipped only with both keys of the insecure policy" {
+  val insecure = ActiveMq.defaultOptions("127.0.0.1", tlsBrokerPort(), freshName()).copy(login = "lyric", passcode = "secret", requestTimeoutMs = 3000, connectTimeoutMs = 5000).withTls().withTlsServerName("broker.invalid").withInsecureSkipVerify()
+  Env.setVar("LYRIC_TLS_ALLOW_INSECURE", "")
+  assertTrue(not ActiveMq.skipsVerification(insecure.tls), "the option alone does not skip verification")
+  expectHandshakeFailure(insecure, "the option without the environment variable")
+  Env.setVar("LYRIC_TLS_ALLOW_INSECURE", "true")
+  expectHandshakeFailure(insecure, "the variable must be exactly 1")
+  Env.setVar("LYRIC_TLS_ALLOW_INSECURE", "1")
+  val secure = tlsOptionsFor(freshName()).withTlsServerName("broker.invalid")
+  assertTrue(not ActiveMq.skipsVerification(secure.tls), "the environment variable alone does not skip verification")
+  expectHandshakeFailure(secure, "the environment variable without the option")
+  assertTrue(ActiveMq.skipsVerification(insecure.tls), "both keys")
+  expectRoundTrip(insecure, "both keys")
+  Env.setVar("LYRIC_TLS_ALLOW_INSECURE", "")
+}
+
+test "TLS: a required client certificate is presented, and its absence refused" {
+  val base = mutualTlsOptionsFor(freshName())
+  expectRoundTrip(base.withClientIdentity(TEST_ONLY_CLIENT_CERT, TEST_ONLY_CLIENT_KEY), "mutual TLS")
+  // With TLS 1.3 the client learns of the refusal after its own handshake
+  // has finished, so the failure is either a handshake or a CONNECT error.
+  val without = errorOfConnect(base)
+  assertTrue(Str.startsWith(without, "activemq: "), "no client certificate: " + without)
+  assertTrue(without != "connected", "no client certificate must not connect")
+  val stray = errorOfConnect(base.withClientIdentity(TEST_ONLY_STRAY_CERT, TEST_ONLY_STRAY_KEY))
+  assertTrue(Str.startsWith(stray, "activemq: "), "a client certificate from another CA: " + stray)
+  assertTrue(stray != "connected", "a client certificate from another CA must not connect")
+}
+
+test "TLS: a minimum version of TLS 1.3 connects" {
+  expectRoundTrip(tlsOptionsFor(freshName()).withMinTlsVersion(Tls.TlsVersion.Tls13), "TLS 1.3 only")
+}
+
+test "TLS: consume timeouts, large bodies and broker failures behave as over plain TCP" {
+  val q = open(tlsOptionsFor(freshName()))
+  expectTimeout(q, "nothing published yet")
+  expectTimeout(q, "still nothing")
+  var body = ""
+  var i = 0
+  while i < 4000 {
+    body = body + "0123456789abcdefghijklmnopqrstuvwxyz-" + i.toString() + ";"
+    i += 1
+  }
+  mustPublish(q, message("big", body))
+  val got = mustTake(q)
+  assertEqual(got.body, body, "a body of several TLS records")
+  match q.ack("big") {
+    case Ok(_) -> ()
+    case Err(e) -> assertTrue(false, "ack: " + e)
+  }
+  expectTimeout(q, "after the acknowledgement")
+  q.close()
+
+  val failing = open(tlsOptionsFor("/queue/fail.error"))
+  expectContains(errorOf(failing.publish(message("e", "x")), "ERROR"), "activemq: broker error:", "an ERROR frame")
+  failing.close()
+  val dropped = open(tlsOptionsFor("/queue/fail.drop"))
+  expectContains(
+    errorOf(dropped.publish(message("d", "x")), "drop"),
+    "activemq: connection lost",
+    "a dropped connection"
+  )
+  dropped.close()
+  val silent = open(tlsOptionsFor("/queue/fail.silent").copy(requestTimeoutMs = 300))
+  expectContains(errorOf(silent.publish(message("s", "x")), "silent"), "did not answer within 300 ms", "no receipt")
+  silent.close()
+  match ActiveMq.connectWith(tlsOptionsFor(freshName()).copy(passcode = "wrong")) {
+    case Ok(_) -> assertTrue(false, "the passcode is wrong")
+    case Err(e) -> expectContains(e, "password is invalid", "the broker's ERROR on CONNECT")
+  }
+}
+
+test "TLS: the transport must match the connector" {
+  // TLS towards a plain connector: the handshake never completes.
+  val tlsToPlain = ActiveMq.defaultOptions("127.0.0.1", brokerPort(), freshName()).copy(connectTimeoutMs = 1500).withTls().withExclusiveCaCertificate(
+    TEST_ONLY_CA
+  )
+  expectHandshakeFailure(tlsToPlain, "TLS to a plain connector")
+  // Plain STOMP towards a TLS connector: no CONNECTED frame comes back.
+  val plainToTls = ActiveMq.defaultOptions("127.0.0.1", tlsBrokerPort(), freshName())
+  val e = errorOfConnect(plainToTls.copy(login = "lyric", passcode = "secret", requestTimeoutMs = 1500))
+  assertTrue(Str.startsWith(e, "activemq: "), "plain to a TLS connector: " + e)
+  assertTrue(e != "connected", "plain STOMP must not get through a TLS connector")
+}
+
+test "TLS options are validated before any connection is made" {
+  val plain = ActiveMq.defaultOptions("127.0.0.1", 1, "/queue/a")
+  expectContains(errorOfConnect(plain.withCaCertificate(TEST_ONLY_CA)), "the connection is not TLS", "a CA without TLS")
+  expectContains(errorOfConnect(plain.withInsecureSkipVerify()), "the connection is not TLS", "skip-verify without TLS")
+  expectContains(errorOfConnect(plain.withTlsServerName("h")), "the connection is not TLS", "a server name without TLS")
+  expectContains(
+    errorOfConnect(plain.withMinTlsVersion(Tls.TlsVersion.Tls13)),
+    "the connection is not TLS",
+    "a version without TLS"
+  )
+  val tls = plain.withTls()
+  expectContains(errorOfConnect(tls.withCaCertificate("not a certificate")), "TLS CA certificate:", "a malformed CA")
+  expectContains(
+    errorOfConnect(tls.withExclusiveCaCertificate("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")),
+    "TLS exclusive CA certificate:",
+    "a malformed exclusive CA"
+  )
+  expectContains(
+    errorOfConnect(tls.withClientIdentity(TEST_ONLY_CLIENT_CERT, "")),
+    "without its private key",
+    "a certificate alone"
+  )
+  expectContains(
+    errorOfConnect(tls.withClientIdentity("", TEST_ONLY_CLIENT_KEY)),
+    "without its certificate",
+    "a key alone"
+  )
+  expectContains(
+    errorOfConnect(tls.withClientIdentity(TEST_ONLY_CLIENT_CERT, "not a key")),
+    "TLS client identity:",
+    "a malformed key"
+  )
+  expectContains(
+    errorOfConnect(tls.withClientIdentity("not a certificate", TEST_ONLY_CLIENT_KEY)),
+    "TLS client identity:",
+    "a malformed certificate"
+  )
+  val sec1 = "-----BEGIN EC PRIVATE KEY-----\nAAAA\n-----END EC PRIVATE KEY-----\n"
+  expectContains(errorOfConnect(tls.withClientIdentity(TEST_ONLY_CLIENT_CERT, sec1)), "PKCS8", "a SEC1 key is refused")
+  val e = errorOfConnect(tls.withClientIdentity(TEST_ONLY_CLIENT_CERT, TEST_ONLY_STRAY_KEY))
+  expectContains(e, "TLS client identity:", "a key that belongs to another certificate")
+}
+
+test "a stomp+ssl URL turns TLS on, with the TLS default port" {
+  match ActiveMq.optionsFromUrl("stomp+ssl://u:p@broker.example", "orders") {
+    case Err(e) -> assertTrue(false, e)
+    case Ok(o) -> {
+      assertTrue(o.tls.enabled, "TLS")
+      assertEqualInt(o.port, 61614, "the default TLS port")
+      assertEqual(o.destination, "/queue/orders", "destination")
+      assertEqual(o.login, "u", "login")
+      assertTrue(not o.tls.insecureSkipVerify, "verification is on")
+    }
+  }
+  match ActiveMq.optionsFromUrl("stomp://broker.example", "orders") {
+    case Err(e) -> assertTrue(false, e)
+    case Ok(o) -> assertTrue(not o.tls.enabled, "stomp:// is plain TCP")
+  }
+  val url = "stomp+ssl://lyric:secret@127.0.0.1:" + tlsBrokerPort().toString()
+  // No CA is configured, so the URL alone must fail on the test certificate.
+  match ActiveMq.connectUrl(url, "orders") {
+    case Ok(_) -> assertTrue(false, "the test CA is not in the platform trust store")
+    case Err(e) -> expectContains(e, "activemq: TLS handshake with 127.0.0.1:", "connectUrl over TLS")
+  }
+  match ActiveMq.optionsFromUrl(url, freshName()) {
+    case Err(e) -> assertTrue(false, e)
+    case Ok(o) -> expectRoundTrip(o.copy(requestTimeoutMs = 3000).withCaCertificate(TEST_ONLY_CA), "URL plus a CA")
+  }
+}
+
+func writeTestOnlyFile(name: in String, text: in String): String {
+  val path = Env.getVarOrDefault("TMPDIR", "/tmp") + "/lyric-mq-activemq-test-only-" + name
+  match File.writeText(path, text) {
+    case Ok(_) -> path
+    case Err(_) -> panic("cannot write " + path)
+  }
+}
+
+test "connectFromEnv reads the TLS settings" {
+  val caPath = writeTestOnlyFile("ca.pem", TEST_ONLY_CA)
+  val certPath = writeTestOnlyFile("client.pem", TEST_ONLY_CLIENT_CERT)
+  val keyPath = writeTestOnlyFile("client.key", TEST_ONLY_CLIENT_KEY)
+  val prefix = "LYRIC_CONFIG_MQ_ACTIVEMQ_"
+  slot.names = slot.names + 1
+  Env.setVar(prefix + "URL", "stomp+ssl://lyric:secret@127.0.0.1:" + mutualTlsBrokerPort().toString())
+  Env.setVar(prefix + "QUEUENAME", "env.tls." + slot.names.toString())
+  Env.setVar(prefix + "ACKMODE", "")
+  Env.setVar(prefix + "TLSCAFILE", caPath + ".missing")
+  match ActiveMq.connectFromEnv() {
+    case Ok(_) -> assertTrue(false, "the CA file does not exist")
+    case Err(e) -> expectContains(e, "LYRIC_CONFIG_MQ_ACTIVEMQ_TLSCAFILE", "an unreadable CA file")
+  }
+  Env.setVar(prefix + "TLSCAFILE", caPath)
+  Env.setVar(prefix + "TLSCAEXCLUSIVE", "maybe")
+  match ActiveMq.connectFromEnv() {
+    case Ok(_) -> assertTrue(false, "TLSCAEXCLUSIVE is not a boolean")
+    case Err(e) -> expectContains(e, "TLSCAEXCLUSIVE must be true or false", "a bad boolean")
+  }
+  Env.setVar(prefix + "TLSCAEXCLUSIVE", "true")
+  Env.setVar(prefix + "TLSMINVERSION", "1.1")
+  match ActiveMq.connectFromEnv() {
+    case Ok(_) -> assertTrue(false, "TLS 1.1 cannot be asked for")
+    case Err(e) -> expectContains(e, "TLSMINVERSION must be 1.2 or 1.3", "a bad version")
+  }
+  Env.setVar(prefix + "TLSMINVERSION", "1.3")
+  Env.setVar(prefix + "TLSCERTFILE", certPath)
+  match ActiveMq.connectFromEnv() {
+    case Ok(_) -> assertTrue(false, "a certificate without a key")
+    case Err(e) -> expectContains(e, "without its private key", "a certificate file alone")
+  }
+  Env.setVar(prefix + "TLSKEYFILE", keyPath)
+  Env.setVar(prefix + "TLSSERVERNAME", "localhost")
+  match ActiveMq.connectFromEnv() {
+    case Err(e) -> assertTrue(false, e)
+    case Ok(q) -> {
+      mustPublish(q, message("env-tls", "from env over TLS"))
+      assertEqual(mustTake(q).body, "from env over TLS", "round trip")
+      q.close()
+    }
+  }
+  Env.setVar(prefix + "TLSSERVERNAME", "broker.invalid")
+  match ActiveMq.connectFromEnv() {
+    case Ok(_) -> assertTrue(false, "the certificate does not name broker.invalid")
+    case Err(e) -> expectContains(e, "TLS handshake", "the configured server name is checked")
+  }
+  for field in ["URL", "QUEUENAME", "TLSCAFILE", "TLSCAEXCLUSIVE", "TLSMINVERSION", "TLSCERTFILE", "TLSKEYFILE", "TLSSERVERNAME"] {
+    Env.setVar(prefix + field, "")
+  }
+  val _ = File.deleteFile(caPath)
+  val _ = File.deleteFile(certPath)
+  val _ = File.deleteFile(keyPath)
+}
+
+// ─── TEST-ONLY certificates and keys ─────────────────────────────────────────
+// Everything below was generated for this test file with `openssl` (EC P-256,
+// valid until 2126) and is used by nothing else. The private keys are public
+// by being here: never trust these certificates outside this file.
+//
+//   TEST_ONLY_CA            self-signed CA
+//   TEST_ONLY_SERVER_*      issued by the CA; SAN DNS:localhost, IP:127.0.0.1
+//   TEST_ONLY_CLIENT_*      issued by the CA; clientAuth
+//   TEST_ONLY_OTHER_CA      a second, unrelated self-signed CA
+//   TEST_ONLY_STRAY_*       a client certificate issued by the other CA
+// test-only
+val TEST_ONLY_CA: String = "-----BEGIN CERTIFICATE-----\n" + "MIIB4TCCAYegAwIBAgIUMdZcqE1iGtInxR0FPbqibzyXeHYwCgYIKoZIzj0EAwIw\n" + "PTEkMCIGA1UECgwbbHlyaWMtbXEtYWN0aXZlbXEgVEVTVCBPTkxZMRUwEwYDVQQD\n" + "DAx0ZXN0LW9ubHkgQ0EwIBcNMjYxMTEyMjA0MzQyWhgPMjEyNjEwMTkyMDQzNDJa\n" + "MD0xJDAiBgNVBAoMG2x5cmljLW1xLWFjdGl2ZW1xIFRFU1QgT05MWTEVMBMGA1UE\n" + "AwwMdGVzdC1vbmx5IENBMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEYAYCGXrA\n" + "I2ewAr+wvyoRAfbXD36+mTug7dD9P79g9FPZ4pb/G1LPreTm3JJpvL0rPMcjyZ6i\n" + "atNgUShoEQtM1KNjMGEwHQYDVR0OBBYEFBO96Lq71dvpw7aQAdoxUqxZdTZiMB8G\n" + "A1UdIwQYMBaAFBO96Lq71dvpw7aQAdoxUqxZdTZiMA8GA1UdEwEB/wQFMAMBAf8w\n" + "DgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49BAMCA0gAMEUCIEPshpyn3+k8gCVsrkjG\n" + "hpyEoRE8+JDdAiWTbTZM17iqAiEAzarnIdQWuq0m+22jQ8ljnODgMXejV5pJ30E3\n" + "C5N+2hs=\n" + "-----END CERTIFICATE-----\n"
+
+// test-only
+val TEST_ONLY_SERVER_CERT: String = "-----BEGIN CERTIFICATE-----\n" + "MIICATCCAaagAwIBAgIUCKVnu3yl92vqNWhjbOod6MrPh4gwCgYIKoZIzj0EAwIw\n" + "PTEkMCIGA1UECgwbbHlyaWMtbXEtYWN0aXZlbXEgVEVTVCBPTkxZMRUwEwYDVQQD\n" + "DAx0ZXN0LW9ubHkgQ0EwIBcNMjYxMTEyMjA0MzQyWhgPMjEyNjEwMTkyMDQzNDJa\n" + "MDoxJDAiBgNVBAoMG2x5cmljLW1xLWFjdGl2ZW1xIFRFU1QgT05MWTESMBAGA1UE\n" + "AwwJbG9jYWxob3N0MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE4UqMwZLtPgfr\n" + "qsc8bdkA+Ma4as92fSn9nFyRnSlkW2qbsPx1fsPpbzdnx8noQeU9ng2B7JZdGFT/\n" + "N41Ri4aJnqOBhDCBgTAaBgNVHREEEzARgglsb2NhbGhvc3SHBH8AAAEwEwYDVR0l\n" + "BAwwCgYIKwYBBQUHAwEwDgYDVR0PAQH/BAQDAgeAMB0GA1UdDgQWBBQwtXKELMB8\n" + "diGydfIRw6aYVl0dVzAfBgNVHSMEGDAWgBQTvei6u9Xb6cO2kAHaMVKsWXU2YjAK\n" + "BggqhkjOPQQDAgNJADBGAiEA9nWrmJBPYADaQCWfcLkxFIe+5NJtvPZWY4DzWJoz\n" + "cV0CIQD4sNqVPsbSEbuQuHAh+m82dFOxaOzuTU+Ptb+s6uKrzw==\n" + "-----END CERTIFICATE-----\n"
+
+// test-only private key
+val TEST_ONLY_SERVER_KEY: String = "-----BEGIN PRIVATE KEY-----\n" + "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg0iMsh8kO7i1GbAKc\n" + "gI7OOrGRS/k+bbNUtMsYmBA68X+hRANCAAThSozBku0+B+uqxzxt2QD4xrhqz3Z9\n" + "Kf2cXJGdKWRbapuw/HV+w+lvN2fHyehB5T2eDYHsll0YVP83jVGLhome\n" + "-----END PRIVATE KEY-----\n"
+
+// test-only
+val TEST_ONLY_CLIENT_CERT: String = "-----BEGIN CERTIFICATE-----\n" + "MIIB6jCCAY+gAwIBAgIUCKVnu3yl92vqNWhjbOod6MrPh4kwCgYIKoZIzj0EAwIw\n" + "PTEkMCIGA1UECgwbbHlyaWMtbXEtYWN0aXZlbXEgVEVTVCBPTkxZMRUwEwYDVQQD\n" + "DAx0ZXN0LW9ubHkgQ0EwIBcNMjYxMTEyMjA0MzQyWhgPMjEyNjEwMTkyMDQzNDJa\n" + "MEExJDAiBgNVBAoMG2x5cmljLW1xLWFjdGl2ZW1xIFRFU1QgT05MWTEZMBcGA1UE\n" + "AwwQdGVzdC1vbmx5IGNsaWVudDBZMBMGByqGSM49AgEGCCqGSM49AwEHA0IABBPG\n" + "NQcnPleid2CUSj3TcqY/7T2mH54mNqqRP89ugZtmCmPrKeguQejvY8i04nToDPGg\n" + "9Lno+WXA7UeDh7aEGYijZzBlMBMGA1UdJQQMMAoGCCsGAQUFBwMCMA4GA1UdDwEB\n" + "/wQEAwIHgDAdBgNVHQ4EFgQULwRAoPjdU+MFvJYdA4EeB9XhWDUwHwYDVR0jBBgw\n" + "FoAUE73ourvV2+nDtpAB2jFSrFl1NmIwCgYIKoZIzj0EAwIDSQAwRgIhAPHfud/j\n" + "lfy9BqSFYumS5MW7ljCZC+hBeO9fXZiiSbgDAiEAx+DPE3IVzjYVclCL4k/TT2+y\n" + "C9kbvqMHtdvi2dWjbJc=\n" + "-----END CERTIFICATE-----\n"
+
+// test-only private key
+val TEST_ONLY_CLIENT_KEY: String = "-----BEGIN PRIVATE KEY-----\n" + "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgn3/zm5+BLXEqOfVa\n" + "81O7AX4r9UiOMVTJpfWUi9mn5CChRANCAAQTxjUHJz5XondglEo903KmP+09ph+e\n" + "JjaqkT/PboGbZgpj6ynoLkHo72PItOJ06AzxoPS56PllwO1Hg4e2hBmI\n" + "-----END PRIVATE KEY-----\n"
+
+// test-only
+val TEST_ONLY_OTHER_CA: String = "-----BEGIN CERTIFICATE-----\n" + "MIIB7DCCAZOgAwIBAgIUIff2SUzilDgPnfhpZuCjgCv0cuswCgYIKoZIzj0EAwIw\n" + "QzEkMCIGA1UECgwbbHlyaWMtbXEtYWN0aXZlbXEgVEVTVCBPTkxZMRswGQYDVQQD\n" + "DBJ0ZXN0LW9ubHkgb3RoZXIgQ0EwIBcNMjYxMTEyMjA0MzQyWhgPMjEyNjEwMTky\n" + "MDQzNDJaMEMxJDAiBgNVBAoMG2x5cmljLW1xLWFjdGl2ZW1xIFRFU1QgT05MWTEb\n" + "MBkGA1UEAwwSdGVzdC1vbmx5IG90aGVyIENBMFkwEwYHKoZIzj0CAQYIKoZIzj0D\n" + "AQcDQgAEUR1JFo0CD3Njte9zvDQRwZpfqkN99Cr/tWDv/py3OxILiIUZxPIAJjKZ\n" + "IwaEIBHAjfKazW3H6DwAKRDyLRMuKaNjMGEwHQYDVR0OBBYEFOc3kuRypGZLrgq+\n" + "ULOmQ53rPQc7MB8GA1UdIwQYMBaAFOc3kuRypGZLrgq+ULOmQ53rPQc7MA8GA1Ud\n" + "EwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49BAMCA0cAMEQCIFDY\n" + "fnOZLZvo50DDnsjqmvU8QERfKI4BuZKAF1URYAMgAiA+BnCvnTP5byJjxU558h8x\n" + "lTB/jAfGEwVj5amWPzTAww==\n" + "-----END CERTIFICATE-----\n"
+
+// test-only
+val TEST_ONLY_STRAY_CERT: String = "-----BEGIN CERTIFICATE-----\n" + "MIIB9DCCAZugAwIBAgIUW4CJBIZ52Zh1nR8hK5SdBEl3Uh0wCgYIKoZIzj0EAwIw\n" + "QzEkMCIGA1UECgwbbHlyaWMtbXEtYWN0aXZlbXEgVEVTVCBPTkxZMRswGQYDVQQD\n" + "DBJ0ZXN0LW9ubHkgb3RoZXIgQ0EwIBcNMjYxMTEyMjA0MzQyWhgPMjEyNjEwMTky\n" + "MDQzNDJaMEcxJDAiBgNVBAoMG2x5cmljLW1xLWFjdGl2ZW1xIFRFU1QgT05MWTEf\n" + "MB0GA1UEAwwWdGVzdC1vbmx5IHN0cmF5IGNsaWVudDBZMBMGByqGSM49AgEGCCqG\n" + "SM49AwEHA0IABIkfflimVwpiL9W8mKqin/dEkFuBwKThiXNqht9NVJ/5ONO4xJgo\n" + "JKcroGDsJK0HsEL5vjBGzRxk6sdGUbh/p+2jZzBlMBMGA1UdJQQMMAoGCCsGAQUF\n" + "BwMCMA4GA1UdDwEB/wQEAwIHgDAdBgNVHQ4EFgQU8hV86rSPyWSoYYNIY19fk/G0\n" + "ptIwHwYDVR0jBBgwFoAU5zeS5HKkZkuuCr5Qs6ZDnes9BzswCgYIKoZIzj0EAwID\n" + "RwAwRAIgZDqq5uIxulT/iFszvxubUpoYw/9zr/0EhsEkzkX2ErkCIH9j9qmllwSG\n" + "ce8eoOWDafL1iEcoqdAufQP53uCudIrc\n" + "-----END CERTIFICATE-----\n"
+
+// test-only private key
+val TEST_ONLY_STRAY_KEY: String = "-----BEGIN PRIVATE KEY-----\n" + "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg/irIMjHltlSLzkqe\n" + "AitdTtpknt7mMQqZFfyCqWygP3ihRANCAASJH35YplcKYi/VvJiqop/3RJBbgcCk\n" + "4YlzaobfTVSf+TjTuMSYKCSnK6Bg7CStB7BC+b4wRs0cZOrHRlG4f6ft\n" + "-----END PRIVATE KEY-----\n"

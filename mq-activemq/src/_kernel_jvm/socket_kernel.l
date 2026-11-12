@@ -1,10 +1,28 @@
 //! Mq.ActiveMq.Kernel (jvm) - the socket boundary of the STOMP client on
 //! `--target jvm`.
 //!
-//! `java.net.Socket` / `java.net.ServerSocket` and their streams, a
-//! `ReentrantLock`, `System.nanoTime` and a daemon thread, all through the JVM
-//! auto-FFI (`extern type` + `T.method(args)`); no Java shim. Every operation
-//! returns a `Result` with the failure text; nothing throws.
+//! `java.net.Socket` / `java.net.ServerSocket` and their streams,
+//! `javax.net.ssl.SSLSocket` for TLS, a `ReentrantLock`, `System.nanoTime` and
+//! a daemon thread, all through the JVM auto-FFI (`extern type` +
+//! `T.method(args)`); no Java shim. Every operation returns a `Result` with
+//! the failure text; nothing throws.
+//!
+//! TLS: an `SSLContext` built from a `KeyStore`-backed `TrustManagerFactory`
+//! (the configured CA, plus the platform's accepted issuers for additive
+//! trust) and a `KeyManagerFactory` (client identity), whose socket factory
+//! layers an `SSLSocket` over the connected socket. The host name is checked
+//! by the JDK (`SSLParameters.setEndpointIdentificationAlgorithm("HTTPS")`).
+//! An `SSLSocket` is a `Socket`: reads, read timeouts and writes are the same
+//! code as for plain TCP. Certificates and keys are loaded from PEM by the
+//! standard library's `Std.TlsHost`. The server side (`sockAcceptTls`) exists
+//! for the in-process broker of the hermetic tests.
+//!
+//! A few JDK calls go through `java.lang.reflect` (the idiom of the standard
+//! library's `_kernel_jvm/http_host.l`): the auto-FFI cannot pass a typed
+//! reference array (`TrustManager[]`, `Certificate[]`, `String[]`) or `null`
+//! (lyric-lang#4775) as an argument, and `KeyStore.load`, `KeyStore.setKeyEntry`,
+//! `TrustManagerFactory.init`, `KeyManagerFactory.init`, `SSLContext.init` and
+//! `SSLParameters.setProtocols` need one or the other.
 //!
 //! The dotnet twin (`src/_kernel_dotnet/socket_kernel.l`) declares the same
 //! package with the same public surface; a file-level `@cfg(target = ...)`
@@ -15,6 +33,9 @@
 package Mq.ActiveMq.Kernel
 
 import Std.Core
+import Std.Collections
+import Std.Encoding
+import Std.TlsHost as TlsHost
 
 extern type JSocket = "java.net.Socket"
 
@@ -38,11 +59,70 @@ extern type JSystem = "java.lang.System"
 
 extern type JReentrantLock = "java.util.concurrent.locks.ReentrantLock"
 
-/// One open TCP connection.
+extern type JObject = "java.lang.Object"
+
+extern type JArrayList = "java.util.ArrayList"
+
+extern type JClass = "java.lang.Class"
+
+extern type JMethod = "java.lang.reflect.Method"
+
+extern type JReflectArray = "java.lang.reflect.Array"
+
+extern type JInvocationHandler = "java.lang.reflect.InvocationHandler"
+
+extern type JClassLoader = "java.lang.ClassLoader"
+
+extern type JCharacterCls = "java.lang.Character"
+
+extern type JKeyStore = "java.security.KeyStore"
+
+extern type JTrustManagerFactory = "javax.net.ssl.TrustManagerFactory"
+
+extern type JKeyManagerFactory = "javax.net.ssl.KeyManagerFactory"
+
+extern type JTrustManager = "javax.net.ssl.TrustManager"
+
+extern type JSSLContext = "javax.net.ssl.SSLContext"
+
+extern type JSSLParameters = "javax.net.ssl.SSLParameters"
+
+extern type JSSLSocketFactory = "javax.net.ssl.SSLSocketFactory"
+
+extern type JSSLSocket = "javax.net.ssl.SSLSocket"
+
+/// One open connection: plain TCP, or TLS over it.
 pub record Sock {
   socket: JSocket
   input: JInputStream
   output: JOutputStream
+}
+
+/// How a client secures a connection (`sockStartTls`). PEM text; an empty
+/// string means "not configured".
+pub record ClientTls {
+  /// The name sent as SNI and checked against the server certificate.
+  serverName: String
+  /// A trust anchor in addition to the platform's, or instead of them when
+  /// `exclusiveCa` is set.
+  caPem: String
+  exclusiveCa: Bool
+  /// The client certificate and its PKCS8 private key (mutual TLS).
+  certPem: String
+  keyPem: String
+  /// TLS 1.3 only; otherwise TLS 1.2 or later.
+  tls13Only: Bool
+  /// Accept any server certificate and any name. The caller decides whether
+  /// that is allowed; the kernel only does what it is told.
+  skipVerify: Bool
+}
+
+/// How a server secures an accepted connection (`sockAcceptTls`).
+pub record ServerTls {
+  certPem: String
+  keyPem: String
+  /// When not empty, a client certificate issued by this CA is required.
+  clientCaPem: String
 }
 
 /// What one read produced.
@@ -179,6 +259,320 @@ pub func sockClose(s: in Sock): Unit {
   closeQuietly(s.socket)
 }
 
+// ─── TLS ─────────────────────────────────────────────────────────────────────
+// The first public method of `className` called `name` with `arity`
+// parameters, the first of them of type `firstParam` when that is not empty.
+func findMethod(className: in String, name: in String, arity: in Int, firstParam: in String): JMethod {
+  val cls: JClass = JClass.forName(className)
+  val methods: slice[JMethod] = cls.getMethods()
+  var i = 0
+  while i < methods.length {
+    val m = methods[i]
+    if m.getName() == name and m.getParameterCount() == arity {
+      if firstParam.length == 0 {
+        return m
+      }
+      val parameters: slice[JClass] = m.getParameterTypes()
+      if parameters[0].getName() == firstParam {
+        return m
+      }
+    }
+    i = i + 1
+  }
+  panic("no method " + className + "." + name + " with " + arity.toString() + " parameters")
+}
+
+// A `null` reference: the element of a fresh one-element array.
+func nullRef(): JObject {
+  val objectClass: JClass = JClass.forName("java.lang.Object")
+  val holder: JObject = JReflectArray.newInstance(objectClass, 1)
+  JReflectArray.get(holder, 0)
+}
+
+// An empty `char[]`: the "no password" of an in-memory key store.
+func noPassword(): JObject {
+  val charClass: JClass = JCharacterCls.TYPE
+  JReflectArray.newInstance(charClass, 0)
+}
+
+func certificateArray(certificate: in TlsHost.JCertificate): JObject {
+  val elementClass: JClass = JClass.forName("java.security.cert.Certificate")
+  val array: JObject = JReflectArray.newInstance(elementClass, 1)
+  JReflectArray.set(array, 0, certificate)
+  array
+}
+
+func emptyKeyStore(): JKeyStore {
+  val store: JKeyStore = JKeyStore.getInstance("PKCS12")
+  val arguments: JArrayList = JArrayList.new()
+  arguments.add(nullRef())
+  arguments.add(noPassword())
+  val _ = findMethod("java.security.KeyStore", "load", 2, "java.io.InputStream").invoke(store, arguments.toArray())
+  store
+}
+
+// A trust manager factory over `store`; a `null` store is the platform's.
+func trustFactory(store: in JObject): JTrustManagerFactory {
+  val factory: JTrustManagerFactory = JTrustManagerFactory.getInstance(JTrustManagerFactory.getDefaultAlgorithm())
+  val arguments: JArrayList = JArrayList.new()
+  arguments.add(store)
+  val _ = findMethod("javax.net.ssl.TrustManagerFactory", "init", 1, "java.security.KeyStore").invoke(
+    factory,
+    arguments.toArray()
+  )
+  factory
+}
+
+func loadFailure(what: in String, e: in TlsHost.HostLoadError): String {
+  match e {
+    case TlsHost.HostMalformed(m) -> what + " could not be loaded: " + m
+    case TlsHost.HostMismatch(m) -> what + " could not be loaded: " + m
+  }
+}
+
+func loadCertificate(what: in String, pem: in String): TlsHost.JCertificate {
+  match TlsHost.hostCertFromPemBytes(encodeUtf8(pem)) {
+    case Ok(h) -> h.cert
+    case Err(e) -> panic(loadFailure(what, e))
+  }
+}
+
+// The platform's trust anchors, as the `X509Certificate[]` its default trust
+// manager reports. The method is looked up on the public interface: the
+// implementing class is not exported from `java.base`.
+func platformAnchors(): JObject {
+  val managers: slice[JTrustManager] = trustFactory(nullRef()).getTrustManagers()
+  val none: JArrayList = JArrayList.new()
+  findMethod("javax.net.ssl.X509TrustManager", "getAcceptedIssuers", 0, "").invoke(managers[0], none.toArray())
+}
+
+// `TrustManager[]` that trusts `caPem`, plus the platform's anchors unless
+// `exclusive`.
+func trustManagersFor(what: in String, caPem: in String, exclusive: in Bool): JObject {
+  val store = emptyKeyStore()
+  store.setCertificateEntry("lyric-ca", loadCertificate(what, caPem))
+  if not exclusive {
+    val anchors = platformAnchors()
+    val count = JReflectArray.getLength(anchors)
+    var i = 0
+    while i < count {
+      val anchor: TlsHost.JCertificate = JReflectArray.get(anchors, i)
+      store.setCertificateEntry("lyric-platform-" + i.toString(), anchor)
+      i = i + 1
+    }
+  }
+  val managers: JObject = trustFactory(store).getTrustManagers()
+  managers
+}
+
+// `KeyManager[]` presenting the certificate and key.
+func keyManagersFor(what: in String, certPem: in String, keyPem: in String): JObject {
+  val handle = match TlsHost.hostIdentityFromPemBytes(encodeUtf8(certPem), encodeUtf8(keyPem)) {
+    case Ok(h) -> h
+    case Err(e) -> panic(loadFailure(what, e))
+  }
+  val key: TlsHost.JPrivateKey = match handle.key {
+    case Some(k) -> k
+    case None -> panic(what + " could not be loaded: no private key")
+  }
+  val store = emptyKeyStore()
+  val entry: JArrayList = JArrayList.new()
+  entry.add("lyric-identity")
+  entry.add(key)
+  entry.add(noPassword())
+  entry.add(certificateArray(handle.cert))
+  val _ = findMethod("java.security.KeyStore", "setKeyEntry", 4, "").invoke(store, entry.toArray())
+  val factory: JKeyManagerFactory = JKeyManagerFactory.getInstance(JKeyManagerFactory.getDefaultAlgorithm())
+  val arguments: JArrayList = JArrayList.new()
+  arguments.add(store)
+  arguments.add(noPassword())
+  val _ = findMethod("javax.net.ssl.KeyManagerFactory", "init", 2, "java.security.KeyStore").invoke(
+    factory,
+    arguments.toArray()
+  )
+  val managers: JObject = factory.getKeyManagers()
+  managers
+}
+
+// The trust manager behind `skipVerify`: a `java.lang.reflect.Proxy` for
+// `X509TrustManager` whose checks return without throwing. A Lyric record
+// cannot implement the interface directly, because its methods take
+// `X509Certificate[]`.
+record TrustEverything {
+  label: String
+}
+
+func boxed[T](value: in T): JObject {
+  val objectClass: JClass = JClass.forName("java.lang.Object")
+  val holder: JObject = JReflectArray.newInstance(objectClass, 1)
+  JReflectArray.set(holder, 0, value)
+  JReflectArray.get(holder, 0)
+}
+
+impl JInvocationHandler for TrustEverything {
+  func invoke(proxy: in JObject, method: in JMethod, args: in slice[JObject]): JObject {
+    val name: String = method.getName()
+    if name == "getAcceptedIssuers" {
+      val certificateClass: JClass = JClass.forName("java.security.cert.X509Certificate")
+      val none: JObject = JReflectArray.newInstance(certificateClass, 0)
+      none
+    } else if name == "toString" {
+      val label: String = self.label
+      boxed(label)
+    } else if name == "hashCode" {
+      val hash: Int = JSystem.identityHashCode(proxy)
+      boxed(hash)
+    } else if name == "equals" {
+      val never: Bool = false
+      boxed(never)
+    } else {
+      // `checkClientTrusted` / `checkServerTrusted` are `void`.
+      nullRef()
+    }
+  }
+}
+
+@unsafe_ffi
+func trustEverythingManagers(): JObject {
+  val loader: JClassLoader = JClassLoader.getSystemClassLoader()
+  val managerClass: JClass = JClass.forName("javax.net.ssl.X509TrustManager")
+  val classClass: JClass = JClass.forName("java.lang.Class")
+  val interfaces: JObject = JReflectArray.newInstance(classClass, 1)
+  JReflectArray.set(interfaces, 0, managerClass)
+  val handler: JInvocationHandler = TrustEverything(label = "Mq.ActiveMq.Kernel.TrustEverything")
+  val arguments: List[JObject] = newList()
+  arguments.add(externAsObject(loader))
+  arguments.add(interfaces)
+  arguments.add(externAsObject(handler))
+  val manager: JTrustManager = findMethod("java.lang.reflect.Proxy", "newProxyInstance", 3, "").invoke(
+    nullRef(),
+    arguments.toArray()
+  )
+  val managerArrayClass: JClass = JClass.forName("javax.net.ssl.TrustManager")
+  val managers: JObject = JReflectArray.newInstance(managerArrayClass, 1)
+  JReflectArray.set(managers, 0, manager)
+  managers
+}
+
+// `keyManagers` / `trustManagers`: the arrays, or `null` for the defaults.
+func sslContext(keyManagers: in JObject, trustManagers: in JObject): JSSLContext {
+  val context: JSSLContext = JSSLContext.getInstance("TLS")
+  val arguments: JArrayList = JArrayList.new()
+  arguments.add(keyManagers)
+  arguments.add(trustManagers)
+  arguments.add(nullRef())
+  val _ = findMethod("javax.net.ssl.SSLContext", "init", 3, "").invoke(context, arguments.toArray())
+  context
+}
+
+func protocolArray(tls13Only: in Bool): JObject {
+  val stringClass: JClass = JClass.forName("java.lang.String")
+  val protocols: JObject = JReflectArray.newInstance(stringClass, if tls13Only { 1 } else { 2 })
+  JReflectArray.set(protocols, 0, "TLSv1.3")
+  if not tls13Only {
+    JReflectArray.set(protocols, 1, "TLSv1.2")
+  }
+  protocols
+}
+
+// Layer an `SSLSocket` over `plain`. `peerName` is what the JDK sends as
+// SNI and checks the peer certificate against.
+func layerTls(context: in JSSLContext, plain: in JSocket, peerName: in String): JSocket {
+  val factory: JSSLSocketFactory = context.getSocketFactory()
+  factory.createSocket(plain, peerName, plain.getPort(), true)
+}
+
+func asSslSocket(layered: in JSocket): JSSLSocket {
+  val sslClass: JClass = JClass.forName("javax.net.ssl.SSLSocket")
+  val ssl: JSSLSocket = sslClass.cast(layered)
+  ssl
+}
+
+func setProtocols(parameters: in JSSLParameters, tls13Only: in Bool): Unit {
+  val arguments: JArrayList = JArrayList.new()
+  arguments.add(protocolArray(tls13Only))
+  val _ = findMethod("javax.net.ssl.SSLParameters", "setProtocols", 1, "").invoke(parameters, arguments.toArray())
+}
+
+func clientHandshake(plain: in JSocket, tls: in ClientTls, timeoutMs: in Int): Sock {
+  val keyManagers = if tls.certPem.length > 0 {
+    keyManagersFor("the client certificate and key", tls.certPem, tls.keyPem)
+  } else {
+    nullRef()
+  }
+  val trustManagers = if tls.skipVerify {
+    trustEverythingManagers()
+  } else if tls.caPem.length > 0 {
+    trustManagersFor("the CA certificate", tls.caPem, tls.exclusiveCa)
+  } else {
+    nullRef()
+  }
+  val layered = layerTls(sslContext(keyManagers, trustManagers), plain, tls.serverName)
+  val ssl = asSslSocket(layered)
+  ssl.setUseClientMode(true)
+  val parameters: JSSLParameters = ssl.getSSLParameters()
+  if not tls.skipVerify {
+    parameters.setEndpointIdentificationAlgorithm("HTTPS")
+  }
+  setProtocols(parameters, tls.tls13Only)
+  ssl.setSSLParameters(parameters)
+  layered.setSoTimeout(timeoutMs)
+  ssl.startHandshake()
+  wrapSocket(layered)
+}
+
+func serverHandshake(plain: in JSocket, tls: in ServerTls, timeoutMs: in Int): Sock {
+  val keyManagers = keyManagersFor("the server certificate and key", tls.certPem, tls.keyPem)
+  val needClient = tls.clientCaPem.length > 0
+  val trustManagers = if needClient {
+    trustManagersFor("the client CA certificate", tls.clientCaPem, true)
+  } else {
+    nullRef()
+  }
+  val layered = layerTls(sslContext(keyManagers, trustManagers), plain, "localhost")
+  val ssl = asSslSocket(layered)
+  ssl.setUseClientMode(false)
+  ssl.setNeedClientAuth(needClient)
+  layered.setSoTimeout(timeoutMs)
+  ssl.startHandshake()
+  wrapSocket(layered)
+}
+
+func handshakeFailure(typeName: in String, message: in String, timeoutMs: in Int): String {
+  if typeName == "SocketTimeoutException" or typeName == "java.net.SocketTimeoutException" {
+    "timed out after " + timeoutMs.toString() + " ms"
+  } else {
+    message
+  }
+}
+
+/// Run the client side of a TLS handshake over `s` and return the secured
+/// connection. It waits at most `timeoutMs` milliseconds (`0` = no limit).
+/// On `Err` the connection is closed.
+pub func sockStartTls(s: in Sock, tls: in ClientTls, timeoutMs: in Int): Result[Sock, String]
+  requires: timeoutMs >= 0
+{
+  try {
+    Ok(clientHandshake(s.socket, tls, timeoutMs))
+  } catch Bug as b {
+    closeQuietly(s.socket)
+    Err(handshakeFailure(b.typeName, b.message, timeoutMs))
+  }
+}
+
+/// Run the server side of a TLS handshake over an accepted connection. On
+/// `Err` the connection is closed.
+pub func sockAcceptTls(s: in Sock, tls: in ServerTls, timeoutMs: in Int): Result[Sock, String]
+  requires: timeoutMs >= 0
+{
+  try {
+    Ok(serverHandshake(s.socket, tls, timeoutMs))
+  } catch Bug as b {
+    closeQuietly(s.socket)
+    Err(handshakeFailure(b.typeName, b.message, timeoutMs))
+  }
+}
+
 /// Listen on the IP literal `host` and `port` (`port = 0` picks a free port).
 pub func serverListen(host: in String, port: in Int): Result[ServerSock, String] {
   try {
@@ -251,8 +645,12 @@ pub func monotonicMillis(): Long {
   JSystem.nanoTime() / 1000000i64
 }
 
+// Fair: a consumer waiting for a message gives the lock up every 100 ms and
+// takes it again at once. With the default (barging) policy it usually wins
+// that race against a publisher parked on the lock, which can then starve
+// for the whole of the wait.
 pub func newLock(): Lock {
-  Lock(inner = JReentrantLock.new())
+  Lock(inner = JReentrantLock.new(true))
 }
 
 pub func lockEnter(l: in Lock): Unit {
