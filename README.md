@@ -11,6 +11,7 @@ interface's conformance suite on every target it claims.
 | Package | Directory | Interface | Backend | Targets | Implementation |
 |---|---|---|---|---|---|
 | `Lyric.Storage.S3` | `storage-s3/` | `Storage.StorageBucket` | Amazon S3 and S3-compatible stores | dotnet, jvm | pure Lyric (SigV4 over `Std.Http`) |
+| `Lyric.Storage.Gcs` | `storage-gcs/` | `Storage.StorageBucket` | Google Cloud Storage | dotnet, jvm | pure Lyric (XML API, GOOG4-HMAC-SHA256 over `Std.Http`); not yet verified with a real key |
 | `Lyric.Storage.AzureBlob` | `storage-azure-blob/` | `Storage.StorageBucket` | Azure Blob Storage | dotnet, jvm | pure Lyric (Shared Key over `Std.Http`) |
 | `Lyric.Aws.SigV4` | `aws-sigv4/` | (shared signing) | AWS Signature V4 | dotnet, jvm | pure Lyric |
 | `Lyric.Jobs.Quartz` | `jobs-quartz/` | `Jobs.JobScheduler` | Quartz | jvm | Quartz via Maven |

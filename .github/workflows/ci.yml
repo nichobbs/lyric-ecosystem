@@ -120,3 +120,13 @@ jobs:
       - name: Test packages against the services
         working-directory: lyric-ecosystem
         run: bash scripts/ci/test-packages.sh ${{ matrix.target }} --integration
+
+      # No emulator speaks the Cloud Storage XML API with HMAC signing, and there
+      # is no key in CI, so this is the only run against Google itself: requests
+      # signed with a non-existent key (refused; Google echoes how it read them)
+      # and anonymous reads of Google's public buckets.
+      - name: storage-gcs against storage.googleapis.com (no credentials)
+        working-directory: lyric-ecosystem
+        run: |
+          "$LYRIC" restore --manifest storage-gcs/lyric.toml
+          "$LYRIC" test --manifest storage-gcs/lyric.toml --target ${{ matrix.target }} --features live
