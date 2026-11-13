@@ -519,7 +519,7 @@ supplied as secrets.
   retention, no batch delete. `list` has no delimiter.
 - Requests are not retried. `SlowDown` and 5xx answers reach the caller as errors.
 - The interface's `requires:` clauses are enforced on `jvm` and not on `dotnet` for this backend
-  (see Surprises; related to nichobbs/lyric-lang#9043, no issue number of its own yet).
+  (see Surprises; nichobbs/lyric-lang#9043).
 - `Std.HttpServer` cannot send a HEAD response that reports an entity's length
   (nichobbs/lyric-lang#9048). The hermetic tests are not affected: Cloud Storage reports an
   object's size in `x-goog-stored-content-length`, the client reads that header first, and the fake

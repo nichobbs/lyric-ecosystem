@@ -1,8 +1,8 @@
 //! Redis - a Redis client written in Lyric.
 //!
 //! The protocol (`Redis.Resp`), the URL parser (`Redis.Url`) and the client
-//! are plain Lyric; only the TCP socket and the TLS layer over it are reached
-//! through a per-target kernel (`Redis.Kernel`). Every operation returns
+//! are plain Lyric; the TCP connection and the TLS layer over it are
+//! `Net.Tcp`'s (package `Lyric.Net`). Every operation returns
 //! `Result[_, RedisError]`; nothing throws.
 //!
 //! ```
@@ -31,10 +31,11 @@
 //!
 //! TLS: a `rediss://` URL (or `withTls`) connects over TLS, verifying the
 //! server certificate against the system trust store and its name against
-//! the host. `withExclusiveCaCertificate`, `withClientIdentity`,
-//! `withMinTlsVersion`, `withTlsServerName` and `withInsecureSkipVerify`
-//! adjust that; the names and the insecure policy are `Std.Http`'s
-//! (`HttpClientBuilder`), the types `Std.Tls`'s.
+//! the host. `withCaCertificate`, `withExclusiveCaCertificate`,
+//! `withClientIdentity`, `withMinTlsVersion`, `withTlsServerName` and
+//! `withInsecureSkipVerify` adjust that; the names and the insecure policy
+//! are `Std.Http`'s (`HttpClientBuilder`), the types `Std.Tls`'s, and the
+//! checks and the handshake `Net.Tls`'s and `Net.Tcp`'s.
 //!
 //! Reconnection: a connection that breaks is closed and the next command
 //! dials again (and repeats AUTH / SELECT). A command is repeated once on a
@@ -50,7 +51,6 @@ import Std.Core
 import Std.Collections
 import Std.Console as Console
 import Std.Encoding
-import Std.Environment as Env
 import Std.File as File
 import Std.Http as Http
 import Std.Parse
@@ -58,7 +58,8 @@ import Std.String as Str
 import Std.Tls as Tls
 import Redis.Resp as Resp
 import Redis.Url as Url
-import Redis.Kernel as Kernel
+import Net.Tcp as Tcp
+import Net.Tls as NetTls
 
 // ─── Errors ──────────────────────────────────────────────────────────────────
 /// Why a Redis operation failed.
@@ -131,8 +132,11 @@ pub record RedisTlsOptions {
   /// uses the configuration's `host`.
   serverName: String
   /// The only certificate authority the server certificate may chain to;
-  /// `""` trusts the system trust store.
+  /// `""` trusts the system trust store (and `additionalCaCertificatePem`).
   caCertificatePem: String
+  /// A certificate authority trusted in addition to the system trust store;
+  /// `""` adds none. Ignored when `caCertificatePem` is set.
+  additionalCaCertificatePem: String
   /// The client certificate presented for mutual TLS; `""` presents none.
   clientCertificatePem: String
   /// The private key of `clientCertificatePem`.
@@ -149,6 +153,7 @@ func noTls(): RedisTlsOptions {
     enabled = false,
     serverName = "",
     caCertificatePem = "",
+    additionalCaCertificatePem = "",
     clientCertificatePem = "",
     clientKeyPem = "",
     minVersion = Tls.Tls12,
@@ -172,7 +177,7 @@ pub record RedisConfig {
   /// Longest wait for the TCP connection, in milliseconds (`0` = no limit).
   connectTimeoutMs: Int
   /// Longest wait for one read or write, in milliseconds (`0` = no limit).
-  /// It also bounds each step of the TLS handshake.
+  /// It also bounds the TLS handshake as a whole.
   ioTimeoutMs: Int
   /// Repeat a command once on a fresh connection when the server had closed
   /// the idle one before the command ran.
@@ -281,11 +286,23 @@ pub func withTls(cfg: in RedisConfig): RedisConfig {
   cfg.copy(tls = cfg.tls.copy(enabled = true))
 }
 
+/// `cfg` trusting the certificate authority `caPem` (PEM text, one
+/// certificate) in addition to the system trust store: the additive form, as
+/// `Std.Http`'s `withCaCertificate`. `withExclusiveCaCertificate` wins when
+/// both are set. An unusable certificate is `InvalidConfig` from `checkTls`
+/// and when the client first connects.
+@experimental
+pub func withCaCertificate(cfg: in RedisConfig, caPem: in String): RedisConfig
+  requires: caPem.length > 0
+{
+  cfg.copy(tls = cfg.tls.copy(additionalCaCertificatePem = caPem))
+}
+
 /// `cfg` trusting ONLY the certificate authority `caPem` (PEM text) for the
 /// server certificate: the system trust store is not consulted. This is the
-/// trust-replacing form, as `Std.Http`'s `withExclusiveCaCertificate`; there
-/// is no additive form. The PEM is parsed when the client first connects; an
-/// unusable certificate is `InvalidConfig` there.
+/// trust-replacing form, as `Std.Http`'s `withExclusiveCaCertificate`;
+/// `withCaCertificate` is the additive one. An unusable certificate is
+/// `InvalidConfig` from `checkTls` and when the client first connects.
 @experimental
 pub func withExclusiveCaCertificate(cfg: in RedisConfig, caPem: in String): RedisConfig
   requires: caPem.length > 0
@@ -304,6 +321,15 @@ func readPem(what: in String, path: in String): Result[String, RedisError] {
       Err(InvalidConfig(message = "the " + what + " file is empty: " + path))
     }
     case Err(_) -> Err(InvalidConfig(message = "cannot read the " + what + ": " + path))
+  }
+}
+
+/// `withCaCertificate` reading the PEM file at `path`.
+@experimental
+pub func withCaCertificateFile(cfg: in RedisConfig, path: in String): Result[RedisConfig, RedisError] {
+  match readPem("CA certificate", path) {
+    case Ok(pem) -> Ok(withCaCertificate(cfg, pem))
+    case Err(e) -> Err(e)
   }
 }
 
@@ -377,27 +403,28 @@ pub func withInsecureSkipVerify(cfg: in RedisConfig): RedisConfig {
   cfg.copy(tls = cfg.tls.copy(insecureSkipVerify = true))
 }
 
-val insecureAllowEnvVar: String = "LYRIC_TLS_ALLOW_INSECURE"
-
-func hasTlsDetails(t: in RedisTlsOptions): Bool {
-  val pinned = match t.minVersion { case Tls13 -> true; case Tls12 -> false }
-  t.serverName.length > 0 or t.caCertificatePem.length > 0 or t.clientCertificatePem.length > 0 or
-    t.clientKeyPem.length > 0 or
-    t.insecureSkipVerify or
-    pinned
+// The options as `Net.Tls` takes them.
+func netTlsOptions(t: in RedisTlsOptions): NetTls.TlsOptions {
+  NetTls.TlsOptions(
+    enabled = t.enabled,
+    serverName = t.serverName,
+    caCertificatePem = t.additionalCaCertificatePem,
+    exclusiveCaCertificatePem = t.caCertificatePem,
+    clientCertificatePem = t.clientCertificatePem,
+    clientKeyPem = t.clientKeyPem,
+    minVersion = t.minVersion,
+    insecureSkipVerify = t.insecureSkipVerify
+  )
 }
 
-func checkCaPem(pem: in String): Result[Unit, RedisError] {
-  match Tls.Certificate.fromPem(pem) {
-    case Ok(_) -> Ok(())
-    case Err(e) -> Err(InvalidConfig(message = "TLS CA certificate: " + e.message()))
-  }
-}
-
-func checkIdentityPem(certPem: in String, keyPem: in String): Result[Unit, RedisError] {
-  match Tls.Identity.fromPem(certPem, keyPem) {
-    case Ok(_) -> Ok(())
-    case Err(e) -> Err(InvalidConfig(message = "TLS client certificate and key: " + e.message()))
+func tlsProblemMessage(problem: in NetTls.TlsProblem): String {
+  match problem {
+    case NetTls.TlsNotEnabled -> "TLS options are set but the connection is not TLS: use a rediss:// URL or withTls"
+    case NetTls.CaCertificateUnusable(reason) -> "TLS CA certificate: " + reason
+    case NetTls.ExclusiveCaCertificateUnusable(reason) -> "TLS CA certificate: " + reason
+    case NetTls.ClientKeyWithoutCertificate -> "TLS client certificate and key: the certificate is missing"
+    case NetTls.ClientCertificateWithoutKey -> "TLS client certificate and key: the key is missing"
+    case NetTls.ClientIdentityUnusable(reason) -> "TLS client certificate and key: " + reason
   }
 }
 
@@ -409,28 +436,10 @@ func checkIdentityPem(certPem: in String, keyPem: in String): Result[Unit, Redis
 /// client run the same check.
 @experimental
 pub func checkTls(cfg: in RedisConfig): Result[Unit, RedisError] {
-  val t = cfg.tls
-  if not t.enabled {
-    if hasTlsDetails(t) {
-      return Err(
-        InvalidConfig(message = "TLS options are set but the connection is not TLS: use a rediss:// URL or withTls")
-      )
-    }
-    return Ok(())
+  match NetTls.validateTlsOptions(netTlsOptions(cfg.tls)) {
+    case Ok(_) -> Ok(())
+    case Err(problem) -> Err(InvalidConfig(message = tlsProblemMessage(problem)))
   }
-  if t.caCertificatePem.length > 0 {
-    match checkCaPem(t.caCertificatePem) {
-      case Err(e) -> return Err(e)
-      case Ok(_) -> ()
-    }
-  }
-  if t.clientCertificatePem.length > 0 {
-    match checkIdentityPem(t.clientCertificatePem, t.clientKeyPem) {
-      case Err(e) -> return Err(e)
-      case Ok(_) -> ()
-    }
-  }
-  Ok(())
 }
 
 /// Whether verification is really off for a client of `cfg`, given whether
@@ -442,47 +451,34 @@ pub func insecurePolicyFor(cfg: in RedisConfig, envAllows: in Bool): Http.Insecu
   Http.resolveInsecureVerifyPolicy(cfg.tls.insecureSkipVerify, envAllows)
 }
 
-// The kernel's TLS state for `cfg`, built once per client; `None` for a plain
-// connection.
-func prepareTls(cfg: in RedisConfig): Result[Option[Kernel.TlsClient], RedisError] {
+// What a client's TLS handshakes use, decided once per client.
+record TlsPlan {
+  options: NetTls.TlsOptions
+  // The insecure policy as it stood when the client first connected.
+  skipVerify: Bool
+}
+
+// The TLS plan of `cfg`; `None` for a plain connection.
+func prepareTls(cfg: in RedisConfig): Result[Option[TlsPlan], RedisError] {
   match checkTls(cfg) {
     case Err(e) -> return Err(e)
     case Ok(_) -> ()
   }
-  val t = cfg.tls
-  if not t.enabled {
+  if not cfg.tls.enabled {
     return Ok(None)
   }
-  val skipVerify = match insecurePolicyFor(cfg, Env.getVarOrDefault(insecureAllowEnvVar, "") == "1") {
+  val skipVerify = match insecurePolicyFor(cfg, NetTls.insecureAllowedByEnvironment()) {
     case VerificationDisabled -> true
     case VerificationEnabled -> false
     case VerificationEnabledWarn -> {
       Console.error(
-        "[Redis] warning: withInsecureSkipVerify() requested but " + insecureAllowEnvVar +
+        "[Redis] warning: withInsecureSkipVerify() requested but " + NetTls.insecureAllowEnvName() +
           " is not set; TLS certificate verification remains ENABLED."
       )
       false
     }
   }
-  val settings = Kernel.TlsSettings(
-    caPem = t.caCertificatePem,
-    certPem = t.clientCertificatePem,
-    keyPem = t.clientKeyPem,
-    tls13Only = match t.minVersion { case Tls13 -> true; case Tls12 -> false },
-    skipVerify = skipVerify
-  )
-  match Kernel.tlsPrepare(settings) {
-    case Ok(client) -> Ok(Some(value = client))
-    case Err(m) -> Err(InvalidConfig(message = "TLS: " + m))
-  }
-}
-
-func tlsServerName(cfg: in RedisConfig): String {
-  if cfg.tls.serverName.length > 0 {
-    cfg.tls.serverName
-  } else {
-    cfg.host
-  }
+  Ok(Some(value = TlsPlan(options = netTlsOptions(cfg.tls), skipVerify = skipVerify)))
 }
 
 // ─── Wire exchange ───────────────────────────────────────────────────────────
@@ -496,8 +492,34 @@ union Exchange {
   case Broken(error: RedisError, notExecuted: Bool)
 }
 
+// How long one read waits when the configuration sets no limit; the read is
+// then repeated.
+val unboundedReadSliceMs: Int = 60000
+
+// The next bytes from the server; an empty slice means it closed the
+// connection. `ioTimeoutMs = 0` waits without limit.
+func readChunk(sock: in Tcp.Sock, ioTimeoutMs: in Int): Result[slice[Byte], String] {
+  val wait = if ioTimeoutMs > 0 { ioTimeoutMs } else { unboundedReadSliceMs }
+  while true {
+    match Tcp.sockRead(sock, readChunkBytes, wait) {
+      case Err(m) -> return Err(m)
+      case Ok(Tcp.Data(bytes)) -> return Ok(bytes)
+      case Ok(Tcp.Eof) -> {
+        val closed: slice[Byte] = []
+        return Ok(closed)
+      }
+      case Ok(Tcp.TimedOut) -> {
+        if ioTimeoutMs > 0 {
+          return Err("timed out: the server sent nothing for " + ioTimeoutMs.toString() + " ms")
+        }
+      }
+    }
+  }
+  Err("unreachable")
+}
+
 // Read one reply, skipping RESP3 push messages, which may arrive at any time.
-func readReply(sock: in Kernel.Sock, pending: in slice[Byte]): Exchange {
+func readReply(sock: in Tcp.Sock, pending: in slice[Byte], ioTimeoutMs: in Int): Exchange {
   var buf = pending
   var received = false
   while true {
@@ -513,7 +535,7 @@ func readReply(sock: in Kernel.Sock, pending: in slice[Byte]): Exchange {
       }
       case Malformed(m) -> return Broken(error = ProtocolViolation(message = m), notExecuted = false)
       case Incomplete -> {
-        match Kernel.sockRead(sock, readChunkBytes) {
+        match readChunk(sock, ioTimeoutMs) {
           case Err(m) -> return Broken(error = ConnectionLost(message = m), notExecuted = false)
           case Ok(chunk) -> {
             if chunk.length == 0 {
@@ -532,10 +554,10 @@ func readReply(sock: in Kernel.Sock, pending: in slice[Byte]): Exchange {
   Broken(error = ConnectionLost(message = "unreachable"), notExecuted = false)
 }
 
-func exchange(sock: in Kernel.Sock, pending: in slice[Byte], request: in slice[Byte]): Exchange {
-  match Kernel.sockWrite(sock, request) {
+func exchange(sock: in Tcp.Sock, pending: in slice[Byte], request: in slice[Byte], ioTimeoutMs: in Int): Exchange {
+  match Tcp.sockWriteWithin(sock, request, ioTimeoutMs) {
     case Err(m) -> Broken(error = ConnectionLost(message = m), notExecuted = true)
-    case Ok(_) -> readReply(sock, pending)
+    case Ok(_) -> readReply(sock, pending, ioTimeoutMs)
   }
 }
 
@@ -548,7 +570,7 @@ func bytesOfArgs(args: in slice[String]): slice[slice[Byte]] {
 }
 
 // AUTH / HELLO and SELECT on a new connection. Anything but success closes it.
-func handshake(sock: in Kernel.Sock, cfg: in RedisConfig): Result[slice[Byte], RedisError] {
+func handshake(sock: in Tcp.Sock, cfg: in RedisConfig): Result[slice[Byte], RedisError] {
   var pending: slice[Byte] = []
   val steps: List[slice[String]] = newList()
   val hasPassword = cfg.password.length > 0
@@ -571,7 +593,7 @@ func handshake(sock: in Kernel.Sock, cfg: in RedisConfig): Result[slice[Byte], R
   }
   for step in steps {
     val name: String = step[0]
-    match exchange(sock, pending, Resp.encodeCommand(step)) {
+    match exchange(sock, pending, Resp.encodeCommand(step), cfg.ioTimeoutMs) {
       case Broken(e, _) -> return Err(e)
       case Replied(value, rest) -> {
         pending = rest
@@ -600,13 +622,13 @@ func isAuthError(m: in String): Bool {
 }
 
 // Dial, and run the TLS handshake when `tls` is set.
-func dial(cfg: in RedisConfig, tls: in Option[Kernel.TlsClient]): Result[Kernel.Sock, RedisError] {
+func dial(cfg: in RedisConfig, tls: in Option[TlsPlan]): Result[Tcp.Sock, RedisError] {
   val endpoint = cfg.host + ":" + cfg.port.toString() + ": "
-  match Kernel.sockConnect(cfg.host, cfg.port, cfg.connectTimeoutMs, cfg.ioTimeoutMs) {
+  match Tcp.sockConnect(cfg.host, cfg.port, cfg.connectTimeoutMs) {
     case Err(m) -> Err(ConnectFailed(message = endpoint + m))
     case Ok(plain) -> match tls {
       case None -> Ok(plain)
-      case Some(t) -> match Kernel.sockStartTls(plain, t, tlsServerName(cfg), cfg.port) {
+      case Some(plan) -> match Tcp.sockStartTls(plain, plan.options, cfg.host, plan.skipVerify, cfg.ioTimeoutMs) {
         case Ok(encrypted) -> Ok(encrypted)
         case Err(m) -> Err(TlsFailed(message = endpoint + m))
       }
@@ -614,13 +636,13 @@ func dial(cfg: in RedisConfig, tls: in Option[Kernel.TlsClient]): Result[Kernel.
   }
 }
 
-func openLink(cfg: in RedisConfig, tls: in Option[Kernel.TlsClient]): Result[Link, RedisError] {
+func openLink(cfg: in RedisConfig, tls: in Option[TlsPlan]): Result[Link, RedisError] {
   match dial(cfg, tls) {
     case Err(e) -> Err(e)
     case Ok(sock) -> match handshake(sock, cfg) {
       case Ok(pending) -> Ok(Link(sock = sock, pending = pending))
       case Err(e) -> {
-        Kernel.sockClose(sock)
+        Tcp.sockClose(sock)
         Err(e)
       }
     }
@@ -628,7 +650,7 @@ func openLink(cfg: in RedisConfig, tls: in Option[Kernel.TlsClient]): Result[Lin
 }
 
 record Link {
-  sock: Kernel.Sock
+  sock: Tcp.Sock
   pending: slice[Byte]
 }
 
@@ -648,13 +670,13 @@ pub protected type RedisClient {
   var link: Option[Link] = None
   var closed: Bool = false
   var connectCount: Int = 0
-  // The parsed TLS state, built by the first connection and kept for the
-  // client's life.
+  // The TLS plan, made by the first connection and kept for the client's
+  // life.
   var tlsReady: Bool = false
-  var tls: Option[Kernel.TlsClient] = None
+  var tls: Option[TlsPlan] = None
   func dropLink(): Unit {
     match link {
-      case Some(l) -> Kernel.sockClose(l.sock)
+      case Some(l) -> Tcp.sockClose(l.sock)
       case None -> ()
     }
     link = None
@@ -705,7 +727,7 @@ pub protected type RedisClient {
       val reused = match link { case Some(_) -> true; case None -> false }
       match currentLink() {
         case Err(e) -> return Err(e)
-        case Ok(l) -> match exchange(l.sock, l.pending, request) {
+        case Ok(l) -> match exchange(l.sock, l.pending, request, config.ioTimeoutMs) {
           case Replied(value, rest) -> {
             link = Some(value = Link(sock = l.sock, pending = rest))
             return replyResult(value)
@@ -742,7 +764,7 @@ pub protected type RedisClient {
     match currentLink() {
       case Err(e) -> return Err(e)
       case Ok(l) -> {
-        match Kernel.sockWrite(l.sock, request) {
+        match Tcp.sockWriteWithin(l.sock, request, config.ioTimeoutMs) {
           case Err(m) -> {
             dropLink()
             return Err(ConnectionLost(message = m))
@@ -753,7 +775,7 @@ pub protected type RedisClient {
         var pending: slice[Byte] = l.pending
         var i = 0
         while i < commands.length {
-          match readReply(l.sock, pending) {
+          match readReply(l.sock, pending, config.ioTimeoutMs) {
             case Replied(value, rest) -> {
               replies.add(value)
               pending = rest

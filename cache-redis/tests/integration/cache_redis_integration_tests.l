@@ -33,7 +33,7 @@ import Cache
 import Cache.Redis as RedisCache
 import Cache.Redis.Extras as Extras
 import Redis as RedisLib
-import Redis.Kernel as Kernel
+import Net.Tcp.Testing as KT
 import Testing.Conformance
 import Testing.Conformance.Cache as CacheConformance
 
@@ -345,15 +345,15 @@ func writeMany(store: in RedisCache.RedisCacheStore, worker: in Int, count: in I
 
 test "one store shared by six threads stores every entry" {
   val store = storeWith(RedisCache.options(freshPrefix()))
-  val workers: List[Kernel.Background] = newList()
+  val workers: List[KT.Background] = newList()
   var w = 0
   while w < 6 {
     val id = w
-    workers.add(Kernel.startBackground({ -> writeMany(store, id, 100) }))
+    workers.add(KT.startBackground({ -> writeMany(store, id, 100) }))
     w = w + 1
   }
   for worker in workers {
-    Kernel.waitBackground(worker)
+    KT.waitBackground(worker)
   }
   assertEqualInt(store.errors.errorCount(), 0, "no write failed")
   assertEqualInt(ok(Extras.entryCount(store), "entryCount"), 600, "every write landed")

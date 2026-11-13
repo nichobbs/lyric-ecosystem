@@ -24,7 +24,7 @@ import Std.Time
 import Std.Uuid
 import Redis
 import Redis.Resp
-import Redis.Kernel as Kernel
+import Net.Tcp.Testing as KT
 
 func serverUrl(): String {
   val url = Env.getVarOrDefault("LYRIC_REDIS_URL", "")
@@ -500,14 +500,14 @@ test "one client shared by eight threads loses no command" {
   val c = client()
   val k = key("threads")
   val failures: List[String] = newList()
-  val workers: List[Kernel.Background] = newList()
+  val workers: List[KT.Background] = newList()
   var t = 0
   while t < 8 {
-    workers.add(Kernel.startBackground({ -> incrementMany(c, k, 250, failures) }))
+    workers.add(KT.startBackground({ -> incrementMany(c, k, 250, failures) }))
     t = t + 1
   }
   for w in workers {
-    Kernel.waitBackground(w)
+    KT.waitBackground(w)
   }
   assertEqualInt(failures.count, 0, "no command failed")
   expectSome(Redis.get(c, k), "2000", "every increment was applied exactly once")

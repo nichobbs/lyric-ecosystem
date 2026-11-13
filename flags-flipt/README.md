@@ -382,7 +382,7 @@ temporary directory and a random bootstrap token.
 - `Admin` does not manage segments, rules, distributions or rollouts.
 - Flipt v2 (Git-native storage, `/api/v2`) is not supported.
 - Compiler problems found while writing this package, none worked around in a way that changes
-  behaviour; issues are to be filed in `nichobbs/lyric-lang`:
+  behaviour (nichobbs/lyric-lang#9069):
   - dotnet: an enum is miscompiled in a package that is listed in `[project.packages]` before the
     package that declares it (reading a record field of that enum type is an
     `InvalidProgramException`, a `match` on it a `TypeLoadException`). `lyric.toml` lists the

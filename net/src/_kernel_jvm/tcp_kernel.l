@@ -1,5 +1,5 @@
-//! Mq.RabbitMq.Kernel (jvm) - the socket boundary of the AMQP client on
-//! `--target jvm`.
+//! Net.Tcp.Kernel (jvm) - the socket boundary of `Net.Tcp` on
+//! `--target jvm`. Use `Net.Tcp`, not this package.
 //!
 //! `java.net.Socket` / `java.net.ServerSocket` and their streams,
 //! `javax.net.ssl.SSLSocket` for TLS, a `ReentrantLock`, `System.nanoTime` and
@@ -18,7 +18,7 @@
 //! and, when no chunk gets through in time, ends by closing the socket.
 //! Certificates and keys are loaded from PEM by the standard library's
 //! `Std.TlsHost`. The server side (`sockAcceptTls`) exists for the in-process
-//! broker of the hermetic tests.
+//! servers of hermetic tests (`Net.Tcp.Testing`).
 //!
 //! A few JDK calls go through `java.lang.reflect` (the idiom of the standard
 //! library's `_kernel_jvm/http_host.l`): the auto-FFI cannot pass a typed
@@ -27,13 +27,13 @@
 //! `TrustManagerFactory.init`, `KeyManagerFactory.init`, `SSLContext.init` and
 //! `SSLParameters.setProtocols` need one or the other.
 //!
-//! The dotnet twin (`src/_kernel_dotnet/socket_kernel.l`) declares the same
+//! The dotnet twin (`src/_kernel_dotnet/tcp_kernel.l`) declares the same
 //! package with the same public surface; a file-level `@cfg(target = ...)`
 //! leaves exactly one of them in a build.
 @axiom("the host socket, thread, lock and clock primitives conform to their documented platform contracts")
 @cfg(target = "jvm")
 @io
-package Mq.RabbitMq.Kernel
+package Net.Tcp.Kernel
 
 import Std.Core
 import Std.Collections
@@ -139,8 +139,8 @@ pub union ReadOutcome {
   case Eof
 }
 
-/// A bound, listening TCP socket (the loopback AMQP peer of the hermetic
-/// tests; the client itself never listens).
+/// A bound, listening TCP socket (the loopback peer of hermetic tests; a
+/// client never listens).
 pub record ServerSock {
   server: JServerSocket
 }
@@ -524,7 +524,7 @@ func trustEverythingManagers(): JObject {
   val classClass: JClass = JClass.forName("java.lang.Class")
   val interfaces: JObject = JReflectArray.newInstance(classClass, 1)
   JReflectArray.set(interfaces, 0, managerClass)
-  val handler: JInvocationHandler = TrustEverything(label = "Mq.RabbitMq.Kernel.TrustEverything")
+  val handler: JInvocationHandler = TrustEverything(label = "Net.Tcp.Kernel.TrustEverything")
   val arguments: List[JObject] = newList()
   arguments.add(externAsObject(loader))
   arguments.add(interfaces)

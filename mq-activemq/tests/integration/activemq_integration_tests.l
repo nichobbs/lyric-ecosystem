@@ -38,7 +38,8 @@ import Testing.Conformance.Mq as MqConformance
 import Mq
 import Mq.ActiveMq as ActiveMq
 import Mq.ActiveMq.Extras as Extras
-import Mq.ActiveMq.Kernel as K
+import Net.Tcp as K
+import Net.Tcp.Testing as KT
 import Mq.ActiveMq.Stomp as Stomp
 import Mq.ActiveMq.Url as Url
 
@@ -183,9 +184,9 @@ test "connectUrl reaches the broker named by the URL" {
 }
 
 test "a refused connection is an Err" {
-  val server = match K.serverListen("127.0.0.1", 0) { case Ok(s) -> s; case Err(e) -> panic(e) }
-  val port = K.serverPort(server)
-  K.serverClose(server)
+  val server = match KT.serverListen("127.0.0.1", 0) { case Ok(s) -> s; case Err(e) -> panic(e) }
+  val port = KT.serverPort(server)
+  KT.serverClose(server)
   match ActiveMq.connectWith(ActiveMq.defaultOptions("127.0.0.1", port, "/queue/a")) {
     case Ok(_) -> assertTrue(false, "nothing listens there")
     case Err(e) -> expectContains(e, "activemq: cannot connect to 127.0.0.1:" + port.toString(), "refused")
@@ -903,10 +904,10 @@ test "two consumers on their own threads share a queue without loss or duplicati
   }
   val leftGot = Got(messages = newList())
   val rightGot = Got(messages = newList())
-  val leftWork = K.startBackground({ -> drain(left, leftGot) })
-  val rightWork = K.startBackground({ -> drain(right, rightGot) })
-  K.waitBackground(leftWork)
-  K.waitBackground(rightWork)
+  val leftWork = KT.startBackground({ -> drain(left, leftGot) })
+  val rightWork = KT.startBackground({ -> drain(right, rightGot) })
+  KT.waitBackground(leftWork)
+  KT.waitBackground(rightWork)
   val seen: Map[String, Bool] = newMap()
   for m in leftGot.messages.toArray() {
     seen[m.id] = true

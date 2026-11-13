@@ -47,7 +47,8 @@ import Testing.Conformance.Mq as MqConformance
 import Mq
 import Mq.ActiveMq as ActiveMq
 import Mq.ActiveMq.Extras as Extras
-import Mq.ActiveMq.Kernel as K
+import Net.Tcp as K
+import Net.Tcp.Testing as KT
 import Mq.ActiveMq.Stomp as Stomp
 
 // ─── The fake broker ─────────────────────────────────────────────────────────
@@ -64,10 +65,10 @@ record Stored {
 }
 
 ref record FakeBroker {
-  server: K.ServerSock
+  server: KT.ServerSock
   // Whether every accepted connection starts with a TLS handshake.
   secured: Bool
-  tls: K.ServerTls
+  tls: KT.ServerTls
   lock: K.Lock
   var queues: Map[String, List[Stored]]
   var counter: Int
@@ -411,7 +412,7 @@ func serveAccepted(b: in FakeBroker, accepted: in K.Sock): Unit {
     serve(b, accepted)
     return
   }
-  match K.sockAcceptTls(accepted, b.tls, 5000) {
+  match KT.sockAcceptTls(accepted, b.tls, 5000) {
     case Ok(sock) -> serve(b, sock)
     case Err(_) -> ()
   }
@@ -420,9 +421,9 @@ func serveAccepted(b: in FakeBroker, accepted: in K.Sock): Unit {
 func acceptLoop(b: in FakeBroker): Unit {
   var listening = true
   while listening {
-    match K.serverAccept(b.server) {
+    match KT.serverAccept(b.server) {
       case Ok(sock) -> {
-        val _ = K.startBackground({ -> serveAccepted(b, sock) })
+        val _ = KT.startBackground({ -> serveAccepted(b, sock) })
       }
       case Err(_) -> {
         listening = false
@@ -431,18 +432,18 @@ func acceptLoop(b: in FakeBroker): Unit {
   }
 }
 
-func startBrokerWith(secured: in Bool, tls: in K.ServerTls): FakeBroker {
-  val server = match K.serverListen("127.0.0.1", 0) {
+func startBrokerWith(secured: in Bool, tls: in KT.ServerTls): FakeBroker {
+  val server = match KT.serverListen("127.0.0.1", 0) {
     case Ok(s) -> s
     case Err(e) -> panic("the fake broker cannot listen: " + e)
   }
   val b = FakeBroker(server = server, secured = secured, tls = tls, lock = K.newLock(), queues = newMap(), counter = 0)
-  val _ = K.startBackground({ -> acceptLoop(b) })
+  val _ = KT.startBackground({ -> acceptLoop(b) })
   b
 }
 
-func serverTls(clientCaPem: in String): K.ServerTls {
-  K.ServerTls(certPem = TEST_ONLY_SERVER_CERT, keyPem = TEST_ONLY_SERVER_KEY, clientCaPem = clientCaPem)
+func serverTls(clientCaPem: in String): KT.ServerTls {
+  KT.ServerTls(certPem = TEST_ONLY_SERVER_CERT, keyPem = TEST_ONLY_SERVER_KEY, clientCaPem = clientCaPem)
 }
 
 // One broker of each kind for the whole module, started by the first test
@@ -458,11 +459,11 @@ val slot: BrokerSlot = BrokerSlot(broker = None, tlsBroker = None, mutualTlsBrok
 
 func brokerPort(): Int {
   match slot.broker {
-    case Some(b) -> K.serverPort(b.server)
+    case Some(b) -> KT.serverPort(b.server)
     case None -> {
       val b = startBrokerWith(false, serverTls(""))
       slot.broker = Some(value = b)
-      K.serverPort(b.server)
+      KT.serverPort(b.server)
     }
   }
 }
@@ -470,11 +471,11 @@ func brokerPort(): Int {
 // The broker behind TLS (server certificate only).
 func tlsBrokerPort(): Int {
   match slot.tlsBroker {
-    case Some(b) -> K.serverPort(b.server)
+    case Some(b) -> KT.serverPort(b.server)
     case None -> {
       val b = startBrokerWith(true, serverTls(""))
       slot.tlsBroker = Some(value = b)
-      K.serverPort(b.server)
+      KT.serverPort(b.server)
     }
   }
 }
@@ -482,11 +483,11 @@ func tlsBrokerPort(): Int {
 // The broker behind TLS that requires a client certificate from the CA.
 func mutualTlsBrokerPort(): Int {
   match slot.mutualTlsBroker {
-    case Some(b) -> K.serverPort(b.server)
+    case Some(b) -> KT.serverPort(b.server)
     case None -> {
       val b = startBrokerWith(true, serverTls(TEST_ONLY_CA))
       slot.mutualTlsBroker = Some(value = b)
-      K.serverPort(b.server)
+      KT.serverPort(b.server)
     }
   }
 }
@@ -585,9 +586,9 @@ test "connecting reports the broker's server header and destination" {
 }
 
 test "a refused connection is an Err naming the endpoint" {
-  val server = match K.serverListen("127.0.0.1", 0) { case Ok(s) -> s; case Err(e) -> panic(e) }
-  val port = K.serverPort(server)
-  K.serverClose(server)
+  val server = match KT.serverListen("127.0.0.1", 0) { case Ok(s) -> s; case Err(e) -> panic(e) }
+  val port = KT.serverPort(server)
+  KT.serverClose(server)
   match ActiveMq.connectWith(ActiveMq.defaultOptions("127.0.0.1", port, "/queue/a")) {
     case Ok(_) -> assertTrue(false, "nothing listens there")
     case Err(e) -> expectContains(e, "activemq: cannot connect to 127.0.0.1:" + port.toString(), "refused")
@@ -1312,14 +1313,14 @@ test "consume does not wait past its timeout for the connection's lock" {
   val base = optionsFor(freshName())
   val q = open(base.copy(requestTimeoutMs = 10000))
   expectTimeout(q, "subscribe")
-  val publisher = K.startBackground({ -> publishSlowly(q) })
+  val publisher = KT.startBackground({ -> publishSlowly(q) })
   K.sleepMs(300)
   val started = K.monotonicMillis()
   val e = errorOf(q.consume(100, { m -> Ok(()) }), "a consume while a publish holds the connection")
   val elapsed = K.monotonicMillis() - started
   assertEqual(e, "timeout", "the consume times out")
   assertTrue(elapsed < 1500i64, "consume(100) returned after " + elapsed.toString() + " ms")
-  K.waitBackground(publisher)
+  KT.waitBackground(publisher)
   q.close()
 }
 
@@ -1415,112 +1416,12 @@ test "connectFromEnv reads the undeliverable policy" {
   Env.setVar(prefix + "ONUNDELIVERABLE", "")
 }
 
-// A peer that sends `text` in `pieces` writes, `pauseMs` apart.
-func dribble(server: in K.ServerSock, secured: in Bool, text: in String, pieces: in Int, pauseMs: in Int): Unit {
-  val accepted = match K.serverAccept(server) { case Ok(s) -> s; case Err(_) -> return }
-  val sock = if secured {
-    match K.sockAcceptTls(accepted, serverTls(""), 5000) {
-      case Ok(s) -> s
-      case Err(_) -> return
-    }
-  } else {
-    accepted
-  }
-  val bytes = encodeUtf8(text)
-  val step = bytes.length / pieces
-  var n = 0
-  while n < pieces {
-    val stop = if n == pieces - 1 { bytes.length } else { (n + 1) * step }
-    val _ = K.sockWrite(sock, bytes.slice(n * step, stop))
-    K.sleepMs(pauseMs)
-    n += 1
-  }
-  K.sockClose(sock)
-}
-
-// Read with `waitMs` per call until the peer closes; every byte must come
-// through, in order, whatever the read timeouts cut across.
-func readDribble(secured: in Bool, waitMs: in Int, pauseMs: in Int, label: in String): Unit {
-  val polling = waitMs < pauseMs / 2
-  val server = match K.serverListen("127.0.0.1", 0) { case Ok(s) -> s; case Err(e) -> panic(e) }
-  val text = filler(40) + "|" + filler(700) + "|end"
-  val peer = K.startBackground({ -> dribble(server, secured, text, 12, pauseMs) })
-  val plain = match K.sockConnect("127.0.0.1", K.serverPort(server), 5000) { case Ok(s) -> s; case Err(e) -> panic(e) }
-  val sock = if secured {
-    val tls = K.ClientTls(
-      serverName = "localhost",
-      caPem = TEST_ONLY_CA,
-      exclusiveCa = true,
-      certPem = "",
-      keyPem = "",
-      tls13Only = false,
-      skipVerify = false
-    )
-    match K.sockStartTls(plain, tls, 5000) {
-      case Ok(s) -> s
-      case Err(e) -> panic(label + ": handshake: " + e)
-    }
-  } else {
-    plain
-  }
-  val got: List[Byte] = newList()
-  var timeouts = 0
-  var open = true
-  val giveUp = K.monotonicMillis() + 30000i64
-  while open and K.monotonicMillis() < giveUp {
-    match K.sockRead(sock, 7, waitMs) {
-      case Ok(Data(bytes)) -> {
-        for b in bytes {
-          got.add(b)
-        }
-      }
-      case Ok(TimedOut) -> {
-        timeouts += 1
-      }
-      case Ok(Eof) -> {
-        open = false
-      }
-      case Err(e) -> {
-        assertTrue(false, label + ": read failed: " + e)
-        open = false
-      }
-    }
-  }
-  assertTrue(not open, label + ": the peer's close was seen")
-  val received = match tryDecodeUtf8(got.toArray()) { case Some(t) -> t; case None -> "<not UTF-8>" }
-  assertTrue(
-    received == text,
-    label + ": " + got.count.toString() + " bytes after " + timeouts.toString() + " timeouts"
-  )
-  if polling {
-    assertTrue(timeouts > 0, label + ": the reads did time out between the pieces")
-  }
-  match K.sockRead(sock, 7, waitMs) {
-    case Ok(Eof) -> ()
-    case _ -> assertTrue(false, label + ": the end of the stream is reported again")
-  }
-  K.sockClose(sock)
-  K.waitBackground(peer)
-  K.serverClose(server)
-}
-
-test "bytes sent in pieces across read timeouts all arrive, in order, over plain TCP and TLS" {
-  // Waits shorter than, equal to and longer than the pause between pieces,
-  // so reads expire before, while and after a piece arrives.
-  readDribble(false, 1, 30, "plain, polling")
-  readDribble(false, 30, 30, "plain, wait equal to the pause")
-  readDribble(false, 45, 30, "plain, wait longer than the pause")
-  readDribble(true, 1, 30, "TLS, polling")
-  readDribble(true, 30, 30, "TLS, wait equal to the pause")
-  readDribble(true, 45, 30, "TLS, wait longer than the pause")
-}
-
 // A peer that sends `first`, then closes the connection at once, without a
 // TLS shutdown when it is TLS.
-func sayAndHangUp(server: in K.ServerSock, secured: in Bool, first: in slice[Byte]): Unit {
-  val accepted = match K.serverAccept(server) { case Ok(s) -> s; case Err(_) -> return }
+func sayAndHangUp(server: in KT.ServerSock, secured: in Bool, first: in slice[Byte]): Unit {
+  val accepted = match KT.serverAccept(server) { case Ok(s) -> s; case Err(_) -> return }
   val sock = if secured {
-    match K.sockAcceptTls(accepted, serverTls(""), 5000) {
+    match KT.sockAcceptTls(accepted, serverTls(""), 5000) {
       case Ok(s) -> s
       case Err(_) -> return
     }
@@ -1536,13 +1437,13 @@ func sayAndHangUp(server: in K.ServerSock, secured: in Bool, first: in slice[Byt
 }
 
 func loginAgainst(secured: in Bool, first: in slice[Byte]): String {
-  val server = match K.serverListen("127.0.0.1", 0) { case Ok(s) -> s; case Err(e) -> panic(e) }
-  val peer = K.startBackground({ -> sayAndHangUp(server, secured, first) })
-  val base = ActiveMq.defaultOptions("127.0.0.1", K.serverPort(server), "/queue/a")
+  val server = match KT.serverListen("127.0.0.1", 0) { case Ok(s) -> s; case Err(e) -> panic(e) }
+  val peer = KT.startBackground({ -> sayAndHangUp(server, secured, first) })
+  val base = ActiveMq.defaultOptions("127.0.0.1", KT.serverPort(server), "/queue/a")
   val options = base.copy(login = "lyric", passcode = "hunter2", requestTimeoutMs = 5000)
   val e = errorOfConnect(if secured { options.withTls().withExclusiveCaCertificate(TEST_ONLY_CA) } else { options })
-  K.waitBackground(peer)
-  K.serverClose(server)
+  KT.waitBackground(peer)
+  KT.serverClose(server)
   assertTrue(not Str.contains(e, "hunter2"), "the passcode is not echoed: " + e)
   e
 }
@@ -1601,7 +1502,7 @@ test "a busy thread pool does not delay connecting, publishing or consuming" {
   val flag = Flag(done = false)
   var n = 0
   while n < 64 {
-    val _ = K.startPoolWork({ -> idleUntil(flag) })
+    val _ = KT.startPoolWork({ -> idleUntil(flag) })
     n += 1
   }
   K.sleepMs(200)
@@ -1622,7 +1523,7 @@ func publishMany(q: in ActiveMq.ActiveMqQueue, count: in Int): Unit {
 test "a publisher thread and a consuming thread share one connection" {
   val q = openFresh()
   val count = 40
-  val publisher = K.startBackground({ -> publishMany(q, count) })
+  val publisher = KT.startBackground({ -> publishMany(q, count) })
   val got = Got(messages = newList())
   var failures = 0
   while got.messages.count < count and failures < 50 {
@@ -1636,7 +1537,7 @@ test "a publisher thread and a consuming thread share one connection" {
       }
     }
   }
-  K.waitBackground(publisher)
+  KT.waitBackground(publisher)
   assertEqualInt(got.messages.count, count, "every message arrived")
   var n = 0
   while n < got.messages.count {

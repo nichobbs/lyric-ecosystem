@@ -40,7 +40,8 @@ import Mq
 import Mq.RabbitMq as RabbitMq
 import Mq.RabbitMq.Extras
 import Mq.RabbitMq.Extras as Extras
-import Mq.RabbitMq.Kernel as K
+import Net.Tcp as K
+import Net.Tcp.Testing as KT
 import Mq.RabbitMq.Amqp as Amqp
 import Mq.RabbitMq.Url as Url
 
@@ -229,9 +230,9 @@ test "connectUrl reaches the broker and virtual host named by the URL" {
 }
 
 test "a refused connection is an Err" {
-  val server = match K.serverListen("127.0.0.1", 0) { case Ok(s) -> s; case Err(e) -> panic(e) }
-  val port = K.serverPort(server)
-  K.serverClose(server)
+  val server = match KT.serverListen("127.0.0.1", 0) { case Ok(s) -> s; case Err(e) -> panic(e) }
+  val port = KT.serverPort(server)
+  KT.serverClose(server)
   val e = connectError(RabbitMq.defaultOptions("127.0.0.1", port, "a"), "nothing listens there")
   expectContains(e, "rabbitmq: cannot connect to 127.0.0.1:" + port.toString(), "refused")
 }
@@ -890,10 +891,10 @@ test "two consumers on their own threads share a queue without loss or duplicati
   }
   val leftGot = Got(messages = newList())
   val rightGot = Got(messages = newList())
-  val leftWork = K.startBackground({ -> drainInto(left, leftGot) })
-  val rightWork = K.startBackground({ -> drainInto(right, rightGot) })
-  K.waitBackground(leftWork)
-  K.waitBackground(rightWork)
+  val leftWork = KT.startBackground({ -> drainInto(left, leftGot) })
+  val rightWork = KT.startBackground({ -> drainInto(right, rightGot) })
+  KT.waitBackground(leftWork)
+  KT.waitBackground(rightWork)
   val seen: Map[String, Bool] = newMap()
   for m in leftGot.messages.toArray() {
     seen[m.id] = true
@@ -925,12 +926,12 @@ test "one connection shared by a consumer thread and two publisher threads loses
   assertTrue(isOk(RabbitMq.subscribe(q)), "consumer")
   val failures = Got(messages = newList())
   val got = Got(messages = newList())
-  val consumer = K.startBackground({ -> drainInto(q, got) })
-  val a = K.startBackground({ -> publishMany(q, "a-", 40, failures) })
-  val b = K.startBackground({ -> publishMany(q, "b-", 40, failures) })
-  K.waitBackground(a)
-  K.waitBackground(b)
-  K.waitBackground(consumer)
+  val consumer = KT.startBackground({ -> drainInto(q, got) })
+  val a = KT.startBackground({ -> publishMany(q, "a-", 40, failures) })
+  val b = KT.startBackground({ -> publishMany(q, "b-", 40, failures) })
+  KT.waitBackground(a)
+  KT.waitBackground(b)
+  KT.waitBackground(consumer)
   assertEqualInt(failures.messages.count, 0, "every publish was confirmed")
   val seen: Map[String, Bool] = newMap()
   for m in got.messages.toArray() {

@@ -260,8 +260,7 @@ run against an Azure storage account.
   (nichobbs/lyric-lang#9048). `stat`'s `contentLength` is therefore asserted only by the
   integration tests.
 - Compiler: an inherited interface `requires:` is enforced on a cross-package implementation on
-  the JVM but not on .NET (see "Surprises"; related to nichobbs/lyric-lang#9043, no issue number
-  of its own yet).
+  the JVM but not on .NET (see "Surprises"; nichobbs/lyric-lang#9043).
 - Compiler: a `pub val` of a library package is not visible to a test module that links the
   library's shared build (`T0020`; `lyric test` falls back to compiling with the library). The
   package exposes its constants as functions (`apiVersion()`, `devAccountKey()`) instead. No issue

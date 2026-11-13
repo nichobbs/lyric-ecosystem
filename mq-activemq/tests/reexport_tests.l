@@ -1,5 +1,6 @@
 //! tests/reexport_tests.l - an application that imports only `Mq.ActiveMq`
-//! can name the interface types, because the backend re-exports `Mq`.
+//! can name the interface types, because the backend re-exports `Mq`, and
+//! the TLS options, because it re-exports `Net.Tls`.
 @test_module
 package Mq.ActiveMq.ReexportTests
 
@@ -18,4 +19,15 @@ test "Message, MessageHeader and the interfaces are visible through the backend"
   val options = defaultOptions("127.0.0.1", 61613, resolveDestination("orders"))
   assertEqual(options.destination, "/queue/orders", "the backend's own names")
   assertTrue(options.persistent, "persistent by default")
+}
+
+test "TlsOptions and its functions are visible through the backend" {
+  val plain: TlsOptions = plainTcp()
+  assertTrue(not plain.enabled, "plainTcp")
+  val options = defaultOptions("127.0.0.1", 1, "orders").withTls().withTlsServerName("broker.internal")
+  assertTrue(options.tls.enabled, "ConnectOptions.withTls")
+  assertEqual(options.tls.serverName, "broker.internal", "ConnectOptions.withTlsServerName")
+  assertEqual(options.tls.withCaCertificate("pem").caCertificatePem, "pem", "TlsOptions.withCaCertificate")
+  assertTrue(not skipsVerification(options.tls), "skipsVerification")
+  assertEqual(INSECURE_ALLOW_ENV, "LYRIC_TLS_ALLOW_INSECURE", "the variable's name")
 }

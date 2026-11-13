@@ -1,11 +1,11 @@
-//! Mq.RabbitMq.Kernel (dotnet) - the socket boundary of the AMQP client on
-//! `--target dotnet`.
+//! Net.Tcp.Kernel (dotnet) - the socket boundary of `Net.Tcp` on
+//! `--target dotnet`. Use `Net.Tcp`, not this package.
 //!
 //! `System.Net.Sockets.TcpClient` / `TcpListener`, `System.Net.Security.SslStream`
 //! for TLS, a monitor lock, a monotonic clock and a background thread. Every
 //! operation returns a `Result` with the failure text; nothing throws.
 //!
-//! `Std.TcpHost` is not used: an AMQP consumer has to tell "nothing arrived
+//! `Std.TcpHost` is not used: a protocol client has to tell "nothing arrived
 //! within the wait" from "the connection failed", and `Std.TcpHost` reports a
 //! receive timeout as the same `TransportFailed` as a reset. Here each
 //! connection that is read from has a reader thread of its own, which does
@@ -38,15 +38,16 @@
 //! is the chain policy with `X509VerificationFlags.AllFlags`, which also
 //! carries `IgnoreInvalidName`. Certificates and keys are loaded from PEM by
 //! the standard library's `Std.TlsHost`. The server side
-//! (`sockAcceptTls`) exists for the in-process broker of the hermetic tests.
+//! (`sockAcceptTls`) exists for the in-process servers of hermetic tests
+//! (`Net.Tcp.Testing`).
 //!
-//! The JVM twin (`src/_kernel_jvm/socket_kernel.l`) declares the same package
+//! The JVM twin (`src/_kernel_jvm/tcp_kernel.l`) declares the same package
 //! with the same public surface; a file-level `@cfg(target = ...)` leaves
 //! exactly one of them in a build.
 @axiom("the host socket, thread, lock and clock primitives conform to their documented platform contracts")
 @cfg(target = "dotnet")
 @io
-package Mq.RabbitMq.Kernel
+package Net.Tcp.Kernel
 
 import Std.Core
 import Std.Encoding
@@ -419,8 +420,8 @@ pub union ReadOutcome {
   case Eof
 }
 
-/// A bound, listening TCP socket (the loopback AMQP peer of the hermetic
-/// tests; the client itself never listens).
+/// A bound, listening TCP socket (the loopback peer of hermetic tests; a
+/// client never listens).
 pub record ServerSock {
   listener: TcpListener
 }

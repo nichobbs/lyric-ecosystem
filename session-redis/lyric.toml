@@ -32,3 +32,5 @@ integration = []   # run tests/integration against the servers named by LYRIC_RE
 "Lyric.Testing"  = { workspace = true }
 "Lyric.Session"  = { workspace = true }
 "Lyric.Redis"   = { workspace = true }
+# The tests use its listening sockets and background threads (Net.Tcp.Testing).
+"Lyric.Net"     = { workspace = true }

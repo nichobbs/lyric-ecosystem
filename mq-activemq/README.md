@@ -258,7 +258,7 @@ full STOMP destination taken as written (`/queue/NAME`, `/topic/NAME`). An empty
 | `requestTimeoutMs` | 10000 | how long to wait for the broker to confirm a frame, and how long a write may make no progress because the broker is not reading; at least 1 |
 | `maxFrameBytes` | 16777216 (16 MiB) | largest message body accepted from the broker, in bytes, inclusive; at least 1. A larger message is undeliverable (next row); the connection stays usable. |
 | `onUndeliverable` | `UndeliverablePolicy.LeaveUnacknowledged` | what `consume` does with a message it cannot hand to a handler: `LeaveUnacknowledged` leaves it on the broker, `RejectToBroker` sends `NACK` (dead-letter queue if persistent, discarded if not). Either way `consume` returns an `Err`. See "Surprises". |
-| `tls` | `plainTcp()` | `TlsOptions`, set with the functions below |
+| `tls` | `plainTcp()` | `TlsOptions` (`Net.Tls`, re-exported by `Mq.ActiveMq`), set with the functions below |
 
 TLS options. The function names and the rule for skipping verification are those of
 `Std.Http.HttpClientBuilder` (docs/61 in lyric-lang):
@@ -751,35 +751,17 @@ The other packages:
 | `src/extras.l` | `Mq.ActiveMq.Extras` | topics, delivery options, selectors |
 | `src/stomp.l` | `Mq.ActiveMq.Stomp` | STOMP 1.2 frame encoder and incremental decoder (which reads past frames over a limit and reports them), no I/O |
 | `src/url.l` | `Mq.ActiveMq.Url` | broker URL parsing (`parseUrl`, `percentDecode`) |
-| `src/_kernel_dotnet/socket_kernel.l` | `Mq.ActiveMq.Kernel` | `System.Net.Sockets`, `System.Net.Security.SslStream`, monitor lock, clock, dedicated threads |
-| `src/_kernel_jvm/socket_kernel.l` | `Mq.ActiveMq.Kernel` | `java.net.Socket`, `javax.net.ssl.SSLSocket`, `ReentrantLock`, clock, thread |
 
-The two kernel files declare the same package and surface; a file-level `@cfg(target = ...)` keeps
-one per build. They are the only files with extern declarations. The kernel also has a listener,
-the server side of a TLS handshake and a background-thread primitive, used by the in-process
-broker of the hermetic tests. `Mq.ActiveMq.Kernel` and the fields of `ActiveMqQueue` are public
-for those tests; they are not an application API.
-
-How the kernels do TLS:
-
-- dotnet: `SslStream.AuthenticateAsClient` with `SslClientAuthenticationOptions`. Trust is a
-  `CertificateChainPolicy` (custom root store; the platform's root stores are added to it for
-  `withCaCertificate`), and skip-verify is that policy with `X509VerificationFlags.AllFlags`. No
-  validation callback is involved. Each connection has a reader thread that does blocking
-  `Stream.Read` calls and hands every chunk, and then the end of the stream or the read's failure,
-  to the consumer in order, which waits for the hand-over with a limit; so a consume timeout is
-  exact whether or not TLS has buffered data, nothing that arrived before a failure is lost, and
-  the plain transport uses the same path. The connect, the handshake and the reader run on
-  threads of their own and every call is the synchronous one: nothing completes on the runtime's
-  shared thread pool. An earlier version kept a pending `Stream.ReadAsync` instead; its completion
-  needs a pool thread, so with the pool busy (blocked tasks of the application, or of the tests'
-  own in-process broker on a machine with few cores) a message that had arrived was seen seconds
-  late and a `consume` timed out.
-- jvm: an `SSLContext` from a `KeyStore`-backed `TrustManagerFactory` and `KeyManagerFactory`,
-  an `SSLSocket` layered over the connected socket, and
-  `SSLParameters.setEndpointIdentificationAlgorithm("HTTPS")`. Reads and timeouts are the socket's
-  own (`setSoTimeout`), as for plain TCP.
-- Both load certificates and keys through `Std.TlsHost`, the standard library's PEM loader.
+This package has no extern declarations. The TCP connection, the TLS handshake, the lock and the
+clock are `Net.Tcp`'s; `TlsOptions`, `plainTcp()`, their validation, `skipsVerification(tls)`,
+`insecureAllowedByEnvironment()` and the reader of the `...TLS*` variables are `Net.Tls`'s; the
+authority part of the broker URL is parsed by `Net.Url`. All three are in the `Lyric.Net` package
+of this repository (`net/`), shared with `mq-rabbitmq` and `redis`; its README describes how each
+target does sockets and TLS and what that costs (one thread per connection that has been read from
+on dotnet, for one). `Mq.ActiveMq` re-exports `Net.Tls` (`pub use`), so `TlsOptions` and those
+functions are reachable through `import Mq.ActiveMq`. The in-process broker of the hermetic tests
+is built on `Net.Tcp.Testing`. The fields of `ActiveMqQueue` are public for those tests; they are
+not an application API.
 
 ## Tests
 
@@ -792,13 +774,14 @@ lyric test --manifest mq-activemq/lyric.toml --target dotnet
 lyric test --manifest mq-activemq/lyric.toml --target jvm
 ```
 
-This runs the frame codec, URL, kernel, re-export and `Extras` unit tests, and
+This runs the frame codec, URL, re-export and `Extras` unit tests, and
 `tests/client_tests.l`: the `Testing.Conformance.Mq` queue suite and the error paths (refused
 connection, bad credentials, `ERROR` frame with and without a `receipt-id`, connection dropped
 during publish, during consume and during login, unconfirmed request, refused settlements,
 undeliverable and oversize messages under both policies, a broker that stops reading, the bounds
-of `consume`, a busy thread pool, and bytes arriving in pieces across read timeouts) against an
-in-process STOMP broker on a loopback socket. The same broker is
+of `consume`, and a busy thread pool) against an in-process STOMP broker on a loopback socket. The
+socket-level tests (timed reads, write timeout, bytes arriving in pieces across read timeouts,
+independence from the thread pool) are in `net/tests/tcp_tests.l`. The same broker is
 also started behind TLS and behind TLS with a required client certificate: the conformance suite
 runs once more over TLS, with tests of CA trust (exclusive and additional), an untrusted CA, the
 name check and the server name override, the two keys of skip-verify, mutual TLS with and without
@@ -882,8 +865,7 @@ There is no third-party library (`[nuget]` and `[maven]` are empty). What the su
 - On dotnet, skip-verify relies on `SslStream` honouring `X509VerificationFlags.IgnoreInvalidName`
   from the chain policy for the name check. That is what .NET 10 does (the tests cover it); a
   runtime that does not would refuse the connection rather than accept it.
-- The kernels import `Std.TlsHost`, the standard library's kernel package for PEM loading. It is
-  public but not marked `@stable`.
+- The gaps of `Lyric.Net` apply: see its README for the socket and TLS boundary.
 - `DeadLetterStore` is not implemented (see "Surprises").
 - No binary message bodies, in either direction, and no access to the delivery options of a
   received message.
@@ -916,30 +898,15 @@ There is no third-party library (`[nuget]` and `[maven]` are empty). What the su
     empty message id.
   - lyric-lang#9044: `for x in [a.name, a.value]` over `String` fields loses the element type, and
     `Bug.typeName` is the simple class name on the JVM.
-  - lyric-lang#9042: `Std.TcpHost` has no JVM kernel and cannot tell a read timeout from a failure,
-    so both socket kernels bind the host socket API directly.
-  - lyric-lang#9064: the standard library has no TLS client for a raw socket, so each kernel binds
-    the platform's TLS (`SslStream`, JSSE) itself and the TLS options here repeat those of
-    `Std.Http`.
+  - lyric-lang#9042 and lyric-lang#9064: why the socket and TLS boundary is `Lyric.Net`'s own
+    kernel and not the standard library's; see the `Lyric.Net` README.
 - Compiler defect met while fixing the settlement paths (not yet filed): on `--target dotnet` the
   lambda `{ m -> Ok(()) }` passed as a `(Mq.Message) -> Result[Unit, String]` handler builds a
   `Result` of the wrong generic instantiation, and `consume` fails with an invalid cast
   (`Result_Ok<Object, Object>` to `Result<Object, String>`) at the moment it calls the handler.
   A handler that calls a function with a declared result type (`{ m -> handle(m) }`), as every
   example here does, is not affected; `--target jvm` is not affected.
-- Standard library and compiler limits met while adding TLS (not yet filed):
-  - `Std.Tls.Certificate.rawHandle` and `Identity.rawHandle` are `internal`, so a package outside
-    the standard library cannot hand a `Certificate` or `Identity` to a host TLS API. This is why
-    the options take PEM text and the kernels load it again through `Std.TlsHost`.
-  - A Lyric lambda cannot become a named .NET delegate (`RemoteCertificateValidationCallback`;
-    docs/66 gap 2), so the dotnet kernel configures trust through `CertificateChainPolicy` only.
-  - The JVM auto-FFI cannot pass `null` (lyric-lang#4775) or a typed reference array
-    (`TrustManager[]`, `Certificate[]`, `String[]`) as an argument, and a record cannot implement
-    `X509TrustManager`. The JVM kernel makes those calls through `java.lang.reflect`, as the
-    standard library's `_kernel_jvm/http_host.l` does.
-  - `@externTarget("System.Threading.Tasks.Task`1[System.Int32].get_Result")` on an `extern type`
-    for the closed generic emits a member reference the runtime rejects ("The signature is
-    incorrect"); the built-in `Task[Int]` with `Task`1.get_Result` works and is what the kernel
-    uses.
+- Compiler limit met while adding TLS (not yet filed; the kernel-side ones are in the
+  `Lyric.Net` README):
   - A `[project.tests]` module cannot import a non-test package from `tests/` (`T0215`), so the
     test certificates sit in `tests/client_tests.l` itself.

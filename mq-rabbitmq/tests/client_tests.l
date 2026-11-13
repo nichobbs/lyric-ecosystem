@@ -16,6 +16,7 @@
 //!   virtual host `missing`        connection.close 530 NOT_ALLOWED
 //!   routing key `fail.drop`       a publish makes the broker close the socket
 //!   routing key `fail.silent`     a publish is accepted but never confirmed
+//!   routing key `fail.stall`      at basic.publish nothing is read for 8 s, then the socket closes
 //!   routing key `fail.nack`       a publish is answered with basic.nack
 //!   routing key `fail.blocked`    a publish is answered with connection.blocked
 //!   queue `fail.dropconsume`      basic.consume is answered, then the socket closes
@@ -52,10 +53,14 @@ import Mq
 import Mq.RabbitMq as RabbitMq
 import Mq.RabbitMq.Extras
 import Mq.RabbitMq.Extras as Extras
-import Mq.RabbitMq.Kernel as K
+import Net.Tcp as K
+import Net.Tcp.Testing as KT
 import Mq.RabbitMq.Amqp as Amqp
 
 // ─── The fake broker ─────────────────────────────────────────────────────────
+// How long a broker stalled by `fail.stall` reads nothing.
+val STALL_MS: Int = 8000
+
 record Stored {
   properties: Amqp.Properties
   body: slice[Byte]
@@ -79,10 +84,10 @@ record Binding {
 }
 
 ref record FakeBroker {
-  server: K.ServerSock
+  server: KT.ServerSock
   // Whether every accepted connection starts with a TLS handshake.
   secured: Bool
-  tls: K.ServerTls
+  tls: KT.ServerTls
   lock: K.Lock
   var queues: Map[String, FakeQueue]
   var exchanges: Map[String, String]
@@ -676,6 +681,10 @@ func handleMethod(s: in Session, channel: in Int, m: in Amqp.Method): Bool {
       true
     }
     case BasicPublish(exchange, key, mandatory, _) -> {
+      if key == "fail.stall" {
+        K.sleepMs(STALL_MS)
+        return false
+      }
       s.pubActive = true
       s.pubExchange = exchange
       s.pubKey = key
@@ -860,7 +869,7 @@ func serveAccepted(b: in FakeBroker, accepted: in K.Sock): Unit {
     serve(b, accepted)
     return
   }
-  match K.sockAcceptTls(accepted, b.tls, 5000) {
+  match KT.sockAcceptTls(accepted, b.tls, 5000) {
     case Ok(sock) -> serve(b, sock)
     case Err(_) -> ()
   }
@@ -869,9 +878,9 @@ func serveAccepted(b: in FakeBroker, accepted: in K.Sock): Unit {
 func acceptLoop(b: in FakeBroker): Unit {
   var listening = true
   while listening {
-    match K.serverAccept(b.server) {
+    match KT.serverAccept(b.server) {
       case Ok(sock) -> {
-        val _ = K.startBackground({ -> serveAccepted(b, sock) })
+        val _ = KT.startBackground({ -> serveAccepted(b, sock) })
       }
       case Err(_) -> {
         listening = false
@@ -880,8 +889,8 @@ func acceptLoop(b: in FakeBroker): Unit {
   }
 }
 
-func startBrokerWith(secured: in Bool, tls: in K.ServerTls): FakeBroker {
-  val server = match K.serverListen("127.0.0.1", 0) {
+func startBrokerWith(secured: in Bool, tls: in KT.ServerTls): FakeBroker {
+  val server = match KT.serverListen("127.0.0.1", 0) {
     case Ok(s) -> s
     case Err(e) -> panic("the fake broker cannot listen: " + e)
   }
@@ -905,12 +914,12 @@ func startBrokerWith(secured: in Bool, tls: in K.ServerTls): FakeBroker {
     cleanCloses = 0,
     largestFrame = 0
   )
-  val _ = K.startBackground({ -> acceptLoop(b) })
+  val _ = KT.startBackground({ -> acceptLoop(b) })
   b
 }
 
-func serverTls(clientCaPem: in String): K.ServerTls {
-  K.ServerTls(certPem = TEST_ONLY_SERVER_CERT, keyPem = TEST_ONLY_SERVER_KEY, clientCaPem = clientCaPem)
+func serverTls(clientCaPem: in String): KT.ServerTls {
+  KT.ServerTls(certPem = TEST_ONLY_SERVER_CERT, keyPem = TEST_ONLY_SERVER_KEY, clientCaPem = clientCaPem)
 }
 
 // One broker of each kind for the whole module, started by the first test
@@ -936,17 +945,17 @@ func broker(): FakeBroker {
 }
 
 func brokerPort(): Int {
-  K.serverPort(broker().server)
+  KT.serverPort(broker().server)
 }
 
 // The broker behind TLS (server certificate only).
 func tlsBrokerPort(): Int {
   match slot.tlsBroker {
-    case Some(b) -> K.serverPort(b.server)
+    case Some(b) -> KT.serverPort(b.server)
     case None -> {
       val b = startBrokerWith(true, serverTls(""))
       slot.tlsBroker = Some(value = b)
-      K.serverPort(b.server)
+      KT.serverPort(b.server)
     }
   }
 }
@@ -954,11 +963,11 @@ func tlsBrokerPort(): Int {
 // The broker behind TLS that requires a client certificate from the CA.
 func mutualTlsBrokerPort(): Int {
   match slot.mutualTlsBroker {
-    case Some(b) -> K.serverPort(b.server)
+    case Some(b) -> KT.serverPort(b.server)
     case None -> {
       val b = startBrokerWith(true, serverTls(TEST_ONLY_CA))
       slot.mutualTlsBroker = Some(value = b)
-      K.serverPort(b.server)
+      KT.serverPort(b.server)
     }
   }
 }
@@ -1158,7 +1167,7 @@ func knobBroker(mode: in String, frameMax: in Int, heartbeat: in Int): FakeBroke
 
 test "the frame size is the smaller of the two limits, and 0 from the broker means the client's" {
   val small = knobBroker("", 8192, 60)
-  val q = open(optionsOn(K.serverPort(small.server), "q"))
+  val q = open(optionsOn(KT.serverPort(small.server), "q"))
   assertEqualInt(RabbitMq.negotiatedFrameMax(q), 8192, "the broker's limit is smaller")
   assertEqualLong(small.tunedFrameMax, 8192i64, "tune-ok carries it")
   val body = bigBody(50000)
@@ -1167,22 +1176,22 @@ test "the frame size is the smaller of the two limits, and 0 from the broker mea
   val got = mustTake(q)
   assertTrue(got.body == body, "the body is reassembled from the broker's frames")
   q.close()
-  K.serverClose(small.server)
+  KT.serverClose(small.server)
   val unlimited = knobBroker("", 0, 60)
-  val r = open(optionsOn(K.serverPort(unlimited.server), "q").copy(frameMax = 16384))
+  val r = open(optionsOn(KT.serverPort(unlimited.server), "q").copy(frameMax = 16384))
   assertEqualInt(RabbitMq.negotiatedFrameMax(r), 16384, "the client's limit when the broker has none")
   r.close()
-  K.serverClose(unlimited.server)
+  KT.serverClose(unlimited.server)
   val wide = knobBroker("", 1048576, 60)
-  val w = open(optionsOn(K.serverPort(wide.server), "q"))
+  val w = open(optionsOn(KT.serverPort(wide.server), "q"))
   assertEqualInt(RabbitMq.negotiatedFrameMax(w), 131072, "the client's limit is smaller")
   w.close()
-  K.serverClose(wide.server)
+  KT.serverClose(wide.server)
 }
 
 test "the heartbeat is off unless asked for, then the smaller of the two intervals" {
   val b = knobBroker("", 131072, 60)
-  val port = K.serverPort(b.server)
+  val port = KT.serverPort(b.server)
   val off = open(optionsOn(port, "q"))
   assertEqualInt(RabbitMq.heartbeatSeconds(off), 0, "off by default")
   assertEqualInt(b.tunedHeartbeat, 0, "tune-ok says 0")
@@ -1194,18 +1203,18 @@ test "the heartbeat is off unless asked for, then the smaller of the two interva
   assertEqualInt(RabbitMq.heartbeatSeconds(longer), 60, "the broker's interval is shorter")
   assertEqualInt(b.tunedHeartbeat, 60, "tune-ok says 60")
   longer.close()
-  K.serverClose(b.server)
+  KT.serverClose(b.server)
   val none = knobBroker("", 131072, 0)
-  val q = open(optionsOn(K.serverPort(none.server), "q").copy(heartbeatSeconds = 20))
+  val q = open(optionsOn(KT.serverPort(none.server), "q").copy(heartbeatSeconds = 20))
   assertEqualInt(RabbitMq.heartbeatSeconds(q), 20, "the client's interval when the broker proposes none")
   q.close()
-  K.serverClose(none.server)
+  KT.serverClose(none.server)
 }
 
 test "a refused connection is an Err naming the endpoint" {
-  val server = match K.serverListen("127.0.0.1", 0) { case Ok(s) -> s; case Err(e) -> panic(e) }
-  val port = K.serverPort(server)
-  K.serverClose(server)
+  val server = match KT.serverListen("127.0.0.1", 0) { case Ok(s) -> s; case Err(e) -> panic(e) }
+  val port = KT.serverPort(server)
+  KT.serverClose(server)
   val e = errorOfConnect(RabbitMq.defaultOptions("127.0.0.1", port, "a"))
   expectContains(e, "rabbitmq: cannot connect to 127.0.0.1:" + port.toString(), "refused")
 }
@@ -1231,25 +1240,25 @@ test "an unknown virtual host surfaces the broker's 530" {
 test "a peer that does not speak AMQP 0-9-1 with PLAIN is refused" {
   val mismatch = knobBroker("mismatch", 131072, 60)
   expectContains(
-    errorOfConnect(optionsOn(K.serverPort(mismatch.server), "a")),
+    errorOfConnect(optionsOn(KT.serverPort(mismatch.server), "a")),
     "does not accept AMQP 0-9-1",
     "a protocol header in reply"
   )
-  K.serverClose(mismatch.server)
+  KT.serverClose(mismatch.server)
   val ancient = knobBroker("old-version", 131072, 60)
   expectContains(
-    errorOfConnect(optionsOn(K.serverPort(ancient.server), "a")),
+    errorOfConnect(optionsOn(KT.serverPort(ancient.server), "a")),
     "speaks AMQP 8-0; this client needs 0-9-1",
     "AMQP 0-8"
   )
-  K.serverClose(ancient.server)
+  KT.serverClose(ancient.server)
   val external = knobBroker("no-plain", 131072, 60)
   expectContains(
-    errorOfConnect(optionsOn(K.serverPort(external.server), "a")),
+    errorOfConnect(optionsOn(KT.serverPort(external.server), "a")),
     "does not offer PLAIN authentication (it offers: EXTERNAL)",
     "no PLAIN"
   )
-  K.serverClose(external.server)
+  KT.serverClose(external.server)
 }
 
 test "invalid options are rejected before any connection is made" {
@@ -1419,6 +1428,24 @@ test "a channel error fails the operation, the channel is reopened and the conne
   assertTrue(isOk(q.ack(again.id)), "ack on the new channel")
   mustPublish(q, message("after", "y"))
   assertEqual(mustTake(q).id, "after", "confirms work on the new channel")
+  q.close()
+}
+
+test "a publish to a broker that stops reading ends with the request timeout" {
+  val q = open(optionsFor(freshName()).copy(requestTimeoutMs = 1000))
+  var body = "0123456789abcdef"
+  while body.length < 33554432 {
+    body = body + body
+  }
+  val started = K.monotonicMillis()
+  val e = errorOf(
+    Extras.publishWith(q, message("huge", body), Extras.toExchange(q, "", "fail.stall")),
+    "a publish nobody reads"
+  )
+  val elapsed = K.monotonicMillis() - started
+  expectContains(e, "rabbitmq: connection lost: the write timed out", "a write that cannot finish loses the connection")
+  assertTrue(elapsed < 6000i64, "the publish returned after " + elapsed.toString() + " ms")
+  assertTrue(not RabbitMq.isOpen(q), "the connection is unusable afterwards")
   q.close()
 }
 
@@ -1761,7 +1788,7 @@ test "headers travel as the lyric_headers list and as one plain entry per distin
 }
 
 func makeReshapedEnds(b: in FakeBroker): MqConformance.QueueEnds {
-  val q = open(optionsOn(K.serverPort(b.server), freshName()))
+  val q = open(optionsOn(KT.serverPort(b.server), freshName()))
   opened.queues.add(q)
   val publisher: Mq.MessageQueue = q
   val consumer: Mq.QueueConsumer = q
@@ -1772,7 +1799,7 @@ test "headers survive a broker that reorders table entries and merges repeated k
   val b = startBrokerWith(false, serverTls(""))
   b.reshape = true
   val name = freshName()
-  val q = open(optionsOn(K.serverPort(b.server), name))
+  val q = open(optionsOn(KT.serverPort(b.server), name))
   val sent = [
     Mq.MessageHeader(key = "content-type", value = "text/plain"),
     Mq.MessageHeader(key = "k:colon\nnewline", value = "v\\backslash"),
@@ -1796,7 +1823,7 @@ test "headers survive a broker that reorders table entries and merges repeated k
   expectSameHeaders(mustTake(q).headers, awkwardHeaders(), "every awkward key")
   q.close()
   requireConformance(conformance({ -> makeReshapedEnds(b) }))
-  K.serverClose(b.server)
+  KT.serverClose(b.server)
 }
 
 test "the carrier wins over plain entries; entries it does not name follow it; without it every entry is a header" {
@@ -2278,7 +2305,7 @@ test "publishWith carries the message properties and refuses invalid ones" {
 // ─── Heartbeats ──────────────────────────────────────────────────────────────
 test "with a heartbeat the client beats while it waits, and keepAlive beats on request" {
   val b = knobBroker("", 131072, 1)
-  val q = open(optionsOn(K.serverPort(b.server), "q").copy(heartbeatSeconds = 1))
+  val q = open(optionsOn(KT.serverPort(b.server), "q").copy(heartbeatSeconds = 1))
   assertEqualInt(RabbitMq.heartbeatSeconds(q), 1, "negotiated")
   val got = Got(messages = newList())
   match q.consume(2600, { m -> keep(got, m) }) {
@@ -2293,12 +2320,12 @@ test "with a heartbeat the client beats while it waits, and keepAlive beats on r
   assertTrue(b.heartbeatsSeen > before, "keepAlive sent a heartbeat frame")
   assertEqual(mustTake(q).id, "alive", "deliveries that arrived during keepAlive are kept")
   q.close()
-  K.serverClose(b.server)
+  KT.serverClose(b.server)
 }
 
 test "with a heartbeat a silent broker is given up on after two intervals" {
   val b = knobBroker("mute", 131072, 1)
-  val q = open(optionsOn(K.serverPort(b.server), "q").copy(heartbeatSeconds = 1))
+  val q = open(optionsOn(KT.serverPort(b.server), "q").copy(heartbeatSeconds = 1))
   val started = K.monotonicMillis()
   val e = errorOf(q.consume(8000, { m -> Ok(()) }), "a silent broker")
   val elapsed = K.monotonicMillis() - started
@@ -2306,19 +2333,19 @@ test "with a heartbeat a silent broker is given up on after two intervals" {
   assertTrue(elapsed < 6000i64, "well before the consume timeout: " + elapsed.toString() + " ms")
   assertTrue(not RabbitMq.isOpen(q), "lost")
   q.close()
-  K.serverClose(b.server)
+  KT.serverClose(b.server)
 }
 
 test "without a heartbeat nothing is sent while waiting, and keepAlive is a liveness probe" {
   val b = knobBroker("", 131072, 60)
-  val q = open(optionsOn(K.serverPort(b.server), "q"))
+  val q = open(optionsOn(KT.serverPort(b.server), "q"))
   expectTimeout(q, "an idle wait")
   assertEqualInt(b.heartbeatsSeen, 0, "no heartbeat frames")
   assertTrue(isOk(RabbitMq.keepAlive(q)), "keepAlive on a live connection")
   K.sleepMs(150)
   assertEqualInt(b.heartbeatsSeen, 1, "keepAlive always sends one")
   q.close()
-  K.serverClose(b.server)
+  KT.serverClose(b.server)
 }
 
 // ─── Threads ─────────────────────────────────────────────────────────────────
@@ -2333,7 +2360,7 @@ func publishMany(q: in RabbitMq.RabbitMqQueue, count: in Int): Unit {
 test "a publisher thread and a consuming thread share one connection" {
   val q = open(optionsFor(freshName()).copy(prefetchCount = 0))
   val count = 40
-  val publisher = K.startBackground({ -> publishMany(q, count) })
+  val publisher = KT.startBackground({ -> publishMany(q, count) })
   val got = Got(messages = newList())
   var failures = 0
   while got.messages.count < count and failures < 50 {
@@ -2347,7 +2374,7 @@ test "a publisher thread and a consuming thread share one connection" {
       }
     }
   }
-  K.waitBackground(publisher)
+  KT.waitBackground(publisher)
   assertEqualInt(got.messages.count, count, "every message arrived")
   var n = 0
   while n < got.messages.count {
