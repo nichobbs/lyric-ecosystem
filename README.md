@@ -19,6 +19,7 @@ interface's conformance suite on every target it claims.
 | `Lyric.Net` | `net/` | (shared TCP and TLS client connections, TLS options, URL authority parsing) | host sockets and TLS | dotnet, jvm | pure Lyric over one per-target socket kernel; used by `Lyric.Redis`, `Lyric.Mq.RabbitMq` and `Lyric.Mq.ActiveMq` |
 | `Lyric.Redis` | `redis/` | (client) | Redis | dotnet, jvm | pure Lyric (RESP over TCP) |
 | `Lyric.Cache.Redis` | `cache-redis/` | `Cache.CacheStore` | Redis | dotnet, jvm | on `Lyric.Redis` |
+| `Lyric.Cache.Memcached` | `cache-memcached/` | `Cache.CacheStore` | memcached 1.6.10 and later | dotnet, jvm | pure Lyric (meta protocol on `Lyric.Net`) |
 | `Lyric.Session.Redis` | `session-redis/` | `Session.SessionStore` | Redis | dotnet, jvm | on `Lyric.Redis` |
 | `Lyric.Flags.Flipt` | `flags-flipt/` | `Flags.FlagStore` | Flipt | dotnet, jvm | pure Lyric (Flipt v1 REST over `Std.Http`) |
 | `Lyric.Mq.RabbitMq` | `mq-rabbitmq/` | `Mq.MessageQueue`, `Mq.QueueConsumer` | RabbitMQ | dotnet, jvm | pure Lyric (AMQP 0-9-1 over TCP) |

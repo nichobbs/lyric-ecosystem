@@ -1,0 +1,44 @@
+[package]
+name        = "Lyric.Cache.Memcached"
+version     = "0.1.0"
+stability   = "experimental"
+authors     = ["Lyric Contributors"]
+license     = "MIT"
+description = "memcached backend for the Lyric.Cache CacheStore interface, on a pure-Lyric client for the meta text protocol."
+targets     = ["dotnet", "jvm"]
+
+[project]
+name            = "Lyric.Cache.Memcached"
+output          = "single"
+output_assembly = "Cache.Memcached.dll"
+
+[project.packages]
+"Cache.Memcached"        = "src/cache_memcached.l"
+"Cache.Memcached.Extras" = "src/cache_memcached_extras.l"
+"Cache.Memcached.Client" = "src/client.l"
+"Cache.Memcached.Meta"   = "src/meta.l"
+"Cache.Memcached.Keys"   = "src/keys.l"
+"Cache.Memcached.Url"    = "src/url.l"
+
+[project.tests]
+"Cache.Memcached.MetaTests"       = "tests/meta_tests.l"
+"Cache.Memcached.KeysTests"       = "tests/keys_tests.l"
+"Cache.Memcached.UrlTests"        = "tests/url_tests.l"
+"Cache.Memcached.FakeServerTests" = "tests/fake_server_tests.l"
+# Needs real memcached servers (scripts/ci/start-memcached.sh): file-level
+# `@cfg(feature = "integration")`, so a plain `lyric test` reports the module
+# as gated and stays hermetic.
+"Cache.Memcached.IntegrationTests" = "tests/integration/cache_memcached_integration_tests.l"
+
+[features]
+default     = []
+integration = []   # run tests/integration against the servers named by LYRIC_MEMCACHED_URL, LYRIC_MEMCACHED_TLS_URL and LYRIC_MEMCACHED_AUTH_URL
+
+[dependencies]
+# The interface and its conformance suite, resolved through the root
+# [workspace.overrides].
+"Lyric.Testing" = { workspace = true }
+"Lyric.Cache"   = { workspace = true }
+# The TCP and TLS connection, TLS options and URL authority parsing; the
+# tests use its listening sockets and background threads (Net.Tcp.Testing).
+"Lyric.Net"     = { workspace = true }
