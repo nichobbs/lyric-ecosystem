@@ -20,7 +20,8 @@ import Std.Testing
 import Std.Time
 import Redis
 import Redis.Resp
-import Redis.Kernel as Kernel
+import Net.Tcp as Tcp
+import Net.Tcp.Testing as KT
 
 // ─── The fake server ─────────────────────────────────────────────────────────
 union Action {
@@ -37,7 +38,7 @@ union Action {
 record Fake {
   port: Int
   log: List[String]
-  worker: Kernel.Background
+  worker: KT.Background
 }
 
 func commandWords(v: in RespValue): List[String] {
@@ -56,31 +57,45 @@ func commandWords(v: in RespValue): List[String] {
   words
 }
 
-func writeWire(sock: in Kernel.Sock, text: in String): Unit {
-  val _ = Kernel.sockWrite(sock, encodeUtf8(text))
+// The next bytes from the client; an empty slice means it closed the
+// connection.
+func readChunk(sock: in Tcp.Sock): Result[slice[Byte], String] {
+  while true {
+    match Tcp.sockRead(sock, 4096, 1000) {
+      case Err(m) -> return Err(m)
+      case Ok(Tcp.Data(bytes)) -> return Ok(bytes)
+      case Ok(Tcp.Eof) -> {
+        val closed: slice[Byte] = []
+        return Ok(closed)
+      }
+      case Ok(Tcp.TimedOut) -> ()
+    }
+  }
+  Err("unreachable")
 }
 
-func writeSlowly(sock: in Kernel.Sock, text: in String): Unit {
+func writeWire(sock: in Tcp.Sock, text: in String): Unit {
+  val _ = Tcp.sockWrite(sock, encodeUtf8(text))
+}
+
+func writeSlowly(sock: in Tcp.Sock, text: in String): Unit {
   val all = encodeUtf8(text)
   var i = 0
   while i < all.length {
-    val _ = Kernel.sockWrite(sock, all.slice(i, i + 1))
+    val _ = Tcp.sockWrite(sock, all.slice(i, i + 1))
     i = i + 1
   }
 }
 
 // Serve one connection. False once FAKE.STOP was received.
 func serveConnection(
-  sock: in Kernel.Sock,
-  index: in Int,
-  handler: in (List[String], Int) -> Action,
-  log: in List[String],
+  sock: in Tcp.Sock, index: in Int, handler: in (List[String], Int) -> Action, log: in List[String]
 ): Bool {
   var decoder = newDecoder()
   var open = true
   var keepServing = true
   while open {
-    match Kernel.sockRead(sock, 4096) {
+    match readChunk(sock) {
       case Err(_) -> {
         open = false
       }
@@ -118,15 +133,15 @@ func serveConnection(
       }
     }
   }
-  Kernel.sockClose(sock)
+  Tcp.sockClose(sock)
   keepServing
 }
 
-func serve(server: in Kernel.ServerSock, handler: in (List[String], Int) -> Action, log: in List[String]): Unit {
+func serve(server: in KT.ServerSock, handler: in (List[String], Int) -> Action, log: in List[String]): Unit {
   var running = true
   var index = 0
   while running {
-    match Kernel.serverAccept(server) {
+    match KT.serverAccept(server) {
       case Err(_) -> {
         running = false
       }
@@ -136,16 +151,16 @@ func serve(server: in Kernel.ServerSock, handler: in (List[String], Int) -> Acti
       }
     }
   }
-  Kernel.serverClose(server)
+  KT.serverClose(server)
 }
 
 func startFake(handler: in (List[String], Int) -> Action): Fake {
-  match Kernel.serverListen("127.0.0.1", 0) {
+  match KT.serverListen("127.0.0.1", 0) {
     case Err(m) -> panic("the fake server cannot listen: " + m)
     case Ok(server) -> {
       val log: List[String] = newList()
-      val port = Kernel.serverPort(server)
-      val worker = Kernel.startBackground({ -> serve(server, handler, log) })
+      val port = KT.serverPort(server)
+      val worker = KT.startBackground({ -> serve(server, handler, log) })
       Fake(port = port, log = log, worker = worker)
     }
   }
@@ -155,7 +170,7 @@ func stopFake(fake: in Fake): Unit {
   val stopper = Redis.lazy(Redis.configFor("127.0.0.1", fake.port))
   val _ = Redis.command(stopper, ["FAKE.STOP"])
   stopper.close()
-  Kernel.waitBackground(fake.worker)
+  KT.waitBackground(fake.worker)
 }
 
 func urlOf(fake: in Fake): String {
@@ -519,6 +534,43 @@ test "with the stale retry off the closed connection is reported" {
   sleepMillis(100)
   assertEqual(codeOf(Redis.ping(c), "PING on the stale connection"), "CONNECTION_LOST", "reported")
   ok(Redis.ping(c), "PING on a new connection")
+  c.close()
+  stopFake(fake)
+}
+
+ref record Busy {
+  var done: Bool
+}
+
+func idleWhileBusy(busy: in Busy): Unit {
+  while not busy.done {
+    sleepMillis(20)
+  }
+}
+
+// On dotnet the connect used to complete on the runtime's shared thread pool:
+// with every pool thread blocked, `open` and each reconnect failed with "no
+// connection within N ms" against a server that was listening.
+test "a busy thread pool does not delay connecting, commands or a reconnect" {
+  val fake = startMini(miniRedis("", ""))
+  val busy = Busy(done = false)
+  var n = 0
+  while n < 64 {
+    val _ = KT.startPoolWork({ -> idleWhileBusy(busy) })
+    n += 1
+  }
+  sleepMillis(200)
+  val started = nowEpochMillis()
+  val cfg = Redis.withTimeouts(Redis.configFor("127.0.0.1", fake.port), 5000, 5000)
+  val c = ok(Redis.open(cfg), "open with the pool busy")
+  ok(Redis.set(c, "busy", "v"), "SET")
+  expectValue(Redis.get(c, "busy"), "v", "GET")
+  c.disconnect()
+  ok(Redis.ping(c), "PING on a new connection")
+  val elapsed = nowEpochMillis() - started
+  assertEqualInt(c.connections(), 2, "the client connected twice")
+  assertTrue(elapsed < 3000i64, "connect, commands and reconnect took " + elapsed.toString() + " ms")
+  busy.done = true
   c.close()
   stopFake(fake)
 }

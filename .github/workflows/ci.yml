@@ -127,6 +127,10 @@ jobs:
         working-directory: lyric-ecosystem
         run: bash scripts/ci/start-flipt.sh
 
+      - name: Start memcached
+        working-directory: lyric-ecosystem
+        run: bash scripts/ci/start-memcached.sh
+
       - name: Test packages against the services
         working-directory: lyric-ecosystem
         run: bash scripts/ci/test-packages.sh ${{ matrix.target }} --integration

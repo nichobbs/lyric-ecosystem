@@ -16,12 +16,6 @@ output_assembly = "Redis.dll"
 "Redis"        = "src/redis.l"
 "Redis.Resp"   = "src/resp.l"
 "Redis.Url"    = "src/url.l"
-# One package in two files: the socket boundary for each target. Each file
-# carries a file-level `@cfg(target = ...)`, so exactly one survives a build.
-"Redis.Kernel" = [
-  "src/_kernel_dotnet/redis_kernel.l",
-  "src/_kernel_jvm/redis_kernel.l",
-]
 
 [project.tests]
 "Redis.RespTests"        = "tests/resp_tests.l"
@@ -37,3 +31,8 @@ output_assembly = "Redis.dll"
 [features]
 default     = []
 integration = []   # run tests/integration against the servers named by LYRIC_REDIS_URL and LYRIC_REDIS_TLS_URL / LYRIC_REDIS_MTLS_URL
+
+[dependencies]
+# The TCP and TLS connection, TLS option checks and URL authority parsing
+# shared with the other protocol clients of this repository.
+"Lyric.Net" = { workspace = true }

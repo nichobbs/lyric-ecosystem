@@ -2,7 +2,8 @@
 
 RabbitMQ backend for the `Mq.MessageQueue` and `Mq.QueueConsumer` interfaces of `lyric-mq`. The
 client is an AMQP 0-9-1 implementation written in Lyric; only the TCP socket and the TLS layer
-over it come from the host platform, so there is no RabbitMQ client SDK dependency.
+over it come from the host platform, through `Net.Tcp` of the `Lyric.Net` package in this
+repository (`net/`), so there is no RabbitMQ client SDK dependency.
 
 | | |
 |---|---|
@@ -12,6 +13,7 @@ over it come from the host platform, so there is no RabbitMQ client SDK dependen
 | Broker | RabbitMQ over AMQP 0-9-1. Tested against RabbitMQ 3.12.1 (Erlang/OTP 25, the Ubuntu 24.04 package; every suite, both targets, on a development machine) and 4.0.5 (the Ubuntu 26.04 package, in CI). See "RabbitMQ 3.x and 4.x". |
 | Transport | plain TCP, or TLS 1.2 / 1.3 (`SslStream` on dotnet, `SSLSocket` on jvm) |
 | SDK dependencies | none (`[nuget]` and `[maven]` are empty) |
+| Depends on | `Lyric.Net` (`net/`): TCP and TLS connection, TLS options, URL authority parsing |
 | Interface | `Lyric.Mq` 0.1.0 |
 
 ## Use
@@ -50,7 +52,8 @@ Three ways to connect; none of them reads a credential from source.
   runs the same checks without connecting.
 - `connectUrl(url, queueName)`: a URL in the RabbitMQ URI scheme,
   `amqp://[user[:password]@]host[:port][/vhost][?parameters]` (port 5672) or `amqps://...` (TLS,
-  port 5671). User, password and virtual host are percent-decoded. Without user information the
+  port 5671). User, password and virtual host are percent-decoded; an IPv6 address is written in
+  brackets (`amqp://[::1]:5672`) and refused without them. Without user information the
   user is `guest` / `guest`. Parameters: `heartbeat` (seconds), `connection_timeout`
   (milliseconds), `frame_max` (bytes); any other parameter is an error.
   `optionsFromUrl(url, queueName)` returns the `ConnectOptions` instead of connecting, so TLS
@@ -93,10 +96,10 @@ Three ways to connect; none of them reads a credential from source.
 | `heartbeatSeconds` | 0 (off) | heartbeat interval to ask for, see "Heartbeats" |
 | `frameMax` | 131072 | largest frame, at least 4096; the smaller of this and the broker's limit is used |
 | `connectTimeoutMs` | 10000 | TCP connect limit, and again the TLS handshake limit; 0 = the system's |
-| `requestTimeoutMs` | 10000 | how long to wait for a reply or a publisher confirm |
+| `requestTimeoutMs` | 10000 | how long to wait for a reply or a publisher confirm, and how long a write may make no progress because the broker is not reading |
 | `maxMessageBytes` | 16 MiB | largest message body accepted from the broker |
 | `connectionName` | empty | shown in the broker's management UI |
-| `tls` | `plainTcp()` | TLS settings, see below |
+| `tls` | `plainTcp()` | TLS settings (`TlsOptions` of `Net.Tls`, re-exported by `Mq.RabbitMq`), see below |
 
 ## TLS
 
@@ -199,6 +202,7 @@ Error mapping: every failure is an `Err(String)` starting with `rabbitmq: `; not
 | publish refused by the broker | `refused the message (basic.nack)` | usable |
 | no confirm, or no reply, within `requestTimeoutMs` | `did not confirm the publish within N ms`, `did not answer METHOD within N ms` | lost |
 | broker closed the connection (`320 CONNECTION_FORCED`, ...) or the socket | `connection lost: ...` | lost |
+| the broker accepts no data for `requestTimeoutMs` during a write | `connection lost: the write timed out: ...` | lost |
 | no message within the consume timeout | exactly `timeout` | usable |
 
 `lastReplyCode(queue)` returns the AMQP reply code of the most recent channel or connection error
@@ -304,7 +308,10 @@ Behaviour a user would not expect from the `Mq` interfaces alone:
 - **Threads.** A `RabbitMqQueue` can be shared between threads. Operations are serialized by a
   lock; a waiting `consume` releases it every 100 ms, and the lock is fair on the JVM so that a
   publisher waiting for it gets it then. The handler runs outside the lock and may call
-  `ack`/`nack`.
+  `ack`/`nack`. On `dotnet` a connection owns one thread until it is closed and the client does
+  not use the runtime's shared thread pool (see the `Lyric.Net` README); always `close`.
+- **A write to a broker that has stopped reading fails after `requestTimeoutMs`** and loses the
+  connection: how much of the frame was sent is unknown.
 - **`DeadLetterStore` is not implemented.** The interface is an append/list/count store with a
   capacity; a RabbitMQ dead-letter queue can only be consumed, so it does not map. Read dead
   letters by connecting to the dead-letter queue, or use `Mq.inProcessDeadLetterStore`.
@@ -407,8 +414,10 @@ queue, on a quorum queue and over TLS, and the backend tests: reply codes (403, 
 exchanges, frame splitting, heartbeats (kept alive, and disconnected when idle), threads, and the
 TLS cases (verified, untrusted, wrong name, TLS 1.3, mutual TLS accepted and refused).
 
-The hermetic `tests/client_tests.l` contains the fake broker and the TEST-ONLY certificates it
-uses; they are fixtures, generated for that file, and trusted by nothing else.
+The hermetic `tests/client_tests.l` contains the fake broker, built on `Net.Tcp.Testing`, and the
+TEST-ONLY certificates it uses; they are fixtures, generated for that file, and trusted by nothing
+else. The socket-level tests (timed reads, write timeout, the lock, independence from the thread
+pool) are in `net/tests/tcp_tests.l`.
 
 ## Known gaps
 
@@ -426,6 +435,10 @@ Compiler issues worked around (nichobbs/lyric-lang):
 - Extension methods declared in a package that is imported under an alias cannot be called with
   method syntax (`T0113`), so `Mq.RabbitMq.Extras` must be imported whole for
   `options.withQuorumQueue()`. No issue filed yet.
+
+The socket and TLS boundary, the TLS options and their checks, and the authority part of the URL
+are `Lyric.Net`'s (`net/`), shared with `mq-activemq` and `redis`; its README lists the gaps of that
+layer (lyric-lang#9042, lyric-lang#9064) and what each target does.
 
 Not implemented (no issue filed yet):
 

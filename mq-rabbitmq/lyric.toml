@@ -17,15 +17,8 @@ output_assembly = "Mq.RabbitMq.dll"
 "Mq.RabbitMq.Extras" = "src/extras.l"
 "Mq.RabbitMq.Amqp"   = "src/amqp.l"
 "Mq.RabbitMq.Url"    = "src/url.l"
-# One package in two files: the socket and TLS boundary for each target. Each file
-# carries a file-level `@cfg(target = ...)`, so exactly one survives a build.
-"Mq.RabbitMq.Kernel" = [
-  "src/_kernel_dotnet/socket_kernel.l",
-  "src/_kernel_jvm/socket_kernel.l",
-]
 
 [project.tests]
-"Mq.RabbitMq.KernelTests"   = "tests/kernel_tests.l"
 "Mq.RabbitMq.AmqpTests"     = "tests/amqp_tests.l"
 "Mq.RabbitMq.UrlTests"      = "tests/url_tests.l"
 "Mq.RabbitMq.ExtrasTests"   = "tests/extras_tests.l"
@@ -45,3 +38,6 @@ integration = []   # run tests/integration against the broker named by LYRIC_RAB
 # [workspace.overrides].
 "Lyric.Testing" = { workspace = true }
 "Lyric.Mq"      = { workspace = true }
+# The TCP and TLS connection, the TLS options and URL authority parsing shared
+# with the other protocol clients of this repository.
+"Lyric.Net"     = { workspace = true }

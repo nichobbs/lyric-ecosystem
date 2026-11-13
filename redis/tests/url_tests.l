@@ -141,6 +141,12 @@ test "malformed URLs are rejected" {
   val _ = errorOf("redis://u:p%4@localhost")
 }
 
+test "an IPv6 host without brackets is rejected" {
+  assertTrue(Str.contains(errorOf("redis://::1"), "brackets"), "::1 is not host '::' and port 1")
+  assertTrue(Str.contains(errorOf("redis://::1:6379"), "brackets"), "with a port")
+  assertTrue(Str.contains(errorOf("rediss://:pw@fe80::1/2"), "redis://[::1]:6379"), "the error shows the form")
+}
+
 test "an error never repeats the password" {
   val e = errorOf("redis://app:hunter2@localhost:notaport")
   assertFalse(Str.contains(e, "hunter2"), "the password is not in the error")

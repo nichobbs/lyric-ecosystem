@@ -32,7 +32,7 @@ import Std.Tls as Tls
 import Std.Uuid
 import Redis
 import Redis.Resp
-import Redis.Kernel as Kernel
+import Net.Tcp.Testing as KT
 
 func requiredEnv(name: in String): String {
   val value = Env.getVarOrDefault(name, "")
@@ -153,6 +153,18 @@ test "without the CA the server is not trusted" {
   val c = Redis.lazy(cfg)
   assertEqual(codeOf(Redis.ping(c), "PING on a lazy client"), "TLS_FAILED", "reported by the command")
   assertFalse(c.isConnected(), "no connection is kept")
+  c.close()
+}
+
+test "the CA as an additional trust anchor, next to the system trust store" {
+  val additional = ok(
+    withCaCertificateFile(untrusted("LYRIC_REDIS_TLS_URL"), requiredEnv("LYRIC_REDIS_TLS_CA")),
+    "LYRIC_REDIS_TLS_CA"
+  )
+  val c = openWith(additional)
+  ok(Redis.set(c, key("additional-ca"), "trusted"), "SET")
+  expectSome(Redis.get(c, key("additional-ca")), "trusted", "GET")
+  ok(Redis.del(c, [key("additional-ca")]), "DEL")
   c.close()
 }
 
@@ -360,14 +372,14 @@ test "one TLS client shared by eight threads loses no command" {
   val c = client()
   val k = key("threads")
   val failures: List[String] = newList()
-  val workers: List[Kernel.Background] = newList()
+  val workers: List[KT.Background] = newList()
   var t = 0
   while t < 8 {
-    workers.add(Kernel.startBackground({ -> incrementMany(c, k, 250, failures) }))
+    workers.add(KT.startBackground({ -> incrementMany(c, k, 250, failures) }))
     t = t + 1
   }
   for w in workers {
-    Kernel.waitBackground(w)
+    KT.waitBackground(w)
   }
   assertEqualInt(failures.count, 0, "no command failed")
   expectSome(Redis.get(c, k), "2000", "every increment was applied exactly once")

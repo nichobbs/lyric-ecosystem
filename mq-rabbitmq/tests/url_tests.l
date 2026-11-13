@@ -121,6 +121,13 @@ test "malformed URLs are rejected without echoing the password" {
   assertTrue(not Str.contains(e, "hunter2"), "the password is not in the error: " + e)
 }
 
+test "an IPv6 address without brackets is rejected" {
+  expectContains(rejected("amqp://::1"), "brackets", "::1 is not host '::' and port 1")
+  expectContains(rejected("amqp://::1:5672"), "brackets", "with a port")
+  expectContains(rejected("amqp://u:p@fe80::1/v"), "brackets", "after credentials, before a virtual host")
+  expectContains(rejected("amqps://2001:db8::7:5671"), "amqps://[::1]:5671", "the error shows the form")
+}
+
 test "percentDecode decodes UTF-8 sequences and rejects bad escapes" {
   assertEqual(match Url.percentDecode("a%20b") { case Ok(s) -> s; case Err(e) -> e }, "a b", "a space")
   assertEqual(match Url.percentDecode("plain") { case Ok(s) -> s; case Err(e) -> e }, "plain", "nothing to decode")

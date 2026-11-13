@@ -4,7 +4,9 @@
 //!
 //! The user, password and virtual host are percent-decoded, so a password may
 //! hold `@`, `:` or `/` written as `%40`, `%3A`, `%2F`. An IPv6 literal is
-//! written in brackets (`amqp://[::1]:5672`).
+//! written in brackets (`amqp://[::1]:5672`); without them it is refused,
+//! because its last group cannot be told from a port. The authority is parsed
+//! by `Net.Url` (`Lyric.Net`).
 //!
 //! The virtual host follows the URI specification RabbitMQ publishes:
 //!
@@ -25,10 +27,9 @@
 package Mq.RabbitMq.Url
 
 import Std.Core
-import Std.Collections
-import Std.Encoding
 import Std.Parse
 import Std.String as Str
+import Net.Url as NetUrl
 
 /// The AMQP port of a stock RabbitMQ broker.
 pub val DEFAULT_PORT: Int = 5672
@@ -59,52 +60,11 @@ pub record BrokerAddress {
   frameMax: Int
 }
 
-func hexValue(unit: in Int): Int {
-  if unit >= 48 and unit <= 57 {
-    unit - 48
-  } else if unit >= 65 and unit <= 70 {
-    unit - 55
-  } else if unit >= 97 and unit <= 102 {
-    unit - 87
-  } else {
-    -1
-  }
-}
-
 /// `text` with every `%XX` replaced by the byte it names, read as UTF-8.
 pub func percentDecode(text: in String): Result[String, String] {
-  if not Str.contains(text, "%") {
-    return Ok(text)
-  }
-  val bytes: List[Byte] = newList()
-  var i = 0
-  while i < text.length {
-    val unit = text.codeUnitAt(i)
-    if unit == 37 {
-      if i + 2 > text.length - 1 {
-        return Err("a '%' is not followed by two hexadecimal digits")
-      }
-      val hi = hexValue(text.codeUnitAt(i + 1))
-      val lo = hexValue(text.codeUnitAt(i + 2))
-      if hi < 0 or lo < 0 {
-        return Err("a '%' is not followed by two hexadecimal digits")
-      }
-      bytes.add((hi * 16 + lo).toByte())
-      i += 3
-    } else {
-      var j = i
-      while j < text.length and text.codeUnitAt(j) != 37 {
-        j += 1
-      }
-      for b in encodeUtf8(Str.substring(text, i, j - i)) {
-        bytes.add(b)
-      }
-      i = j
-    }
-  }
-  match tryDecodeUtf8(bytes.toArray()) {
-    case Some(s) -> Ok(s)
-    case None -> Err("percent-encoded bytes are not valid UTF-8")
+  match NetUrl.percentDecode(text) {
+    case Ok(s) -> Ok(s)
+    case Err(problem) -> Err(NetUrl.escapeProblemText(problem))
   }
 }
 
@@ -112,11 +72,11 @@ func invalid(reason: in String): String {
   "rabbitmq: invalid broker URL: " + reason
 }
 
-func parsePort(text: in String): Result[Int, String] {
-  match parseOptInt(text) {
-    case Some(p) -> if p >= 1 and p <= 65535 { Ok(p) } else { Err(invalid("port " + text + " is out of range")) }
-    case None -> Err(invalid("port '" + text + "' is not a number"))
-  }
+func schemes(): slice[NetUrl.Scheme] {
+  [
+    NetUrl.Scheme(name = "amqp", defaultPort = DEFAULT_PORT, tls = false),
+    NetUrl.Scheme(name = "amqps", defaultPort = DEFAULT_TLS_PORT, tls = true)
+  ]
 }
 
 func parseCount(name: in String, text: in String): Result[Int, String] {
@@ -129,16 +89,12 @@ func parseCount(name: in String, text: in String): Result[Int, String] {
 /// Parse an `amqp://` or `amqps://` broker URL. The password never appears
 /// in an error.
 pub func parseUrl(url: in String): Result[BrokerAddress, String] {
-  val schemeEnd = Str.indexOfRaw(url, "://")
-  if schemeEnd < 0 {
-    return Err(invalid("expected amqp://host[:port][/vhost] or amqps://host[:port][/vhost]"))
+  val found = match NetUrl.matchScheme(url, schemes(), true) {
+    case Ok(m) -> m
+    case Err(NoScheme) -> return Err(invalid("expected amqp://host[:port][/vhost] or amqps://host[:port][/vhost]"))
+    case Err(problem) -> return Err(invalid(NetUrl.schemeProblemText(problem, schemes())))
   }
-  val scheme = Str.toLower(Str.substring(url, 0, schemeEnd))
-  val tls = scheme == "amqps"
-  if not tls and scheme != "amqp" {
-    return Err(invalid("unsupported scheme '" + scheme + "', expected amqp or amqps"))
-  }
-  var rest = Str.substring(url, schemeEnd + 3)
+  var rest = found.rest
   if Str.contains(rest, "#") {
     return Err(invalid("a fragment is not allowed"))
   }
@@ -185,54 +141,27 @@ pub func parseUrl(url: in String): Result[BrokerAddress, String] {
       case Err(e) -> return Err(invalid("virtual host: " + e))
     }
   }
-  var user = DEFAULT_USER
-  var password = DEFAULT_USER
-  val at = Str.lastIndexOfRaw(rest, "@")
-  if at >= 0 {
-    val userInfo = Str.substring(rest, 0, at)
-    rest = Str.substring(rest, at + 1)
-    val colon = Str.indexOfRaw(userInfo, ":")
-    val rawUser = if colon < 0 { userInfo } else { Str.substring(userInfo, 0, colon) }
-    val rawPassword = if colon < 0 { "" } else { Str.substring(userInfo, colon + 1) }
-    user = match percentDecode(rawUser) { case Ok(v) -> v; case Err(e) -> return Err(invalid("user: " + e)) }
-    password = match percentDecode(rawPassword) { case Ok(v) -> v; case Err(e) -> return Err(invalid("password: " + e)) }
-    if user.length == 0 {
-      return Err(invalid("the user before '@' is empty"))
-    }
+  val userInfo = match NetUrl.splitUserInfo(rest) {
+    case Ok(u) -> u
+    case Err(problem) -> return Err(invalid(NetUrl.authorityProblemText(problem, "user", "password", found.scheme)))
   }
-  var host = rest
-  var port = if tls { DEFAULT_TLS_PORT } else { DEFAULT_PORT }
-  if Str.startsWith(rest, "[") {
-    val close = Str.indexOfRaw(rest, "]")
-    if close < 0 {
-      return Err(invalid("an IPv6 address is missing its closing bracket"))
-    }
-    host = Str.substring(rest, 1, close - 1)
-    val after = Str.substring(rest, close + 1)
-    if after.length > 0 {
-      if not Str.startsWith(after, ":") {
-        return Err(invalid("unexpected text after the IPv6 address"))
-      }
-      port = match parsePort(Str.substring(after, 1)) { case Ok(p) -> p; case Err(e) -> return Err(e) }
-    }
-  } else {
-    val colon = Str.lastIndexOfRaw(rest, ":")
-    if colon >= 0 {
-      host = Str.substring(rest, 0, colon)
-      port = match parsePort(Str.substring(rest, colon + 1)) { case Ok(p) -> p; case Err(e) -> return Err(e) }
-    }
+  if userInfo.present and userInfo.user.length == 0 {
+    return Err(invalid("the user before '@' is empty"))
   }
-  if host.length == 0 {
-    return Err(invalid("the host is empty"))
+  val user = if userInfo.present { userInfo.user } else { DEFAULT_USER }
+  val password = if userInfo.present { userInfo.password } else { DEFAULT_USER }
+  val address = match NetUrl.parseHostPort(userInfo.hostPort, found.scheme.defaultPort) {
+    case Ok(hp) -> hp
+    case Err(problem) -> return Err(invalid(NetUrl.authorityProblemText(problem, "user", "password", found.scheme)))
   }
   Ok(
     BrokerAddress(
-      host = host,
-      port = port,
+      host = address.host,
+      port = address.port,
       user = user,
       password = password,
       virtualHost = virtualHost,
-      tls = tls,
+      tls = found.scheme.tls,
       heartbeatSeconds = heartbeat,
       connectTimeoutMs = connectTimeout,
       frameMax = frameMax

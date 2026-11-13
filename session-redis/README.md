@@ -11,7 +11,7 @@ requests on a session lose no update and `set` can never create a session. It ru
 | Targets | `dotnet`, `jvm` |
 | Stability | experimental (0.1.0) |
 | Interface | `Lyric.Session` (`Session.SessionStore`), re-exported with `pub use Session`; conformance suite `Testing.Conformance.Session` from `Lyric.Testing` |
-| Third-party libraries | none; `Lyric.Redis` (`redis/` in this repository) is a `{ workspace = true }` dependency |
+| Third-party libraries | none; `Lyric.Redis` (`redis/` in this repository) is a `{ workspace = true }` dependency, and so is `Lyric.Net` (`net/`), which `Lyric.Redis` connects through and whose `Net.Tcp.Testing` the tests use |
 | Server requirement | `EVAL` must be allowed for the connecting user; Redis 4.0 or later (the scripts use `HSET` with several fields), 6.0 or later for ACL users, RESP3 and TLS |
 
 ## Usage

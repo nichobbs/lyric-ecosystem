@@ -92,14 +92,15 @@ import Std.Math as Math
 import Std.String as Str
 import Std.Environment as Env
 import Std.Console as Console
-import Std.File as File
 import Std.Tls as Tls
-import Mq.RabbitMq.Kernel as K
+import Net.Tcp as K
+import Net.Tls
 import Mq.RabbitMq.Amqp as Amqp
 import Mq.RabbitMq.Url as Url
 import Mq
 import Std.Encoding
 pub use Mq
+pub use Net.Tls
 
 /// The environment variable that must be `1` for `withInsecureSkipVerify()`
 /// to take effect (the standard library's, docs/61 §4 in lyric-lang).
@@ -117,45 +118,6 @@ pub val HEADER_HEADERS: String = "lyric_headers"
 
 /// The version this client reports to the broker.
 pub val CLIENT_VERSION: String = "0.1.0"
-
-/// TLS settings of a connection. PEM text; an empty string means "not
-/// configured". Build one with the `with...` functions on `ConnectOptions`.
-pub record TlsOptions {
-  /// Whether the connection is TLS at all.
-  enabled: Bool
-  /// The name sent as SNI and checked against the server certificate; empty
-  /// uses the `host` field.
-  serverName: String
-  /// A trust anchor accepted in addition to the platform trust store.
-  caCertificatePem: String
-  /// A trust anchor that replaces the platform trust store. Wins over
-  /// `caCertificatePem` when both are set.
-  exclusiveCaCertificatePem: String
-  /// The client certificate and its private key, for a listener that
-  /// requires client authentication (`fail_if_no_peer_cert`). The key is an
-  /// unencrypted PKCS8 `PRIVATE KEY` block, as for `Std.Tls.Identity`.
-  clientCertificatePem: String
-  clientKeyPem: String
-  /// `Tls12` (the default) accepts TLS 1.2 and later; `Tls13` only TLS 1.3.
-  minVersion: Tls.TlsVersion
-  /// A request to skip certificate and name verification. Takes effect only
-  /// when `LYRIC_TLS_ALLOW_INSECURE=1` is also set in the environment.
-  insecureSkipVerify: Bool
-}
-
-/// No TLS: the connection is plain TCP.
-pub func plainTcp(): TlsOptions {
-  TlsOptions(
-    enabled = false,
-    serverName = "",
-    caCertificatePem = "",
-    exclusiveCaCertificatePem = "",
-    clientCertificatePem = "",
-    clientKeyPem = "",
-    minVersion = Tls.TlsVersion.Tls12,
-    insecureSkipVerify = false
-  )
-}
 
 /// How to reach a broker and which queue to use.
 pub record ConnectOptions {
@@ -247,25 +209,25 @@ pub func defaultOptions(host: in String, port: in Int, queue: in String): Connec
 /// Connect over TLS, verifying the server certificate against the platform
 /// trust store and its name against `host`.
 pub func ConnectOptions.withTls(o: in ConnectOptions): ConnectOptions {
-  o.copy(tls = o.tls.copy(enabled = true))
+  o.copy(tls = o.tls.withTls())
 }
 
 /// Check the server certificate against `name` instead of `host`, and send
 /// `name` as SNI. For a broker reached by address or through a tunnel.
 pub func ConnectOptions.withTlsServerName(o: in ConnectOptions, name: in String): ConnectOptions {
-  o.copy(tls = o.tls.copy(serverName = name))
+  o.copy(tls = o.tls.withTlsServerName(name))
 }
 
 /// Trust the CA certificate in `pem` in addition to the platform trust
 /// store. `pem` holds one certificate.
 pub func ConnectOptions.withCaCertificate(o: in ConnectOptions, pem: in String): ConnectOptions {
-  o.copy(tls = o.tls.copy(caCertificatePem = pem))
+  o.copy(tls = o.tls.withCaCertificate(pem))
 }
 
 /// Trust only the CA certificate in `pem`; the platform trust store is not
 /// consulted. Wins over `withCaCertificate`.
 pub func ConnectOptions.withExclusiveCaCertificate(o: in ConnectOptions, pem: in String): ConnectOptions {
-  o.copy(tls = o.tls.copy(exclusiveCaCertificatePem = pem))
+  o.copy(tls = o.tls.withExclusiveCaCertificate(pem))
 }
 
 /// Present a client certificate (mutual TLS). `keyPem` is the certificate's
@@ -273,12 +235,12 @@ pub func ConnectOptions.withExclusiveCaCertificate(o: in ConnectOptions, pem: in
 pub func ConnectOptions.withClientIdentity(
   o: in ConnectOptions, certificatePem: in String, keyPem: in String
 ): ConnectOptions {
-  o.copy(tls = o.tls.copy(clientCertificatePem = certificatePem, clientKeyPem = keyPem))
+  o.copy(tls = o.tls.withClientIdentity(certificatePem, keyPem))
 }
 
 /// Refuse a TLS version older than `version`.
 pub func ConnectOptions.withMinTlsVersion(o: in ConnectOptions, version: in Tls.TlsVersion): ConnectOptions {
-  o.copy(tls = o.tls.copy(minVersion = version))
+  o.copy(tls = o.tls.withMinTlsVersion(version))
 }
 
 /// Ask for certificate and name verification to be skipped. This alone does
@@ -286,7 +248,7 @@ pub func ConnectOptions.withMinTlsVersion(o: in ConnectOptions, version: in Tls.
 /// connection is opened, otherwise verification stays on and a warning goes
 /// to standard error. Never for production.
 pub func ConnectOptions.withInsecureSkipVerify(o: in ConnectOptions): ConnectOptions {
-  o.copy(tls = o.tls.copy(insecureSkipVerify = true))
+  o.copy(tls = o.tls.withInsecureSkipVerify())
 }
 
 /// One delivery from the broker, before it becomes an `Mq.Message`.
@@ -449,7 +411,7 @@ func checkUsable(q: in RabbitMqQueue): Result[Unit, String] {
 }
 
 func writeBytes(q: in RabbitMqQueue, bytes: in slice[Byte]): Result[Unit, String] {
-  match K.sockWrite(q.sock, bytes) {
+  match K.sockWriteWithin(q.sock, bytes, q.options.requestTimeoutMs) {
     case Ok(_) -> {
       q.lastSent = K.monotonicMillis()
       Ok(())
@@ -858,57 +820,9 @@ func validate(options: in ConnectOptions): Result[Unit, String] {
     case Err(e) -> return Err("rabbitmq: queueArguments: " + e)
     case Ok(_) -> ()
   }
-  validateTls(options.tls)
-}
-
-func hasTlsSettings(tls: in TlsOptions): Bool {
-  tls.serverName.length > 0 or tls.caCertificatePem.length > 0 or tls.exclusiveCaCertificatePem.length > 0 or
-    tls.clientCertificatePem.length > 0 or
-    tls.clientKeyPem.length > 0 or
-    tls.insecureSkipVerify or
-    (match tls.minVersion { case Tls13 -> true; case Tls12 -> false })
-}
-
-func checkCertificate(label: in String, pem: in String): Result[Unit, String] {
-  if pem.length == 0 {
-    return Ok(())
-  }
-  match Tls.Certificate.fromPem(pem) {
+  match validateTlsOptions(options.tls) {
     case Ok(_) -> Ok(())
-    case Err(e) -> Err("rabbitmq: TLS " + label + ": " + e.message())
-  }
-}
-
-// The PEM is parsed here with the standard library's loaders, so a bad
-// certificate or key is reported before any connection is made and with the
-// same rules on both targets.
-func validateTls(tls: in TlsOptions): Result[Unit, String] {
-  if not tls.enabled {
-    if hasTlsSettings(tls) {
-      return Err("rabbitmq: TLS options are set but the connection is not TLS; use an amqps:// URL or withTls()")
-    }
-    return Ok(())
-  }
-  match checkCertificate("CA certificate", tls.caCertificatePem) {
-    case Err(e) -> return Err(e)
-    case Ok(_) -> ()
-  }
-  match checkCertificate("exclusive CA certificate", tls.exclusiveCaCertificatePem) {
-    case Err(e) -> return Err(e)
-    case Ok(_) -> ()
-  }
-  if tls.clientCertificatePem.length == 0 and tls.clientKeyPem.length == 0 {
-    return Ok(())
-  }
-  if tls.clientCertificatePem.length == 0 {
-    return Err("rabbitmq: TLS client identity: a private key is set without its certificate")
-  }
-  if tls.clientKeyPem.length == 0 {
-    return Err("rabbitmq: TLS client identity: a certificate is set without its private key")
-  }
-  match Tls.Identity.fromPem(tls.clientCertificatePem, tls.clientKeyPem) {
-    case Ok(_) -> Ok(())
-    case Err(e) -> Err("rabbitmq: TLS client identity: " + e.message())
+    case Err(problem) -> Err("rabbitmq: " + tlsProblemText(problem, "an amqps:// URL"))
   }
 }
 
@@ -916,32 +830,6 @@ func validateTls(tls: in TlsOptions): Result[Unit, String] {
 /// before it opens a socket.
 pub func validateOptions(options: in ConnectOptions): Result[Unit, String] {
   validate(options)
-}
-
-/// Whether the environment holds the second key of the insecure policy
-/// (`LYRIC_TLS_ALLOW_INSECURE=1`).
-pub func insecureAllowedByEnvironment(): Bool {
-  Env.getVarOrDefault(INSECURE_ALLOW_ENV, "") == "1"
-}
-
-/// Whether a connection opened with `tls` now would skip verification: only
-/// when the options ask for it and the environment allows it.
-pub func skipsVerification(tls: in TlsOptions): Bool {
-  tls.enabled and tls.insecureSkipVerify and insecureAllowedByEnvironment()
-}
-
-func kernelTls(options: in ConnectOptions): K.ClientTls {
-  val tls = options.tls
-  val exclusive = tls.exclusiveCaCertificatePem.length > 0
-  K.ClientTls(
-    serverName = if tls.serverName.length > 0 { tls.serverName } else { options.host },
-    caPem = if exclusive { tls.exclusiveCaCertificatePem } else { tls.caCertificatePem },
-    exclusiveCa = exclusive,
-    certPem = tls.clientCertificatePem,
-    keyPem = tls.clientKeyPem,
-    tls13Only = match tls.minVersion { case Tls13 -> true; case Tls12 -> false },
-    skipVerify = skipsVerification(tls)
-  )
 }
 
 // The transport: a TCP connection, secured when the options say so.
@@ -953,13 +841,11 @@ func openTransport(options: in ConnectOptions, endpoint: in String): Result[K.So
   if not options.tls.enabled {
     return Ok(plain)
   }
-  if options.tls.insecureSkipVerify and not insecureAllowedByEnvironment() {
-    Console.error(
-      "[Mq.RabbitMq] warning: withInsecureSkipVerify() requested but " + INSECURE_ALLOW_ENV +
-        " is not set; TLS certificate verification remains ENABLED."
-    )
+  val warning = insecureIgnoredWarning(options.tls, "Mq.RabbitMq")
+  if warning.length > 0 {
+    Console.error(warning)
   }
-  match K.sockStartTls(plain, kernelTls(options), options.connectTimeoutMs) {
+  match K.sockStartTls(plain, options.tls, options.host, skipsVerification(options.tls), options.connectTimeoutMs) {
     case Ok(s) -> Ok(s)
     case Err(e) -> Err("rabbitmq: TLS handshake with " + endpoint + " failed: " + e)
   }
@@ -1229,48 +1115,12 @@ func envOr(field: in String, fallback: in String): String {
   }
 }
 
-// The text of the PEM file named by the variable `field`; `Ok("")` when the
-// variable is unset.
-func pemFromEnv(field: in String): Result[String, String] {
-  val path = envOr(field, "")
-  if path.length == 0 {
-    return Ok("")
-  }
-  match File.readText(path) {
-    case Ok(text) -> Ok(text)
-    case Err(_) -> Err("rabbitmq: cannot read the file named by " + envName(field) + " (" + path + ")")
-  }
-}
-
 // The TLS settings of `connectFromEnv`, applied to `base`.
 func tlsFromEnv(base: in ConnectOptions): Result[ConnectOptions, String] {
-  var options = base
-  val ca = match pemFromEnv("TLSCAFILE") { case Ok(t) -> t; case Err(e) -> return Err(e) }
-  val exclusiveText = Str.toLower(envOr("TLSCAEXCLUSIVE", "false"))
-  if exclusiveText != "true" and exclusiveText != "false" {
-    return Err("rabbitmq: " + envName("TLSCAEXCLUSIVE") + " must be true or false")
+  match tlsOptionsFromEnv(envName(""), base.tls) {
+    case Ok(tls) -> Ok(base.copy(tls = tls))
+    case Err(e) -> Err("rabbitmq: " + e)
   }
-  if ca.length > 0 {
-    options = if exclusiveText == "true" { options.withExclusiveCaCertificate(ca) } else { options.withCaCertificate(ca) }
-  } else if exclusiveText == "true" {
-    return Err("rabbitmq: " + envName("TLSCAEXCLUSIVE") + " is set without " + envName("TLSCAFILE"))
-  }
-  val certificate = match pemFromEnv("TLSCERTFILE") { case Ok(t) -> t; case Err(e) -> return Err(e) }
-  val key = match pemFromEnv("TLSKEYFILE") { case Ok(t) -> t; case Err(e) -> return Err(e) }
-  if certificate.length > 0 or key.length > 0 {
-    options = options.withClientIdentity(certificate, key)
-  }
-  val serverName = envOr("TLSSERVERNAME", "")
-  if serverName.length > 0 {
-    options = options.withTlsServerName(serverName)
-  }
-  val versionText = envOr("TLSMINVERSION", "1.2")
-  if versionText == "1.3" {
-    options = options.withMinTlsVersion(Tls.TlsVersion.Tls13)
-  } else if versionText != "1.2" {
-    return Err("rabbitmq: " + envName("TLSMINVERSION") + " must be 1.2 or 1.3")
-  }
-  Ok(options)
 }
 
 /// The options `connectFromEnv` connects with. A variable that is empty

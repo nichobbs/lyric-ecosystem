@@ -26,7 +26,7 @@ import Session
 import Session.Redis as RedisSessions
 import Session.Redis.Admin as Admin
 import Redis as RedisLib
-import Redis.Kernel as Kernel
+import Net.Tcp.Testing as KT
 import Testing.Conformance
 import Testing.Conformance.Session as SessionConformance
 
@@ -481,17 +481,17 @@ test "concurrent sets on one session from separate connections lose no update" {
   val id = ok(owner.create(), "create")
   val failures: List[String] = newList()
   val stores: List[RedisSessions.RedisSessionStore] = newList()
-  val workers: List[Kernel.Background] = newList()
+  val workers: List[KT.Background] = newList()
   var w = 0
   while w < 6 {
     val store = RedisSessions.fromClient(newClient(), owner.options)
     stores.add(store)
     val worker = w
-    workers.add(Kernel.startBackground({ -> setMany(store, id, worker, 60, failures) }))
+    workers.add(KT.startBackground({ -> setMany(store, id, worker, 60, failures) }))
     w = w + 1
   }
   for worker in workers {
-    Kernel.waitBackground(worker)
+    KT.waitBackground(worker)
   }
   assertEqualInt(failures.count, 0, "no set failed")
   assertEqualInt(loaded(owner, id).entries.count, 360, "every key from every connection is present")
@@ -523,10 +523,10 @@ test "a set racing a destroy never recreates the session" {
     val writer = RedisSessions.fromClient(newClient(), owner.options)
     val id = ok(owner.create(), "create")
     val outcomes: List[String] = newList()
-    val job = Kernel.startBackground({ -> setUntilGone(writer, id, outcomes) })
+    val job = KT.startBackground({ -> setUntilGone(writer, id, outcomes) })
     sleepMillis(5)
     ok(owner.destroy(id), "destroy")
-    Kernel.waitBackground(job)
+    KT.waitBackground(job)
     match ok(owner.load(id), "load") {
       case None -> ()
       case Some(_) -> assertTrue(false, "a set after destroy recreated the session")

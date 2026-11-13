@@ -13,15 +13,15 @@ import Cache
 import Cache.Redis as RedisCache
 import Cache.Redis.Extras as Extras
 import Redis as RedisLib
-import Redis.Kernel as Kernel
+import Net.Tcp.Testing as KT
 
 // A loopback port with nothing listening: bound, read back, released.
 func closedPort(): Int {
-  match Kernel.serverListen("127.0.0.1", 0) {
+  match KT.serverListen("127.0.0.1", 0) {
     case Err(m) -> panic("cannot reserve a port: " + m)
     case Ok(server) -> {
-      val port = Kernel.serverPort(server)
-      Kernel.serverClose(server)
+      val port = KT.serverPort(server)
+      KT.serverClose(server)
       port
     }
   }

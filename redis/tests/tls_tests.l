@@ -1,9 +1,10 @@
 //! tests/tls_tests.l - the client over TLS against an in-process TLS server,
 //! and the TLS configuration checks that need no server.
 //!
-//! The fake server listens on a free loopback port with `Kernel.serverListenTls`
-//! (an `SslStream` server through `Std.TcpHost` on dotnet, an `SSLServerSocket`
-//! on the JVM) and answers a few commands, so the hermetic suite runs real
+//! The fake server listens on a free loopback port and runs the server side
+//! of the handshake on each accepted connection (`Net.Tcp.Testing`: an
+//! `SslStream` on dotnet, an `SSLSocket` on the JVM), then answers a few
+//! commands, so the hermetic suite runs real
 //! handshakes on both targets: trust, the server name, mutual TLS, the
 //! insecure policy, the TLS version floor, and reconnects and timeouts over
 //! TLS.
@@ -37,7 +38,8 @@ import Std.Tls as Tls
 import Std.Uuid
 import Redis
 import Redis.Resp
-import Redis.Kernel as Kernel
+import Net.Tcp as Tcp
+import Net.Tcp.Testing as KT
 
 // ─── Test fixtures (not secrets, see the header) ─────────────────────────────
 // The CA that signed the server and the client certificate.
@@ -77,7 +79,7 @@ union Action {
 record Fake {
   port: Int
   log: List[String]
-  worker: Kernel.Background
+  worker: KT.Background
   /// A configuration the fake accepts, used to stop it.
   trusted: RedisConfig
 }
@@ -98,23 +100,38 @@ func commandWords(v: in RespValue): List[String] {
   words
 }
 
-func writeWire(sock: in Kernel.Sock, text: in String): Unit {
-  val _ = Kernel.sockWrite(sock, encodeUtf8(text))
+// The next bytes from the client; an empty slice means it closed the
+// connection.
+func readChunk(sock: in Tcp.Sock): Result[slice[Byte], String] {
+  while true {
+    match Tcp.sockRead(sock, 4096, 1000) {
+      case Err(m) -> return Err(m)
+      case Ok(Tcp.Data(bytes)) -> return Ok(bytes)
+      case Ok(Tcp.Eof) -> {
+        val closed: slice[Byte] = []
+        return Ok(closed)
+      }
+      case Ok(Tcp.TimedOut) -> ()
+    }
+  }
+  Err("unreachable")
 }
 
-// Serve one connection. False once FAKE.STOP was received. A client whose
-// handshake fails shows up here as a failed first read on the JVM.
+func writeWire(sock: in Tcp.Sock, text: in String): Unit {
+  val _ = Tcp.sockWrite(sock, encodeUtf8(text))
+}
+
+// Serve one connection. False once FAKE.STOP was received. A client the
+// server refused after its own side of the handshake was done (TLS 1.3 and a
+// missing client certificate) shows up here as a failed first read.
 func serveConnection(
-  sock: in Kernel.Sock,
-  index: in Int,
-  handler: in (List[String], Int) -> Action,
-  log: in List[String],
+  sock: in Tcp.Sock, index: in Int, handler: in (List[String], Int) -> Action, log: in List[String]
 ): Bool {
   var decoder = newDecoder()
   var open = true
   var keepServing = true
   while open {
-    match Kernel.sockRead(sock, 4096) {
+    match readChunk(sock) {
       case Err(_) -> {
         open = false
       }
@@ -151,33 +168,44 @@ func serveConnection(
       }
     }
   }
-  Kernel.sockClose(sock)
+  Tcp.sockClose(sock)
   keepServing
 }
 
-// `index` counts the connections whose handshake succeeded. A failed
-// handshake is a failed accept on dotnet; the server keeps listening, up to a
-// bound that only a broken listener reaches.
-func serve(server: in Kernel.ServerSock, handler: in (List[String], Int) -> Action, log: in List[String]): Unit {
+// `index` counts the connections whose handshake succeeded. After a failed
+// handshake the server keeps listening, up to a bound that only a broken
+// listener reaches.
+func serve(
+  server: in KT.ServerSock,
+  tls: in KT.ServerTls,
+  handler: in (List[String], Int) -> Action,
+  log: in List[String],
+): Unit {
   var running = true
   var index = 0
   var refused = 0
   while running {
-    match Kernel.serverAccept(server) {
+    match KT.serverAccept(server) {
       case Err(_) -> {
         refused = refused + 1
         running = refused < 100
       }
-      case Ok(sock) -> {
-        val before = log.count
-        running = serveConnection(sock, index, handler, log)
-        if log.count > before {
-          index = index + 1
+      case Ok(accepted) -> match KT.sockAcceptTls(accepted, tls, 5000) {
+        case Err(_) -> {
+          refused = refused + 1
+          running = refused < 100
+        }
+        case Ok(sock) -> {
+          val before = log.count
+          running = serveConnection(sock, index, handler, log)
+          if log.count > before {
+            index = index + 1
+          }
         }
       }
     }
   }
-  Kernel.serverClose(server)
+  KT.serverClose(server)
 }
 
 func trustedConfig(port: in Int): RedisConfig {
@@ -186,12 +214,13 @@ func trustedConfig(port: in Int): RedisConfig {
 
 func startFakeWith(requireClientCert: in Bool, handler: in (List[String], Int) -> Action): Fake {
   val clientCa = if requireClientCert { caPem } else { "" }
-  match Kernel.serverListenTls("127.0.0.1", 0, serverCertPem, serverKeyPem, clientCa, requireClientCert) {
+  val tls = KT.ServerTls(certPem = serverCertPem, keyPem = serverKeyPem, clientCaPem = clientCa)
+  match KT.serverListen("127.0.0.1", 0) {
     case Err(m) -> panic("the fake TLS server cannot listen: " + m)
     case Ok(server) -> {
       val log: List[String] = newList()
-      val port = Kernel.serverPort(server)
-      val worker = Kernel.startBackground({ -> serve(server, handler, log) })
+      val port = KT.serverPort(server)
+      val worker = KT.startBackground({ -> serve(server, tls, handler, log) })
       val base = trustedConfig(port)
       val trusted = if requireClientCert { Redis.withClientIdentity(base, clientCertPem, clientKeyPem) } else { base }
       Fake(port = port, log = log, worker = worker, trusted = trusted)
@@ -206,7 +235,7 @@ func stopFake(fake: in Fake): Unit {
     case Err(e) -> panic("the fake TLS server did not take FAKE.STOP: " + e.message())
   }
   stopper.close()
-  Kernel.waitBackground(fake.worker)
+  KT.waitBackground(fake.worker)
 }
 
 func bulk(text: in String): String {
@@ -347,6 +376,51 @@ test "another CA does not vouch for the server" {
   stopFake(fake)
 }
 
+test "an additional CA is trusted along with the system trust store" {
+  val fake = startMini(false)
+  val additional = Redis.withCaCertificate(tlsOn(fake.port), caPem)
+  assertEqual(additional.tls.additionalCaCertificatePem, caPem, "the additional CA text")
+  assertEqual(additional.tls.caCertificatePem, "", "it is not the exclusive CA")
+  val c = ok(Redis.open(additional), "open with the additional CA")
+  ok(Redis.ping(c), "PING")
+  c.close()
+  val unrelated = Redis.withCaCertificate(tlsOn(fake.port), otherCaPem)
+  assertEqual(codeOf(Redis.open(unrelated), "another CA, additional"), "TLS_FAILED", "an unrelated CA adds no trust")
+  val both = Redis.withExclusiveCaCertificate(additional, otherCaPem)
+  assertEqual(codeOf(Redis.open(both), "both forms"), "TLS_FAILED", "the exclusive CA wins over the additional one")
+  stopFake(fake)
+}
+
+test "the additional CA is checked like the exclusive one, and can be read from a file" {
+  val plain = Redis.configFor("127.0.0.1", 6379)
+  assertEqual(
+    codeOf(Redis.checkTls(Redis.withCaCertificate(plain, caPem)), "an additional CA without TLS"),
+    "INVALID_CONFIG",
+    "without TLS"
+  )
+  val tls = Redis.withTls(plain)
+  ok(Redis.checkTls(Redis.withCaCertificate(tls, caPem)), "an additional CA with TLS")
+  val bad = Redis.withCaCertificate(tls, "not a certificate")
+  assertEqual(codeOf(Redis.checkTls(bad), "an additional CA that is not PEM"), "INVALID_CONFIG", "not PEM")
+  assertTrue(
+    Str.contains(messageOf(Redis.checkTls(bad), "the message"), "TLS CA certificate"),
+    "the message names the CA"
+  )
+  assertEqual(codeOf(Redis.open(bad), "open"), "INVALID_CONFIG", "open refuses before dialling")
+  val path = Env.getVarOrDefault("TMPDIR", "/tmp") + "/lyric-redis-tls-" + uuidToString(newUuid()) + "-extra-ca.pem"
+  match File.writeText(path, caPem) {
+    case Ok(_) -> ()
+    case Err(_) -> panic("cannot write " + path)
+  }
+  val fromFile = ok(Redis.withCaCertificateFile(tls, path), "the CA file")
+  assertEqual(fromFile.tls.additionalCaCertificatePem, caPem, "the CA text")
+  assertEqual(
+    codeOf(Redis.withCaCertificateFile(tls, path + ".missing"), "a missing file"),
+    "INVALID_CONFIG",
+    "an unreadable file"
+  )
+}
+
 // ─── Server name ─────────────────────────────────────────────────────────────
 test "the certificate must carry the server name" {
   val fake = startMini(false)
@@ -440,28 +514,28 @@ test "a silent TLS server trips the I/O timeout" {
 }
 
 test "a TLS client on a plain port fails the handshake within the I/O timeout" {
-  match Kernel.serverListen("127.0.0.1", 0) {
+  match KT.serverListen("127.0.0.1", 0) {
     case Err(m) -> panic("cannot listen: " + m)
     case Ok(server) -> {
-      val port = Kernel.serverPort(server)
+      val port = KT.serverPort(server)
       // Accepts one connection and never answers: a server that is not TLS.
-      val worker = Kernel.startBackground(
+      val worker = KT.startBackground(
         { ->
-          match Kernel.serverAccept(server) {
+          match KT.serverAccept(server) {
             case Ok(sock) -> {
               sleepMillis(1500)
-              Kernel.sockClose(sock)
+              Tcp.sockClose(sock)
             }
             case Err(_) -> ()
           }
-          Kernel.serverClose(server)
+          KT.serverClose(server)
         }
       )
       val started = nowEpochMillis()
       val cfg = Redis.withTimeouts(trustedConfig(port), 2000, 300)
       assertEqual(codeOf(Redis.open(cfg), "TLS to a plain server"), "TLS_FAILED", "no handshake")
       assertTrue(nowEpochMillis() - started < 1300i64, "the handshake is bounded by the I/O timeout")
-      Kernel.waitBackground(worker)
+      KT.waitBackground(worker)
     }
   }
 }

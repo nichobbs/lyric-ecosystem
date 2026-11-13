@@ -384,4 +384,4 @@ hand.
   in a library package, a `slice[Byte]` returned by a stdlib call and passed straight to another
   Lyric function's `in slice[Byte]` parameter fails class verification
   (`'[B' is not assignable to '[Ljava/lang/Object;'`). Described in
-  `lyric-lang/docs/progress/2026-11-12-http-bytes-body.md`; no issue number yet.
+  `lyric-lang/docs/progress/2026-11-12-http-bytes-body.md` (nichobbs/lyric-lang#9049).
