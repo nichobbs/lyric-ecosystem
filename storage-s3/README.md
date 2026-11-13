@@ -157,6 +157,23 @@ credentials from the application's `config { }` block or the environment, never 
 | `endpoint` | `endpointConfig` | `""` (AWS) | `http(s)://host[:port]`, nothing after the authority but an optional `/`. `https://` unless the host is `localhost`, `127.0.0.1` or `[::1]` |
 | `pathStyle` | `.withPathStyle(flag)` | false for `awsConfig`, true for `endpointConfig` and for an endpoint from the environment | Put the bucket in the path instead of the host name |
 | `requestTimeoutMs` | `.withRequestTimeout(ms)` | 30000 | Deadline of each request; must be positive |
+| `additionalCaCertificatePem` | `.withCaCertificate(pem)`, `.withCaCertificateFile(path)` | `""` | A certificate authority (PEM text, one certificate) trusted in addition to the system trust store |
+| `caCertificatePem` | `.withExclusiveCaCertificate(pem)`, `.withExclusiveCaCertificateFile(path)` | `""` | The only certificate authority the server certificate may chain to; the system trust store is not consulted. Wins over `additionalCaCertificatePem` |
+
+TLS: an `https://` endpoint's certificate is verified against the system trust store and must carry
+the host name. For an S3-compatible server whose certificate comes from a private authority, or is
+self-signed, give the authority's certificate (or the self-signed certificate itself) to
+`withCaCertificate`, which adds it to the system trust store, or to `withExclusiveCaCertificate`,
+which trusts nothing else. These are `Std.Http`'s options of the same names, and the names and
+meaning are those of `Lyric.Redis`. The `...File` forms read a PEM file and return a `Result`: a
+file that is missing or empty is `INVALID_CONFIG`. There is no option to skip certificate
+verification.
+
+```lyric
+val base = endpointConfig("https://minio.internal.example:9000", "reports", "us-east-1", keyId, secret)
+val cfg = match base.withCaCertificateFile("/etc/ssl/private-ca.pem") { case Ok(c) -> c; case Err(e) -> return Err(e) }
+val bucket = connect(cfg)?
+```
 
 `configFromEnv` and `connectFromEnv` read the standard variables (through `Aws.SigV4.Env`):
 
@@ -172,7 +189,8 @@ no profile, no shared credentials file, no instance or container metadata.
 
 `openClient` (and so `connect`) validates the configuration before any request and answers
 `INVALID_CONFIG` for a bucket or region name that could alter the host name, empty credentials, a
-malformed endpoint, a non-positive timeout, or an `http://` endpoint whose host is not loopback. Plain
+malformed endpoint, a non-positive timeout, a CA certificate that is not a PEM certificate, or an
+`http://` endpoint whose host is not loopback. Plain
 HTTP would expose the access key id, object keys, metadata and payloads, and let anyone on the path
 replay a request for the 15 minutes its signature is valid.
 
@@ -199,6 +217,18 @@ Connecting and addressing:
 - **A custom endpoint is path-style, AWS is virtual-hosted.** A bucket name containing dots is not
   covered by AWS's TLS wildcard certificate; address it with `.withPathStyle(true)`. An endpoint with
   a path (a gateway mounted under a prefix) is refused.
+- **A CA certificate applies to the client's own requests only.** A presigned URL is fetched by
+  whoever receives it, with their own trust store. On an `http://` (loopback) endpoint the option is
+  validated and then has nothing to verify.
+- **Only the first certificate of the PEM text is read.** `withCaCertificate` and
+  `withExclusiveCaCertificate` take one certificate authority, not a bundle: in a file with several
+  certificates the others are ignored, on both targets. Pass the authority that signed the server
+  certificate (for a self-signed server, its own certificate).
+- **An untrusted server certificate is `CONNECTION_FAILED`, and the message differs by target.** On
+  the JVM it names the cause (`PKIX path building failed: ... unable to find valid certification path
+  to requested target`); on dotnet it is only `The SSL connection could not be established, see inner
+  exception`. The code is the same, and so are the CA options: both targets accept the same PEM and
+  behave the same in the hermetic and integration suites.
 - **Bucket names are validated to today's S3 rules**, so a legacy bucket with uppercase letters or
   underscores cannot be opened.
 - **Credentials are static.** There is no provider chain and no refresh: when a session token is
@@ -323,7 +353,12 @@ The default run is hermetic and needs no network:
   HTTP against an S3 server written in Lyric on `Std.HttpServer` inside the test. The server
   verifies the SigV4 signature of every request (header and presigned-URL forms) with the shared
   secret and the hash of the body it received, keeps objects in memory, and pages ListObjectsV2. It
-  listens on the loopback ports 19471 to 19476, which must be free.
+  The same server is also started over HTTPS (`Std.HttpServer.startListenerTls`, both targets) with
+  a fixture certificate from a private CA: a client given that CA with `withCaCertificate` or
+  `withExclusiveCaCertificate` stores and reads an object, and a client without it, or with another
+  CA, gets `CONNECTION_FAILED` and never reaches the server. The certificates and the key in the
+  file are labelled test fixtures. It listens on the loopback ports 19471 to 19477, which must be
+  free.
 
 Integration tests run against a real S3-compatible server and are compiled only with
 `--features integration`:
@@ -346,6 +381,7 @@ them to `$GITHUB_ENV` under GitHub Actions.
 | `LYRIC_S3_REGION` | the region to sign for (`us-east-1` for a default MinIO) |
 | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | credentials that may create and use the bucket |
 | `AWS_SESSION_TOKEN` | optional |
+| `LYRIC_S3_CA_FILE` | optional: a PEM file with a certificate authority, passed to `withCaCertificateFile` (and trusted by the test's own client for presigned URLs) |
 
 A missing variable fails every integration test with a message naming it. The suite runs the
 conformance suite, binary objects with encoded keys and metadata, HEAD, presigned GET and PUT
@@ -360,7 +396,23 @@ fetched by a client without credentials, and S3's own error codes, on both targe
 | `Lyric.Storage`, `Lyric.Testing`, standard library | the `lyric-lang` commit in `.lyric-lang-rev`, through the root `[workspace.overrides]`. The package needs `Std.Http.withBytesBody`, `HttpResponse.headerNames` and (for the tests) `Std.HttpServer.requestBodyBytes`, added in nichobbs/lyric-lang#9047 and not in a release yet |
 | MinIO (integration suite) | `github.com/minio/minio@v0.0.0-20260212201848-7aac2a2c5b7c`, single node, built from that module version by `scripts/ci/start-minio.sh` |
 
-The suite has not been run against AWS S3 itself in CI; `LYRIC_S3_ENDPOINT=aws` is there to do so by
+The suite also runs against [AWS Emulator](https://github.com/aws/aws-emulator) 1.0.341, AWS's own
+local emulator, in the `aws-emulator` CI job (all four integration tests, both targets):
+
+```sh
+set -a; eval "$(bash scripts/ci/start-aws-emulator.sh)"; set +a
+bash scripts/ci/test-aws-emulator.sh dotnet     # or jvm; runs mq-sqs and storage-s3
+```
+
+It verifies signatures against a key generated at start, takes the bucket in the path only, and
+follows Amazon where MinIO differs: creating a bucket the account already owns is a 200 in
+`us-east-1`, so `createBucket` returns `Ok(true)` there. It serves HTTPS with a certificate made at
+start, from its own CA. `test-aws-emulator.sh` passes that CA as `LYRIC_S3_CA_FILE`, so the suite
+trusts it through `withCaCertificateFile` and nothing process-wide is changed (no `SSL_CERT_FILE`,
+no JVM trust store): this run is the check of the CA option against a real HTTPS server with a
+private certificate, on both targets.
+
+The suite has not been run against AWS S3 itself; `LYRIC_S3_ENDPOINT=aws` is there to do so by
 hand.
 
 ## Known gaps

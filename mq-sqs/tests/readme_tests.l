@@ -47,9 +47,23 @@ func provision(cfg: in Sqs.SqsConfig): Result[Sqs.SqsQueue, String] {
   Ok(queue)
 }
 
+func privateCa(queueUrl: in String, keyId: in String, secret: in String): Result[Sqs.SqsQueue, String] {
+  val base = Sqs.endpointConfig("https://sqs.internal.example:9324", queueUrl, "us-east-1", keyId, secret)
+  val cfg = match base.withCaCertificateFile("/etc/ssl/private-ca.pem") {
+    case Ok(c) -> c
+    case Err(e) -> return Err(e.text())
+  }
+  val queue = Sqs.connectWith(cfg)?
+  Ok(queue)
+}
+
 test "the README examples compile and fail cleanly without a server" {
   val cfg = Sqs.endpointConfig("http://127.0.0.1:1", "http://127.0.0.1:1/000000000000/orders", "elasticmq", "x", "x").withRequestTimeout(
     2000
   )
   assertTrue(isErr(provision(cfg)), "nothing listens there")
+  assertTrue(
+    isErr(privateCa("https://sqs.internal.example:9324/000000000000/orders", "x", "x")),
+    "the CA file of the example is not there"
+  )
 }

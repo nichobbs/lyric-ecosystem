@@ -53,7 +53,9 @@ and the interface dependencies become registry version ranges.
 
 Suites that need a real service live in `<package>/tests/integration/` and run with
 `bash scripts/ci/test-packages.sh <target> --integration` once the service is reachable; the
-package README names the environment variables. CI runs them against service containers.
+package README names the environment variables. CI runs them against service containers, and runs
+`mq-sqs` and `storage-s3` a second time against AWS Emulator (`scripts/ci/start-aws-emulator.sh`,
+`scripts/ci/test-aws-emulator.sh`), which verifies their signatures.
 
 ## Continuous integration
 

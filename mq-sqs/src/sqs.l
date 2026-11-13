@@ -374,6 +374,9 @@ func parseSmallInt(text: in String): Option[Int] {
 ///   `default`
 /// - `LYRIC_CONFIG_MQ_SQS_DEADLETTERQUEUEURL`: the queue `nack(id, false)`
 ///   copies to (default: none)
+/// - `LYRIC_CONFIG_MQ_SQS_CACERTIFICATEFILE`: a PEM file holding a
+///   certificate authority to trust in addition to the system trust store
+///   (`withCaCertificateFile`; default: none)
 /// - the credentials, region and endpoint of `configFromEnv`
 ///   (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`,
 ///   `AWS_REGION` or `AWS_DEFAULT_REGION`, `AWS_ENDPOINT_URL_SQS` or
@@ -400,8 +403,17 @@ pub func connectFromEnv(): Result[SqsQueue, String] {
     case Some(n) -> n
     case None -> return Err("sqs: LYRIC_CONFIG_MQ_SQS_RECEIVEBATCH must be a number from 1 to 10")
   }
+  val caFile = envOr("CACERTIFICATEFILE", "")
+  val trusting = if caFile.length == 0 {
+    base
+  } else {
+    match base.withCaCertificateFile(caFile) {
+      case Ok(c) -> c
+      case Err(e) -> return Err("sqs: LYRIC_CONFIG_MQ_SQS_CACERTIFICATEFILE: " + e.message)
+    }
+  }
   connectWith(
-    base.copy(
+    trusting.copy(
       ackMode = mode,
       visibilityTimeoutSeconds = visibility,
       receiveBatchSize = batch,

@@ -22,11 +22,13 @@ import Std.Core
 import Std.Collections
 import Std.Encoding as Enc
 import Std.Errors
+import Std.File as File
 import Std.Hash as Hash
 import Std.Http
 import Std.String as Str
 import Std.Task
 import Std.Time as Time
+import Std.Tls as Tls
 import Aws.SigV4
 import Aws.SigV4.Env as AwsEnv
 import Storage
@@ -44,6 +46,10 @@ val DEFAULT_REQUEST_TIMEOUT_MS: Int = 30000
 /// access key id, the object or its metadata. `pathStyle` puts the bucket in
 /// the path instead of the host name; custom endpoints usually need it.
 /// `sessionToken` is empty for long-term credentials.
+///
+/// `caCertificatePem` and `additionalCaCertificatePem` are set with
+/// `withExclusiveCaCertificate` and `withCaCertificate`; both empty verifies
+/// the server certificate against the system trust store.
 pub record S3Config {
   bucket: String
   region: String
@@ -53,6 +59,13 @@ pub record S3Config {
   endpoint: String
   pathStyle: Bool
   requestTimeoutMs: Int
+  /// The only certificate authority the server certificate may chain to (PEM
+  /// text); `""` trusts the system trust store and
+  /// `additionalCaCertificatePem`.
+  caCertificatePem: String = ""
+  /// A certificate authority trusted in addition to the system trust store
+  /// (PEM text); `""` adds none. Ignored when `caCertificatePem` is set.
+  additionalCaCertificatePem: String = ""
 }
 
 /// Configuration for a bucket on AWS, virtual-hosted.
@@ -92,44 +105,72 @@ pub func endpointConfig(
 
 /// `cfg` with temporary credentials' session token.
 pub func S3Config.withSessionToken(cfg: in S3Config, sessionToken: in String): S3Config {
-  S3Config(
-    bucket = cfg.bucket,
-    region = cfg.region,
-    accessKeyId = cfg.accessKeyId,
-    secretAccessKey = cfg.secretAccessKey,
-    sessionToken = sessionToken,
-    endpoint = cfg.endpoint,
-    pathStyle = cfg.pathStyle,
-    requestTimeoutMs = cfg.requestTimeoutMs
-  )
+  cfg.copy(sessionToken = sessionToken)
 }
 
 /// `cfg` addressing the bucket in the path (`true`) or the host name.
 pub func S3Config.withPathStyle(cfg: in S3Config, pathStyle: in Bool): S3Config {
-  S3Config(
-    bucket = cfg.bucket,
-    region = cfg.region,
-    accessKeyId = cfg.accessKeyId,
-    secretAccessKey = cfg.secretAccessKey,
-    sessionToken = cfg.sessionToken,
-    endpoint = cfg.endpoint,
-    pathStyle = pathStyle,
-    requestTimeoutMs = cfg.requestTimeoutMs
-  )
+  cfg.copy(pathStyle = pathStyle)
 }
 
 /// `cfg` with a per-request deadline in milliseconds.
 pub func S3Config.withRequestTimeout(cfg: in S3Config, requestTimeoutMs: in Int): S3Config {
-  S3Config(
-    bucket = cfg.bucket,
-    region = cfg.region,
-    accessKeyId = cfg.accessKeyId,
-    secretAccessKey = cfg.secretAccessKey,
-    sessionToken = cfg.sessionToken,
-    endpoint = cfg.endpoint,
-    pathStyle = cfg.pathStyle,
-    requestTimeoutMs = requestTimeoutMs
-  )
+  cfg.copy(requestTimeoutMs = requestTimeoutMs)
+}
+
+/// `cfg` trusting the certificate authority `caPem` (PEM text, one
+/// certificate) in addition to the system trust store: the additive form, as
+/// `Std.Http`'s `withCaCertificate`. For an S3-compatible server whose
+/// certificate is signed by a private authority, or is self-signed (pass the
+/// certificate itself). `withExclusiveCaCertificate` wins when both are set.
+/// An unusable certificate is `INVALID_CONFIG` from `openClient`.
+pub func S3Config.withCaCertificate(cfg: in S3Config, caPem: in String): S3Config
+  requires: caPem.length > 0
+{
+  cfg.copy(additionalCaCertificatePem = caPem)
+}
+
+/// `cfg` trusting ONLY the certificate authority `caPem` (PEM text) for the
+/// server certificate: the system trust store is not consulted. This is the
+/// trust-replacing form, as `Std.Http`'s `withExclusiveCaCertificate`;
+/// `withCaCertificate` is the additive one. An unusable certificate is
+/// `INVALID_CONFIG` from `openClient`.
+pub func S3Config.withExclusiveCaCertificate(cfg: in S3Config, caPem: in String): S3Config
+  requires: caPem.length > 0
+{
+  cfg.copy(caCertificatePem = caPem)
+}
+
+func readPem(path: in String): Result[String, StorageError] {
+  if path.length == 0 {
+    return Err(invalidConfig("the path of the CA certificate is empty"))
+  }
+  match File.readText(path) {
+    case Ok(text) -> if text.length > 0 {
+      Ok(text)
+    } else {
+      Err(invalidConfig("the CA certificate file is empty: " + path))
+    }
+    case Err(_) -> Err(invalidConfig("cannot read the CA certificate: " + path))
+  }
+}
+
+/// `withCaCertificate` reading the PEM file at `path`. `Err(INVALID_CONFIG)`
+/// when the file cannot be read or is empty.
+pub func S3Config.withCaCertificateFile(cfg: in S3Config, path: in String): Result[S3Config, StorageError] {
+  match readPem(path) {
+    case Ok(pem) -> Ok(cfg.withCaCertificate(pem))
+    case Err(e) -> Err(e)
+  }
+}
+
+/// `withExclusiveCaCertificate` reading the PEM file at `path`.
+/// `Err(INVALID_CONFIG)` when the file cannot be read or is empty.
+pub func S3Config.withExclusiveCaCertificateFile(cfg: in S3Config, path: in String): Result[S3Config, StorageError] {
+  match readPem(path) {
+    case Ok(pem) -> Ok(cfg.withExclusiveCaCertificate(pem))
+    case Err(e) -> Err(e)
+  }
 }
 
 /// Configuration for `bucket` from the standard AWS environment variables:
@@ -291,12 +332,47 @@ func parseEndpoint(raw: in String): Result[Endpoint, StorageError] {
   Ok(Endpoint(scheme = scheme, authority = authority))
 }
 
+func caCertificate(pem: in String, option: in String): Result[Tls.Certificate, StorageError] {
+  match Tls.Certificate.fromPem(pem) {
+    case Ok(cert) -> Ok(cert)
+    case Err(e) -> Err(
+      invalidConfig("the certificate given to " + option + " is not usable: " + Tls.TlsError.message(e))
+    )
+  }
+}
+
+// The HTTP client of a configuration. A redirect (S3 answers 301/307 for a
+// bucket in another region) would be followed to a host the signature does
+// not cover; it is returned as the error it is instead.
+func httpClientFor(cfg: in S3Config): Result[HttpClient, StorageError] {
+  if cfg.caCertificatePem.length == 0 and cfg.additionalCaCertificatePem.length == 0 {
+    return Ok(clientNoRedirects())
+  }
+  if not tlsConfigSupported() {
+    return Err(invalidConfig("a CA certificate cannot be configured on this target"))
+  }
+  var builder = HttpClientBuilder.new().withNoRedirects()
+  if cfg.caCertificatePem.length > 0 {
+    builder = match caCertificate(cfg.caCertificatePem, "withExclusiveCaCertificate") {
+      case Err(e) -> return Err(e)
+      case Ok(cert) -> builder.withExclusiveCaCertificate(cert)
+    }
+  } else {
+    builder = match caCertificate(cfg.additionalCaCertificatePem, "withCaCertificate") {
+      case Err(e) -> return Err(e)
+      case Ok(cert) -> builder.withCaCertificate(cert)
+    }
+  }
+  Ok(builder.build())
+}
+
 /// Validate `cfg` and open a client for its bucket. No request is made: a
 /// wrong credential or a missing bucket shows up on the first operation.
 ///
 /// `Err(INVALID_CONFIG)` for an invalid bucket or region name, empty
 /// credentials, a malformed endpoint, a plain `http://` endpoint that is not
-/// loopback, or a non-positive timeout.
+/// loopback, a non-positive timeout, or a CA certificate that is not a PEM
+/// certificate.
 pub func openClient(cfg: in S3Config): Result[S3Client, StorageError] {
   if not isValidBucketName(cfg.bucket) {
     return Err(invalidConfig("invalid S3 bucket name: '" + cfg.bucket + "'"))
@@ -319,6 +395,7 @@ pub func openClient(cfg: in S3Config): Result[S3Client, StorageError] {
     }
   }
   val host = if cfg.pathStyle { endpoint.authority } else { cfg.bucket + "." + endpoint.authority }
+  val http = match httpClientFor(cfg) { case Ok(h) -> h; case Err(e) -> return Err(e) }
   Ok(
     S3Client(
       bucket = cfg.bucket,
@@ -332,10 +409,7 @@ pub func openClient(cfg: in S3Config): Result[S3Client, StorageError] {
       host = host,
       basePath = if cfg.pathStyle { "/" + cfg.bucket } else { "" },
       requestTimeoutMs = cfg.requestTimeoutMs,
-      // A redirect (S3 answers 301/307 for a bucket in another region) would
-      // be followed to a host the signature does not cover; it is returned
-      // as the error it is instead.
-      http = clientNoRedirects()
+      http = http
     )
   )
 }

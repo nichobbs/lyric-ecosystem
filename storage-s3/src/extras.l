@@ -109,7 +109,9 @@ pub func presignedPutUrl(client: in S3Client, key: in String, expiresInSeconds: 
 
 /// Create the client's bucket in the client's region. `Ok(true)` when it was
 /// created, `Ok(false)` when this account already owns it; a name taken by
-/// another account is `Err(BucketAlreadyExists)`.
+/// another account is `Err(BucketAlreadyExists)`. Amazon S3 answers 200 for a
+/// bucket the account already owns in `us-east-1`, so there the result is
+/// `Ok(true)` either way.
 pub func createBucket(client: in S3Client): Result[Bool, StorageError] {
   val none: List[Pair] = newList()
   // us-east-1 is the default location and must not be named; every other

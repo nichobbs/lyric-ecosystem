@@ -165,7 +165,7 @@ test "the defaults are SQS's" {
   assertEqual(cfg.withSessionToken("t").sessionToken, "t", "withSessionToken")
 }
 
-val NAMES: slice[String] = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_SQS", "LYRIC_CONFIG_MQ_SQS_QUEUEURL", "LYRIC_CONFIG_MQ_SQS_ACKMODE", "LYRIC_CONFIG_MQ_SQS_VISIBILITYTIMEOUT", "LYRIC_CONFIG_MQ_SQS_RECEIVEBATCH", "LYRIC_CONFIG_MQ_SQS_MESSAGEGROUP", "LYRIC_CONFIG_MQ_SQS_DEADLETTERQUEUEURL"]
+val NAMES: slice[String] = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_SQS", "LYRIC_CONFIG_MQ_SQS_QUEUEURL", "LYRIC_CONFIG_MQ_SQS_ACKMODE", "LYRIC_CONFIG_MQ_SQS_VISIBILITYTIMEOUT", "LYRIC_CONFIG_MQ_SQS_RECEIVEBATCH", "LYRIC_CONFIG_MQ_SQS_MESSAGEGROUP", "LYRIC_CONFIG_MQ_SQS_DEADLETTERQUEUEURL", "LYRIC_CONFIG_MQ_SQS_CACERTIFICATEFILE"]
 
 func saved(): slice[String] {
   val acc: List[String] = newList()
@@ -276,6 +276,13 @@ test "connectFromEnv opens the queue the environment describes" {
   assertEqual(envConnectText(), "sqs: LYRIC_CONFIG_MQ_SQS_RECEIVEBATCH must be a number from 1 to 10", "a bad batch")
   Env.setVar("LYRIC_CONFIG_MQ_SQS_RECEIVEBATCH", "50")
   assertEqual(envConnectText(), "sqs: receiveBatchSize must be 1 to 10, got 50", "a batch out of range")
+  Env.setVar("LYRIC_CONFIG_MQ_SQS_RECEIVEBATCH", "1")
+  Env.setVar("LYRIC_CONFIG_MQ_SQS_CACERTIFICATEFILE", "/no/such/dir/ca.pem")
+  assertEqual(
+    envConnectText(),
+    "sqs: LYRIC_CONFIG_MQ_SQS_CACERTIFICATEFILE: cannot read the CA certificate: /no/such/dir/ca.pem",
+    "a CA file that is not there"
+  )
   restore(before)
 }
 

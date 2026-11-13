@@ -26,10 +26,12 @@ import Std.Core
 import Std.Collections
 import Std.Encoding as Enc
 import Std.Errors
+import Std.File as File
 import Std.Http
 import Std.JsonValue
 import Std.String as Str
 import Std.Task
+import Std.Tls as Tls
 import Aws.SigV4
 import Aws.SigV4.Env as AwsEnv
 import Mq
@@ -122,6 +124,14 @@ pub record SqsConfig {
   /// The largest `SendMessageBatch` request, in bytes of message bodies and
   /// attributes; a larger `publishBatch` is split.
   maxBatchBytes: Int
+  /// The only certificate authority the server certificate may chain to (PEM
+  /// text); `""` trusts the system trust store and
+  /// `additionalCaCertificatePem`. Set with `withExclusiveCaCertificate`.
+  caCertificatePem: String = ""
+  /// A certificate authority trusted in addition to the system trust store
+  /// (PEM text); `""` adds none. Ignored when `caCertificatePem` is set. Set
+  /// with `withCaCertificate`.
+  additionalCaCertificatePem: String = ""
 }
 
 /// Configuration for a queue on an SQS-compatible server at `endpoint`
@@ -217,6 +227,94 @@ pub func SqsConfig.withDeadLetterQueue(cfg: in SqsConfig, queueUrl: in String): 
   cfg.copy(deadLetterQueueUrl = queueUrl)
 }
 
+/// `cfg` trusting the certificate authority `caPem` (PEM text, one
+/// certificate) in addition to the system trust store: the additive form, as
+/// `Std.Http`'s `withCaCertificate`. For an SQS-compatible server whose
+/// certificate is signed by a private authority, or is self-signed (pass the
+/// certificate itself). `withExclusiveCaCertificate` wins when both are set.
+/// An unusable certificate is `INVALID_CONFIG` from `openClient`.
+pub func SqsConfig.withCaCertificate(cfg: in SqsConfig, caPem: in String): SqsConfig
+  requires: caPem.length > 0
+{
+  cfg.copy(additionalCaCertificatePem = caPem)
+}
+
+/// `cfg` trusting ONLY the certificate authority `caPem` (PEM text) for the
+/// server certificate: the system trust store is not consulted. This is the
+/// trust-replacing form, as `Std.Http`'s `withExclusiveCaCertificate`;
+/// `withCaCertificate` is the additive one. An unusable certificate is
+/// `INVALID_CONFIG` from `openClient`.
+pub func SqsConfig.withExclusiveCaCertificate(cfg: in SqsConfig, caPem: in String): SqsConfig
+  requires: caPem.length > 0
+{
+  cfg.copy(caCertificatePem = caPem)
+}
+
+func readPem(path: in String): Result[String, SqsError] {
+  if path.length == 0 {
+    return Err(invalidConfig("the path of the CA certificate is empty"))
+  }
+  match File.readText(path) {
+    case Ok(text) -> if text.length > 0 {
+      Ok(text)
+    } else {
+      Err(invalidConfig("the CA certificate file is empty: " + path))
+    }
+    case Err(_) -> Err(invalidConfig("cannot read the CA certificate: " + path))
+  }
+}
+
+/// `withCaCertificate` reading the PEM file at `path`. `Err(INVALID_CONFIG)`
+/// when the file cannot be read or is empty.
+pub func SqsConfig.withCaCertificateFile(cfg: in SqsConfig, path: in String): Result[SqsConfig, SqsError] {
+  match readPem(path) {
+    case Ok(pem) -> Ok(cfg.withCaCertificate(pem))
+    case Err(e) -> Err(e)
+  }
+}
+
+/// `withExclusiveCaCertificate` reading the PEM file at `path`.
+/// `Err(INVALID_CONFIG)` when the file cannot be read or is empty.
+pub func SqsConfig.withExclusiveCaCertificateFile(cfg: in SqsConfig, path: in String): Result[SqsConfig, SqsError] {
+  match readPem(path) {
+    case Ok(pem) -> Ok(cfg.withExclusiveCaCertificate(pem))
+    case Err(e) -> Err(e)
+  }
+}
+
+func caCertificate(pem: in String, option: in String): Result[Tls.Certificate, SqsError] {
+  match Tls.Certificate.fromPem(pem) {
+    case Ok(cert) -> Ok(cert)
+    case Err(e) -> Err(
+      invalidConfig("the certificate given to " + option + " is not usable: " + Tls.TlsError.message(e))
+    )
+  }
+}
+
+// The HTTP client of a configuration. A redirect would be followed to a host
+// the signature does not cover; it is returned as the error it is instead.
+func httpClientFor(cfg: in SqsConfig): Result[HttpClient, SqsError] {
+  if cfg.caCertificatePem.length == 0 and cfg.additionalCaCertificatePem.length == 0 {
+    return Ok(clientNoRedirects())
+  }
+  if not tlsConfigSupported() {
+    return Err(invalidConfig("a CA certificate cannot be configured on this target"))
+  }
+  var builder = HttpClientBuilder.new().withNoRedirects()
+  if cfg.caCertificatePem.length > 0 {
+    builder = match caCertificate(cfg.caCertificatePem, "withExclusiveCaCertificate") {
+      case Err(e) -> return Err(e)
+      case Ok(cert) -> builder.withExclusiveCaCertificate(cert)
+    }
+  } else {
+    builder = match caCertificate(cfg.additionalCaCertificatePem, "withCaCertificate") {
+      case Err(e) -> return Err(e)
+      case Ok(cert) -> builder.withCaCertificate(cert)
+    }
+  }
+  Ok(builder.build())
+}
+
 /// A connection to one SQS endpoint. Build one with `openClient`; the fields
 /// are derived from a validated `SqsConfig` and are not meant to be set by
 /// hand.
@@ -236,7 +334,8 @@ pub record SqsClient {
 ///
 /// `Err(INVALID_CONFIG)` for empty credentials, a malformed endpoint or
 /// queue URL, a plain `http://` URL that is not loopback, a region that is
-/// neither given nor part of an AWS host name, or a non-positive timeout.
+/// neither given nor part of an AWS host name, a non-positive timeout, or a
+/// CA certificate that is not a PEM certificate.
 pub func openClient(cfg: in SqsConfig): Result[SqsClient, SqsError] {
   if cfg.accessKeyId.length == 0 or cfg.secretAccessKey.length == 0 {
     return Err(invalidConfig("SQS access key id and secret access key must be non-empty"))
@@ -276,6 +375,7 @@ pub func openClient(cfg: in SqsConfig): Result[SqsClient, SqsError] {
   if endpoint.authority.length == 0 {
     endpoint = Endpoint(scheme = "https", authority = "sqs." + region + ".amazonaws.com")
   }
+  val http = match httpClientFor(cfg) { case Ok(h) -> h; case Err(e) -> return Err(e) }
   Ok(
     SqsClient(
       region = region,
@@ -287,9 +387,7 @@ pub func openClient(cfg: in SqsConfig): Result[SqsClient, SqsError] {
       origin = endpoint.origin(),
       host = endpoint.authority,
       requestTimeoutMs = cfg.requestTimeoutMs,
-      // A redirect would be followed to a host the signature does not cover;
-      // it is returned as the error it is instead.
-      http = clientNoRedirects()
+      http = http
     )
   )
 }
