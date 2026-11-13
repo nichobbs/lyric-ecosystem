@@ -13,11 +13,11 @@ interface's conformance suite on every target it claims.
 | `Lyric.Storage.S3` | `storage-s3/` | `Storage.StorageBucket` | Amazon S3 and S3-compatible stores | dotnet, jvm | pure Lyric (SigV4 over `Std.Http`) |
 | `Lyric.Storage.Gcs` | `storage-gcs/` | `Storage.StorageBucket` | Google Cloud Storage | dotnet, jvm | pure Lyric (XML API, GOOG4-HMAC-SHA256 over `Std.Http`); not yet verified with a real key |
 | `Lyric.Storage.AzureBlob` | `storage-azure-blob/` | `Storage.StorageBucket` | Azure Blob Storage | dotnet, jvm | pure Lyric (Shared Key over `Std.Http`) |
-| `Lyric.Aws.SigV4` | `aws-sigv4/` | (shared signing) | AWS Signature V4 | dotnet, jvm | pure Lyric |
+| `Lyric.Aws.SigV4` | `aws-sigv4/` | (shared signing) | AWS Signature V4 | dotnet, jvm, native | pure Lyric |
 | `Lyric.Jobs.Quartz` | `jobs-quartz/` | `Jobs.JobScheduler` | Quartz | jvm | Quartz via Maven |
 | `Lyric.Jobs.QuartzNet` | `jobs-quartznet/` | `Jobs.JobScheduler` | Quartz.NET | dotnet | Quartz.NET via NuGet |
-| `Lyric.Net` | `net/` | (shared TCP and TLS client connections, TLS options, URL authority parsing) | host sockets and TLS | dotnet, jvm | pure Lyric over one per-target socket kernel; used by `Lyric.Redis`, `Lyric.Mq.RabbitMq` and `Lyric.Mq.ActiveMq` |
-| `Lyric.Redis` | `redis/` | (client) | Redis | dotnet, jvm | pure Lyric (RESP over TCP) |
+| `Lyric.Net` | `net/` | (shared TCP and TLS client connections, TLS options, URL authority parsing) | host sockets and TLS | dotnet, jvm, native | pure Lyric over one per-target socket kernel; used by `Lyric.Redis`, `Lyric.Mq.RabbitMq` and `Lyric.Mq.ActiveMq` |
+| `Lyric.Redis` | `redis/` | (client) | Redis | dotnet, jvm, native | pure Lyric (RESP over TCP) |
 | `Lyric.Cache.Redis` | `cache-redis/` | `Cache.CacheStore` | Redis | dotnet, jvm | on `Lyric.Redis` |
 | `Lyric.Cache.Memcached` | `cache-memcached/` | `Cache.CacheStore` | memcached 1.6.10 and later | dotnet, jvm | pure Lyric (meta protocol on `Lyric.Net`) |
 | `Lyric.Session.Redis` | `session-redis/` | `Session.SessionStore` | Redis | dotnet, jvm | on `Lyric.Redis` |
@@ -56,6 +56,11 @@ Suites that need a real service live in `<package>/tests/integration/` and run w
 package README names the environment variables. CI runs them against service containers, and runs
 `mq-sqs` and `storage-s3` a second time against AWS Emulator (`scripts/ci/start-aws-emulator.sh`,
 `scripts/ci/test-aws-emulator.sh`), which verifies their signatures.
+
+Packages that claim `native` run with `bash scripts/ci/test-native.sh` (add `--integration` for the
+service suites) after `make -C ../lyric-lang/lyric-rt`; it needs clang. `lyric test --manifest` does
+not take `--target native` yet (nichobbs/lyric-lang#6815), so `scripts/ci/native-tests.py` builds
+each test module into a native executable and runs it.
 
 ## Continuous integration
 

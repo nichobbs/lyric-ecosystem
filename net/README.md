@@ -1,8 +1,8 @@
 # Lyric.Net
 
-TCP and TLS client connections for protocol clients written in Lyric, for `dotnet` and `jvm`,
-`experimental` (0.1.0). It implements no `lyric-lang` interface: it is the layer under the pure-Lyric
-clients of this repository (`Lyric.Redis`, `Lyric.Mq.ActiveMq`, `Lyric.Mq.RabbitMq`), which used to
+TCP and TLS client connections for protocol clients written in Lyric, for `dotnet`, `jvm` and
+`native` (POSIX), `experimental` (0.1.0). It implements no `lyric-lang` interface: it is the layer
+under the pure-Lyric clients of this repository (`Lyric.Redis`, `Lyric.Mq.ActiveMq`, `Lyric.Mq.RabbitMq`), which used to
 carry a copy each, and it can be used directly by any client that speaks its own protocol over a
 socket.
 
@@ -20,11 +20,11 @@ It holds three things:
 | | |
 |---|---|
 | Lyric packages | `Net.Tcp`, `Net.Tls`, `Net.Url`; `Net.Tcp.Testing` (test support); `Net.Tcp.Kernel` (the externs, not an API) |
-| Targets | `dotnet`, `jvm` |
+| Targets | `dotnet`, `jvm`, `native` (POSIX; run on Linux x86-64) |
 | Stability | experimental (0.1.0) |
 | Third-party libraries | none (`[nuget]` and `[maven]` are empty) |
 | Depends on | the standard library only |
-| TLS | TLS 1.2 and 1.3 through the platform's own stack (`SslStream` on dotnet, JSSE on jvm) |
+| TLS | TLS 1.2 and 1.3 through the platform's own stack (`SslStream` on dotnet, JSSE on jvm, OpenSSL 3 through the standard library's `Std.TcpHost` on native) |
 
 ## Usage
 
@@ -214,23 +214,40 @@ Connections:
   blocks all its pool threads (calling a synchronous client from many tasks) therefore still gets
   its replies on time. The price: a connection dropped without `sockClose` keeps its thread and its
   socket. Always close. On `jvm` reads are the socket's own with `SO_TIMEOUT`, and there is no extra
-  thread.
+  thread. On `native` a read waits in `poll` and no connection owns a thread.
+- **On `native` one thread at a time uses a TLS connection.** OpenSSL does not allow a read and a
+  write of one connection at the same moment, so both take a lock that belongs to the connection. A
+  reader holds it only while bytes are on the wire (at most 20 ms when they are part of a record or
+  a session ticket, not data); a writer holds it for its whole write, so a write to a peer that
+  accepts nothing delays the reads of that connection until the write's limit ends it. A read that
+  cannot get the connection within its wait is `TimedOut`. Plain TCP has no such lock.
+- **On `native` `sockClose` during a read or write on another thread cuts the connection short.**
+  The socket is shut down to end that call, so a TLS peer sees the stream end without a close
+  notification. With no call in progress the close is the orderly one.
 - **A read timeout is not an error.** `TimedOut` leaves the connection usable and loses nothing:
   bytes that arrive later are returned by a later read. `timeoutMs = 0` returns only what has
   already arrived (it waits one millisecond on dotnet, so a chunk being handed over is not missed).
 - **A write timeout is the end of the connection.** `sockWriteWithin` gives up when the peer accepts
   no data for the limit, not when the whole write takes longer than it; how much was sent is unknown,
   so the only thing left to do is `sockClose`. On `jvm` a socket has no write timeout: the write runs
-  on a thread of its own and the socket is closed when no 64 KiB chunk gets through in time.
+  on a thread of its own and the socket is closed when no 64 KiB chunk gets through in time. On
+  `native` it is the socket's send timeout, and the socket stays open until `sockClose`.
 - **`Eof` and a read failure repeat.** Every read after the peer's close returns `Eof` again; bytes
   that arrived before it are returned first.
 - **`0` means different things.** For `sockConnect` and `sockStartTls` it is "no limit of ours"; for
   `sockRead` it is "do not wait"; for `sockWriteWithin` it is "no limit".
-- **The lock is fair on `jvm` and not on `dotnet`** (a `ReentrantLock(true)` and a monitor). A
-  thread that releases the lock and takes it again at once can keep winning on dotnet.
-- **Failure texts are the platform's.** An `Err` carries the .NET or JDK exception message; only
-  "the write timed out", "connect to HOST:PORT timed out after N ms" and the handshake's "timed out
-  after N ms" (dotnet) are worded here. Match on those, not on platform text.
+- **The lock is fair on `jvm` and not on `dotnet` or `native`** (a `ReentrantLock(true)`, a monitor,
+  and an owner record with a wake-up event). A thread that releases the lock and takes it again at
+  once can keep winning on dotnet and native.
+- **On `native` a connect or a TLS handshake that times out ends later than its `Err`.** Each runs
+  on a thread of its own, which the caller stops waiting for at the limit; that thread closes the
+  socket when its connect returns or its handshake fails, which for a silent peer is one more limit
+  later.
+- **Failure texts are the platform's.** An `Err` carries the .NET or JDK exception message, or on
+  native the standard library's text (`Std.TcpHost`, with the operating system's or OpenSSL's
+  reason); only "the write timed out", "connect to HOST:PORT timed out after N ms", the handshake's
+  "timed out after N ms" (dotnet, native) and "the connection is closed" (native, for a call on a
+  connection this side closed) are worded here. Match on those, not on platform text.
 
 TLS:
 
@@ -277,18 +294,18 @@ URLs:
 
 Differences between the targets, collected:
 
-| | `dotnet` | `jvm` |
-|---|---|---|
-| Socket | `System.Net.Sockets.TcpClient` | `java.net.Socket` |
-| TLS | `SslStream.AuthenticateAsClient`, trust through `CertificateChainPolicy` | `SSLSocket` over the connected socket, `SSLContext` from `KeyStore`-backed factories, endpoint identification `HTTPS` |
-| Platform trust store | operating system root stores | JDK trust store |
-| Reads | a reader thread per connection that has been read from; no shared thread pool | `SO_TIMEOUT` on the socket |
-| Write limit | `SendTimeout` on the socket | the write runs on its own thread; the socket is closed when no 64 KiB chunk gets through in time |
-| TLS handshake limit | whole handshake | each read |
-| Skip-verify | chain policy with `X509VerificationFlags.AllFlags` | a trust manager that accepts everything, and no endpoint identification |
-| Lock | monitor, not fair | fair `ReentrantLock` |
-| `startPoolWork` (test support) | the shared thread pool | a thread of its own: there is no shared pool to keep busy |
-| Platform part of error texts | .NET exception messages | JDK exception messages |
+| | `dotnet` | `jvm` | `native` |
+|---|---|---|---|
+| Socket | `System.Net.Sockets.TcpClient` | `java.net.Socket` | `Std.TcpHost` (POSIX sockets in lyric-rt) |
+| TLS | `SslStream.AuthenticateAsClient`, trust through `CertificateChainPolicy` | `SSLSocket` over the connected socket, `SSLContext` from `KeyStore`-backed factories, endpoint identification `HTTPS` | `Std.TcpHost.hostUpgradeClientTls` (OpenSSL 3, loaded at run time) |
+| Platform trust store | operating system root stores | JDK trust store | OpenSSL's default paths, `SSL_CERT_FILE`, `SSL_CERT_DIR` |
+| Reads | a reader thread per connection that has been read from; no shared thread pool | `SO_TIMEOUT` on the socket | `poll` on the socket, then the read; TLS reads and writes share a per-connection lock; no thread |
+| Write limit | `SendTimeout` on the socket | the write runs on its own thread; the socket is closed when no 64 KiB chunk gets through in time | `SO_SNDTIMEO` on the socket |
+| TLS handshake limit | whole handshake | each read | whole handshake (a thread of its own) |
+| Skip-verify | chain policy with `X509VerificationFlags.AllFlags` | a trust manager that accepts everything, and no endpoint identification | OpenSSL `SSL_VERIFY_NONE`, no name check |
+| Lock | monitor, not fair | fair `ReentrantLock` | owner record in a `protected` type, not fair |
+| `startPoolWork` (test support) | the shared thread pool | a thread of its own: there is no shared pool to keep busy | a thread of its own |
+| Platform part of error texts | .NET exception messages | JDK exception messages | `Std.TcpHost` texts (`strerror`, OpenSSL) |
 
 ## Layout
 
@@ -300,10 +317,12 @@ Differences between the targets, collected:
 | `src/url.l` | `Net.Url` | schemes, percent-decoding, user information, host and port |
 | `src/_kernel_dotnet/tcp_kernel.l` | `Net.Tcp.Kernel` | `System.Net.Sockets`, `System.Net.Security.SslStream`, monitor lock, clock, dedicated threads |
 | `src/_kernel_jvm/tcp_kernel.l` | `Net.Tcp.Kernel` | `java.net.Socket`, `javax.net.ssl.SSLSocket`, `ReentrantLock`, clock, threads |
+| `src/_kernel_native/tcp_kernel.l` | `Net.Tcp.Kernel` | `Std.TcpHost` sockets and TLS, `Std.IoWait`, `Std.Task` threads, `protected` state, clock |
 
-The two kernel files declare the same package and surface; a file-level `@cfg(target = ...)` keeps one
-per build. They are the only files with extern declarations (`extern type` and `@externTarget`, bound
-by auto-FFI; no host shim). `Net.Tcp.Kernel` is public because `Net.Tcp` and `Net.Tcp.Testing` are
+The three kernel files declare the same package and surface; a file-level `@cfg(target = ...)` keeps
+one per build. They are the only files with extern declarations (`extern type` and `@externTarget`,
+bound by auto-FFI, on dotnet and jvm; one `extern func`, `pthread_self`, on native; no host shim and
+no C code). `Net.Tcp.Kernel` is public because `Net.Tcp` and `Net.Tcp.Testing` are
 separate Lyric packages; it is not an API.
 
 How the kernels do TLS:
@@ -320,7 +339,15 @@ How the kernels do TLS:
   `SSLParameters.setEndpointIdentificationAlgorithm("HTTPS")`. The JSSE and `KeyStore` calls that
   take `null` or a typed array go through `java.lang.reflect`, as in the standard library's
   `_kernel_jvm/http_host.l`.
-- Both load certificates and keys through `Std.TlsHost`, the standard library's PEM loader.
+- native: `Std.TcpHost.hostUpgradeClientTls` and `hostUpgradeServerTlsPrepared`, the standard
+  library's OpenSSL transport, with `Std.Tls.Certificate` and `Std.Tls.Identity` loaded from the PEM
+  text. A timed read waits for the socket in `poll` and then reads under a 20 ms socket timeout,
+  because readable bytes may be a partial record or a session ticket; `Std.TcpHost` has no error
+  case for a read or write its socket timeout ended (#9042), so the kernel compares the failure
+  text with the four texts lyric-rt gives one (`read: timed out`, `TLS read: timed out`,
+  `write: timed out`, `TLS write: timed out`). The read and write timeout tests fail if they change.
+- dotnet and jvm load certificates and keys through `Std.TlsHost`, the standard library's PEM
+  loader; native through `Std.Tls`.
 
 ## Tests
 
@@ -332,6 +359,13 @@ interface.
 lyric test --manifest net/lyric.toml --target dotnet
 lyric test --manifest net/lyric.toml --target jvm
 ```
+
+`lyric test --manifest` does not run on `--target native` yet (nichobbs/lyric-lang#6815). There the
+same four test modules are built as executables, each together with the package's own packages
+(`lyric build --manifest ... --target native`), and run, by `bash scripts/ci/test-native.sh` here
+and in the `native` CI job: all 31 tests pass that way on Linux x86-64.
+A native build needs `clang` and lyric-rt (`lyric_rt.a`); a native program that uses TLS needs
+OpenSSL 3 (`libssl.so.3`) at run time.
 
 | Module | Content |
 |---|---|
@@ -352,7 +386,8 @@ suites against real servers over plain TCP and TLS.
 ## Pinned versions
 
 There is no third-party library. The runtimes the suites run against: .NET 10; Temurin 22 in CI,
-OpenJDK 21 in development.
+OpenJDK 21 in development; for native, clang 18.1.3 and OpenSSL 3.0.13 on Linux x86-64 in
+development, the runner's clang and OpenSSL 3 in CI.
 
 ## Known gaps
 
@@ -370,9 +405,24 @@ OpenJDK 21 in development.
 - The kernels import `Std.TlsHost`, the standard library's kernel package for PEM loading. It is
   public but not marked `@stable`.
 - On `dotnet` every connection that has been read from holds one thread until it is closed.
+- `native` is POSIX only: the kernel binds `pthread_self`, so a Windows build fails at link time.
+  macOS has not been run.
+- On `native` the suites run through `scripts/ci/native-tests.py`, which builds each test module into
+  an executable, because `lyric test --manifest --target native` is refused
+  (nichobbs/lyric-lang#6815).
+- The native kernel imports `Std.TcpHost` and `Std.IoWait`, kernel packages of the standard library
+  that are public but `@experimental` or undocumented as API, and recognises a socket timeout by
+  the failure text (see "How the kernels do TLS").
+- On `native` a program in which any package declares a record with the name of a union case that
+  has fields, declared in any other package of the build, fails to compile (`N0007`, "missing
+  field"; not yet filed). The cases of this package with fields are `Data` (`Net.Tcp`), and in
+  `Net.Tcp.Kernel` `LockHeld`, `CarryBytes`, `CarryFailed`, `WireGot`, `WireBroken`.
 - Standard library and compiler issues behind the design, in `nichobbs/lyric-lang`:
   - [#9042](https://github.com/nichobbs/lyric-lang/issues/9042): `Std.TcpHost` has no JVM kernel and
-    cannot tell a read timeout from a failure, so this package binds the host socket API itself.
+    cannot tell a read timeout from a failure, so this package binds the host socket API itself on
+    dotnet and jvm, and compares failure texts on native. On native it also has no connect timeout,
+    one setting for the receive and the send timeout, no TLS read that does not block, and no
+    handshake limit for a client.
   - [#9064](https://github.com/nichobbs/lyric-lang/issues/9064): the standard library has no TLS
     client for a raw socket, and `Std.Tls.Certificate.rawHandle` / `Identity.rawHandle` are
     `internal`, so the kernels bind the platform's TLS themselves and the options take PEM text.
