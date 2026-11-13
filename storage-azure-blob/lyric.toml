@@ -1,0 +1,44 @@
+[package]
+name        = "Lyric.Storage.AzureBlob"
+version     = "0.1.0"
+stability   = "experimental"
+authors     = ["Lyric Contributors"]
+license     = "MIT"
+description = "Azure Blob Storage backend for the Lyric Storage.StorageBucket interface, in pure Lyric (Blob REST API with Shared Key authorization over Std.Http)."
+targets     = ["dotnet", "jvm"]
+
+[project]
+name            = "Lyric.Storage.AzureBlob"
+output          = "single"
+output_assembly = "Storage.AzureBlob.dll"
+
+[project.packages]
+"Storage.AzureBlob"           = "src/azure_blob.l"
+"Storage.AzureBlob.Client"    = "src/client.l"
+"Storage.AzureBlob.Config"    = "src/config.l"
+"Storage.AzureBlob.Extras"    = "src/extras.l"
+"Storage.AzureBlob.SharedKey" = "src/shared_key.l"
+"Storage.AzureBlob.Wire"      = "src/wire.l"
+
+[project.tests]
+"Storage.AzureBlob.SharedKeyTests" = "tests/shared_key_tests.l"
+"Storage.AzureBlob.WireTests"      = "tests/wire_tests.l"
+"Storage.AzureBlob.ConfigTests"    = "tests/config_tests.l"
+# The conformance suite and the backend's own behaviour over real HTTP, against
+# an in-process Blob service (tests/fake_blob_tests.l) that verifies the Shared
+# Key signature of every request and the SAS of every presigned URL.
+"Storage.AzureBlob.FakeBlobTests" = "tests/fake_blob_tests.l"
+# Needs a real Blob service (Azurite in CI): file-level
+# `@cfg(feature = "integration")`, so a plain `lyric test` reports the module
+# as gated and stays hermetic.
+"Storage.AzureBlob.IntegrationTests" = "tests/integration/azure_blob_integration_tests.l"
+
+[features]
+default     = []
+integration = []   # run tests/integration against the service named by LYRIC_AZURE_BLOB_ENDPOINT
+
+[dependencies]
+# The interface and its conformance suite, resolved through the root
+# [workspace.overrides].
+"Lyric.Testing" = { workspace = true }
+"Lyric.Storage" = { workspace = true }

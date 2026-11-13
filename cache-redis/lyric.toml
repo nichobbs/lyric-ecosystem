@@ -1,0 +1,34 @@
+[package]
+name        = "Lyric.Cache.Redis"
+version     = "0.1.0"
+stability   = "experimental"
+authors     = ["Lyric Contributors"]
+license     = "MIT"
+description = "Redis backend for the Lyric.Cache CacheStore interface, on the pure-Lyric Lyric.Redis client."
+targets     = ["dotnet", "jvm"]
+
+[project]
+name            = "Lyric.Cache.Redis"
+output          = "single"
+output_assembly = "Cache.Redis.dll"
+
+[project.packages]
+"Cache.Redis"        = "src/cache_redis.l"
+"Cache.Redis.Extras" = "src/cache_redis_extras.l"
+
+[project.tests]
+"Cache.Redis.StoreTests"       = "tests/cache_redis_tests.l"
+# Needs a real Redis: file-level `@cfg(feature = "integration")`, so a plain
+# `lyric test` reports the module as gated and stays hermetic.
+"Cache.Redis.IntegrationTests" = "tests/integration/cache_redis_integration_tests.l"
+
+[features]
+default     = []
+integration = []   # run tests/integration against the servers named by LYRIC_REDIS_URL and LYRIC_REDIS_MTLS_URL
+
+[dependencies]
+# The interface and its conformance suite, resolved through the root
+# [workspace.overrides].
+"Lyric.Testing"  = { workspace = true }
+"Lyric.Cache"    = { workspace = true }
+"Lyric.Redis"   = { workspace = true }

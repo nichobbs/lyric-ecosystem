@@ -1,0 +1,34 @@
+[package]
+name        = "Lyric.Jobs.Quartz"
+version     = "0.1.0"
+stability   = "experimental"
+authors     = ["Lyric Contributors"]
+license     = "MIT"
+description = "Quartz Scheduler backend for the Lyric Jobs.JobScheduler interface (JVM only)."
+targets     = ["jvm"]
+
+[project]
+name            = "Lyric.Jobs.Quartz"
+output          = "single"
+output_assembly = "Jobs.Quartz.dll"
+
+[project.packages]
+"Jobs.Quartz"            = "src/jobs_quartz.l"
+"Jobs.Quartz.Triggers"   = "src/triggers.l"
+"Jobs.Quartz.Kernel.Jvm" = "src/_kernel_jvm/quartz_kernel.l"
+
+[project.tests]
+"Jobs.Quartz.TriggersTests"         = "tests/triggers_tests.l"
+"Jobs.Quartz.ConformanceTests"      = "tests/conformance_tests.l"
+"Jobs.Quartz.ExecutionTests"        = "tests/execution_tests.l"
+"Jobs.Quartz.TriggerExecutionTests" = "tests/trigger_execution_tests.l"
+
+[dependencies]
+# The interface and its conformance suite, resolved through the root
+# [workspace.overrides].
+"Lyric.Testing"    = { workspace = true }
+"Lyric.Jobs"       = { workspace = true }
+
+[maven]
+# Quartz Scheduler (RAMJobStore, SimpleThreadPool). JVM only.
+"org.quartz-scheduler:quartz" = "2.5.2"

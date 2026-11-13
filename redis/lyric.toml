@@ -1,0 +1,39 @@
+[package]
+name        = "Lyric.Redis"
+version     = "0.1.0"
+stability   = "experimental"
+authors     = ["Lyric Contributors"]
+license     = "MIT"
+description = "Pure-Lyric Redis client: RESP2/RESP3 over TCP or TLS, with AUTH, SELECT, timeouts and reconnect."
+targets     = ["dotnet", "jvm"]
+
+[project]
+name            = "Lyric.Redis"
+output          = "single"
+output_assembly = "Redis.dll"
+
+[project.packages]
+"Redis"        = "src/redis.l"
+"Redis.Resp"   = "src/resp.l"
+"Redis.Url"    = "src/url.l"
+# One package in two files: the socket boundary for each target. Each file
+# carries a file-level `@cfg(target = ...)`, so exactly one survives a build.
+"Redis.Kernel" = [
+  "src/_kernel_dotnet/redis_kernel.l",
+  "src/_kernel_jvm/redis_kernel.l",
+]
+
+[project.tests]
+"Redis.RespTests"        = "tests/resp_tests.l"
+"Redis.UrlTests"         = "tests/url_tests.l"
+"Redis.FakeServerTests"  = "tests/fake_server_tests.l"
+"Redis.TlsTests"         = "tests/tls_tests.l"
+# Needs a real Redis: file-level `@cfg(feature = "integration")`, so a plain
+# `lyric test` reports the module as gated and stays hermetic.
+"Redis.IntegrationTests" = "tests/integration/redis_integration_tests.l"
+# Needs a real Redis with TLS (scripts/ci/start-redis-tls.sh), same gate.
+"Redis.TlsIntegrationTests" = "tests/integration/redis_tls_integration_tests.l"
+
+[features]
+default     = []
+integration = []   # run tests/integration against the servers named by LYRIC_REDIS_URL and LYRIC_REDIS_TLS_URL / LYRIC_REDIS_MTLS_URL

@@ -1,0 +1,44 @@
+<!--
+  Broker for the integration suite: ActiveMQ Classic, in memory, with one user
+  and three STOMP connectors on 127.0.0.1: plain TCP, TLS, and TLS that
+  requires a client certificate (needClientAuth). The user, passcode, ports
+  and key stores come from system properties so no credential is written here:
+
+    -Dlyric.activemq.user=... -Dlyric.activemq.passcode=...
+    -Dlyric.activemq.stompPort=...        plain STOMP
+    -Dlyric.activemq.tlsPort=...          STOMP over TLS
+    -Dlyric.activemq.mutualTlsPort=...    STOMP over TLS, client certificate required
+    -Dlyric.activemq.keyStore=...         PKCS12 file with the server certificate and key
+    -Dlyric.activemq.trustStore=...       PKCS12 file with the CA that issues client certificates
+    -Dlyric.activemq.storePassword=...    password of both stores
+
+  scripts/ci/start-activemq.sh generates the stores and starts the broker; see
+  the README's "Tests" section.
+-->
+<beans xmlns="http://www.springframework.org/schema/beans"
+       xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+       xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd
+                           http://activemq.apache.org/schema/core http://activemq.apache.org/schema/core/activemq-core.xsd">
+  <bean class="org.springframework.beans.factory.config.PropertyPlaceholderConfigurer"/>
+  <broker xmlns="http://activemq.apache.org/schema/core" brokerName="lyric-integration" persistent="false" useJmx="false">
+    <plugins>
+      <simpleAuthenticationPlugin>
+        <users>
+          <authenticationUser username="${lyric.activemq.user}" password="${lyric.activemq.passcode}" groups="users,admins"/>
+        </users>
+      </simpleAuthenticationPlugin>
+    </plugins>
+    <sslContext>
+      <sslContext keyStore="file:${lyric.activemq.keyStore}" keyStorePassword="${lyric.activemq.storePassword}"
+                  keyStoreType="PKCS12"
+                  trustStore="file:${lyric.activemq.trustStore}" trustStorePassword="${lyric.activemq.storePassword}"
+                  trustStoreType="PKCS12"/>
+    </sslContext>
+    <transportConnectors>
+      <transportConnector name="stomp" uri="stomp://127.0.0.1:${lyric.activemq.stompPort}"/>
+      <transportConnector name="stomp+ssl" uri="stomp+ssl://127.0.0.1:${lyric.activemq.tlsPort}"/>
+      <transportConnector name="stomp+ssl+clientauth"
+                          uri="stomp+ssl://127.0.0.1:${lyric.activemq.mutualTlsPort}?needClientAuth=true"/>
+    </transportConnectors>
+  </broker>
+</beans>

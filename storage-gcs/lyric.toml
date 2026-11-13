@@ -1,0 +1,54 @@
+[package]
+name        = "Lyric.Storage.Gcs"
+version     = "0.1.0"
+stability   = "experimental"
+authors     = ["Lyric Contributors"]
+license     = "MIT"
+description = "Google Cloud Storage backend for the Lyric Storage.StorageBucket interface, in pure Lyric (XML API with HMAC keys, GOOG4-HMAC-SHA256 over Std.Http)."
+targets     = ["dotnet", "jvm"]
+
+[project]
+name            = "Lyric.Storage.Gcs"
+output          = "single"
+output_assembly = "Storage.Gcs.dll"
+
+[project.packages]
+"Storage.Gcs"        = "src/gcs.l"
+"Storage.Gcs.Client" = "src/client.l"
+"Storage.Gcs.Config" = "src/config.l"
+"Storage.Gcs.Extras" = "src/extras.l"
+"Storage.Gcs.Goog4"  = "src/goog4.l"
+"Storage.Gcs.Wire"   = "src/wire.l"
+
+[project.tests]
+"Storage.Gcs.Goog4Tests"  = "tests/goog4_tests.l"
+"Storage.Gcs.WireTests"   = "tests/wire_tests.l"
+"Storage.Gcs.ConfigTests" = "tests/config_tests.l"
+"Storage.Gcs.ReadmeTests" = "tests/readme_tests.l"
+# The conformance suite and the backend's own behaviour over real HTTP, against
+# an in-process XML API endpoint (tests/fake_gcs_tests.l) that verifies the
+# GOOG4-HMAC-SHA256 signature of every request and of every signed URL.
+"Storage.Gcs.FakeGcsTests" = "tests/fake_gcs_tests.l"
+# Needs the network but no credentials: file-level `@cfg(feature = "live")`.
+# Asks storage.googleapis.com itself which canonical request and string to
+# sign it derives from this client's requests, and parses its real responses.
+"Storage.Gcs.LiveTests" = "tests/live/gcs_live_tests.l"
+# Needs a bucket and an HMAC key on Google Cloud Storage: file-level
+# `@cfg(feature = "credentials")`, so a plain `lyric test` reports the module
+# as gated and stays hermetic.
+"Storage.Gcs.IntegrationTests" = "tests/integration/gcs_integration_tests.l"
+
+[features]
+default     = []
+live        = []   # run tests/live against storage.googleapis.com, without credentials
+credentials = []   # run tests/integration against the bucket named by LYRIC_GCS_BUCKET (needs a real HMAC key; not run in CI)
+
+[dependencies]
+# The interface and its conformance suite, resolved through the root
+# [workspace.overrides].
+"Lyric.Testing" = { workspace = true }
+"Lyric.Storage" = { workspace = true }
+# Canonical requests, percent-encoding and canonical query strings are the
+# same in Google's V4 signing as in AWS Signature Version 4; they are imported
+# from the shared signer, not copied.
+"Lyric.Aws.SigV4" = { workspace = true }
