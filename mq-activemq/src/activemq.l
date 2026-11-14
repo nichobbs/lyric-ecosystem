@@ -53,9 +53,24 @@
 //! - `close` unsubscribes, sends `DISCONNECT` with a receipt and closes the
 //!   socket. Deliveries not yet settled go back to the queue.
 //!
-//! Heart-beats are not negotiated (`heart-beat:0,0`): the client is
-//! synchronous and has no thread to send them from. A connection lost while
-//! idle is reported by the next operation.
+//! Heart-beats (STOMP 1.2) are negotiated by `CONNECT`, 10 s in each
+//! direction by default (`heartBeatSendMs`, `heartBeatReceiveMs`; 0 switches
+//! a direction off). A background thread per connection, the keeper, writes
+//! a newline when nothing was written for half of the agreed interval, reads
+//! what the broker sends while no operation is doing so, and declares the
+//! connection lost when nothing at all arrived for twice the agreed interval.
+//!
+//! A lost connection is re-established by the keeper (`reconnect`, on by
+//! default): capped exponential backoff with jitter, a new `CONNECT`, and a
+//! new `SUBSCRIBE` when the connection had one. While that goes on, `publish`,
+//! `ack` and `nack` fail at once with a "not connected, reconnecting" error
+//! (`isNotConnectedError`: nothing was sent, try again later) and `consume`
+//! waits within its own timeout. Nothing is ever sent twice: a request that
+//! was in flight when the connection dropped reports that its outcome is
+//! unknown (`isOutcomeUnknownError`). Deliveries received on a lost
+//! connection cannot be settled any more (`isStaleDeliveryError`); the broker
+//! redelivers them. A broker that refuses the new `CONNECT` or `SUBSCRIBE`
+//! ends the attempts, as does `maxAttempts`.
 //!
 //! An `ActiveMqQueue` may be shared between threads: operations take the
 //! connection's lock one at a time, and a blocked `consume` releases it every
@@ -67,8 +82,8 @@
 //! frame cannot be attributed, so the connection is treated as lost, as
 //! STOMP 1.2 has the broker close it after an `ERROR`.
 //!
-//! There is no automatic reconnect. After a transport failure every operation
-//! returns `Err`; open a new connection.
+//! With `reconnect.enabled = false` a lost connection stays lost: every
+//! operation returns `Err`; open a new connection.
 //!
 //! TLS: a `stomp+ssl://` URL, or `withTls()` on the options, runs a TLS
 //! handshake before the STOMP `CONNECT`. The server certificate is verified
@@ -96,7 +111,9 @@ import Std.String as Str
 import Std.Environment as Env
 import Std.Console as Console
 import Std.Tls as Tls
+import Std.SecureRandom
 import Net.Tcp as K
+import Net.Threads as Threads
 import Net.Tls
 import Mq.ActiveMq.Stomp as Stomp
 import Mq.ActiveMq.Url as Url
@@ -131,6 +148,48 @@ pub enum UndeliverablePolicy {
   /// dead-letter queue and discards a non-persistent one, so this destroys
   /// or diverts messages meant for other consumers of a shared queue.
   case RejectToBroker
+}
+
+/// How a lost connection is re-established.
+pub record ReconnectOptions {
+  /// False: a lost connection stays lost and every operation returns `Err`.
+  enabled: Bool
+  /// Milliseconds before the first attempt; doubled after every failed
+  /// attempt, up to `maxDelayMs`. At least 1.
+  initialDelayMs: Int
+  /// The longest wait between two attempts, in milliseconds.
+  maxDelayMs: Int
+  /// Failed attempts in a row after which reconnecting is given up; 0 = no
+  /// limit.
+  maxAttempts: Int
+  /// Each wait is shortened by a random part of up to this many percent of
+  /// it (0 to 100), so that clients that lost the same broker do not all
+  /// return at the same moment.
+  jitterPercent: Int
+  /// How long `publish`, `publishBatch` and `publishWithHeaders` wait for a
+  /// connection that is being re-established before they fail, in
+  /// milliseconds; 0 = fail at once.
+  publishWaitMs: Int
+}
+
+/// Reconnecting switched on: first attempt after 1 s, doubling up to 30 s,
+/// 20 % jitter, no limit on the attempts, and a publish that fails at once
+/// while there is no connection.
+pub func defaultReconnect(): ReconnectOptions {
+  ReconnectOptions(
+    enabled = true,
+    initialDelayMs = 1000,
+    maxDelayMs = 30000,
+    maxAttempts = 0,
+    jitterPercent = 20,
+    publishWaitMs = 0
+  )
+}
+
+/// Reconnecting switched off.
+pub func noReconnect(): ReconnectOptions {
+  val base = defaultReconnect()
+  base.copy(enabled = false)
 }
 
 /// How to reach a broker and which destination to use.
@@ -172,12 +231,26 @@ pub record ConnectOptions {
   onUndeliverable: UndeliverablePolicy
   /// TLS settings; `plainTcp()` for a `stomp://` connector.
   tls: TlsOptions
+  /// The heart-beat this client offers to send: the smallest number of
+  /// milliseconds it guarantees between two writes (the first number of the
+  /// STOMP `heart-beat` header); 0 = it sends none. The broker may ask for a
+  /// longer interval, not a shorter one.
+  heartBeatSendMs: Int
+  /// The heart-beat this client asks the broker for: the number of
+  /// milliseconds between two writes of the broker (the second number of
+  /// the header); 0 = none, and a dead peer is then only noticed by an
+  /// operation. The broker may answer with a longer interval.
+  heartBeatReceiveMs: Int
+  /// Whether and how a lost connection is re-established.
+  reconnect: ReconnectOptions
 }
 
 /// Options for `destination` on `host:port` with the defaults: plain TCP, no
 /// credentials, manual acknowledgement, persistent messages, a 10 s connect
-/// and request timeout, a 16 MiB frame limit and undeliverable messages left
-/// on the broker. Adjust with `.copy(...)` and the `with...` functions below.
+/// and request timeout, a 16 MiB frame limit, undeliverable messages left on
+/// the broker, heart-beats every 10 s in both directions and reconnecting
+/// switched on (`defaultReconnect()`). Adjust with `.copy(...)` and the
+/// `with...` functions below.
 pub func defaultOptions(host: in String, port: in Int, destination: in String): ConnectOptions {
   ConnectOptions(
     host = host,
@@ -194,7 +267,10 @@ pub func defaultOptions(host: in String, port: in Int, destination: in String): 
     requestTimeoutMs = 10000,
     maxFrameBytes = 16777216,
     onUndeliverable = UndeliverablePolicy.LeaveUnacknowledged,
-    tls = plainTcp()
+    tls = plainTcp(),
+    heartBeatSendMs = 10000,
+    heartBeatReceiveMs = 10000,
+    reconnect = defaultReconnect()
   )
 }
 
@@ -263,15 +339,27 @@ pub record Delivery {
   // will not settle it (it was never handed to a handler, or its automatic
   // settlement was refused).
   byHand: Bool
+  // The connection it arrived on (`ActiveMqQueue.epoch`).
+  epoch: Int
+  // True once that connection is lost: the broker no longer knows `ackId`
+  // and redelivers the message. The frame is dropped then.
+  stale: Bool
 }
 
 /// An open connection to one ActiveMQ destination. Obtain one from
 /// `connectWith`, `connectUrl` or `connectFromEnv`.
+///
+/// Three locks: `lock` serializes operations and guards every field not
+/// named below; `writeLock` serializes writes to the socket and guards
+/// `lastWriteAt`, `writable` and `sendIntervalMs`; `flagsLock` guards
+/// `closing`, `keeperRunning` and `keeperTurn`. They are taken in that order.
 pub ref record ActiveMqQueue {
   options: ConnectOptions
-  sock: K.Sock
-  decoder: Stomp.Decoder
+  var sock: K.Sock
+  var decoder: Stomp.Decoder
   lock: K.Lock
+  writeLock: K.Lock
+  flagsLock: K.Lock
   var server: String
   var lost: String
   var closed: Bool
@@ -286,6 +374,33 @@ pub ref record ActiveMqQueue {
   // The broker's refusal of the SUBSCRIBE, kept for the next `consume` when
   // it arrived while another request was waiting.
   var subscribeFailure: String
+  // Whether a subscription was asked for, so that a new connection opens it
+  // again.
+  var wantSubscription: Bool
+  // Why reconnecting was given up ("" = it was not): final.
+  var gaveUp: String
+  // The number of the current connection: 0 for the first, one more for
+  // each one that replaced a lost one.
+  var epoch: Int
+  // Failed attempts since the connection was lost, and the last failure.
+  var attempts: Int
+  var lastAttemptError: String
+  // The agreed heart-beat intervals in milliseconds, 0 = none.
+  var sendIntervalMs: Int
+  var receiveIntervalMs: Int
+  // When bytes last arrived from, and were last written to, the broker.
+  var lastReadAt: Long
+  var lastWriteAt: Long
+  // False once the socket must not be written to by the keeper.
+  var writable: Bool
+  // Set by `close` before it waits for `lock`, so that the keeper stops
+  // waiting.
+  var closing: Bool
+  var keeperRunning: Bool
+  // True while the keeper takes or holds `lock`, which it does for a moment
+  // every tick. `consume` waits that moment out instead of counting it
+  // against a short timeout.
+  var keeperTurn: Bool
 }
 
 val EMPTY_ID: String = "activemq: empty message id"
@@ -295,6 +410,50 @@ val SUBSCRIPTION_ID: String = "lyric-sub-0"
 val WAIT_SLICE_MS: Int = 100
 
 val READ_CHUNK_BYTES: Int = 16384
+
+// The connection is taken for dead when nothing arrived for this many agreed
+// heart-beat intervals.
+val HEART_BEAT_TOLERANCE: Int = 2
+
+// The keeper stops reading ahead when this many messages wait for `consume`.
+val KEEPER_BACKLOG_LIMIT: Int = 64
+
+// The keeper's longest sleep, which bounds how late it notices `close`.
+val KEEPER_TICK_MS: Int = 250
+
+// Deliveries of a lost connection are remembered for this many reconnects.
+val STALE_EPOCHS_KEPT: Int = 8
+
+// `consume` waits for the lock in pieces of this length while the keeper
+// has it.
+val KEEPER_GRACE_MS: Int = 50
+
+val NOT_CONNECTED_PREFIX: String = "activemq: not connected, reconnecting"
+
+val OUTCOME_UNKNOWN: String = "the outcome is unknown"
+
+val STALE_DELIVERY_PREFIX: String = "activemq: stale delivery"
+
+/// True for the error of an operation that found the connection lost and
+/// being re-established: nothing was sent, and the same call can succeed
+/// later.
+pub func isNotConnectedError(error: in String): Bool {
+  Str.startsWith(error, NOT_CONNECTED_PREFIX)
+}
+
+/// True for the error of a request that was in flight when the connection
+/// was lost: the broker may or may not have applied it, and this client did
+/// not and will not send it again.
+pub func isOutcomeUnknownError(error: in String): Bool {
+  Str.contains(error, OUTCOME_UNKNOWN)
+}
+
+/// True for the error of an `ack` or `nack` of a delivery that arrived on a
+/// connection that has since been lost. The broker redelivers the message;
+/// settle that delivery instead.
+pub func isStaleDeliveryError(error: in String): Bool {
+  Str.startsWith(error, STALE_DELIVERY_PREFIX)
+}
 
 func header(name: in String, value: in String): Stomp.Header {
   Stomp.Header(name = name, value = value)
@@ -323,10 +482,40 @@ func errorText(frame: in Stomp.Frame): String {
 }
 
 // ─── Transport (callers hold the lock) ───────────────────────────────────────
+func emptyFrame(): Stomp.Frame {
+  val none: slice[Stomp.Header] = []
+  Stomp.Frame(command = "", headers = none, body = noBody())
+}
+
+// The deliveries of the connection that was just lost can no longer be
+// settled. They stay known, without their frame, so that `ack` and `nack`
+// can say what happened to them.
+func retireDeliveries(q: in ActiveMqQueue): Unit {
+  for id in mapKeys(q.inFlight).toArray() {
+    val waiting = q.inFlight[id]
+    var i = 0
+    while i < waiting.count {
+      if not waiting[i].stale {
+        waiting[i] = waiting[i].copy(stale = true, frame = emptyFrame())
+      }
+      i += 1
+    }
+  }
+}
+
 func markLost(q: in ActiveMqQueue, reason: in String): String {
   if q.lost.length == 0 {
     q.lost = reason
+    // Closing first ends a heart-beat write that is stuck, which holds
+    // `writeLock`.
     K.sockClose(q.sock)
+    K.lockEnter(q.writeLock)
+    q.writable = false
+    K.lockExit(q.writeLock)
+    if q.options.reconnect.enabled {
+      retireDeliveries(q)
+      q.backlog = newList()
+    }
   }
   "activemq: connection lost: " + q.lost
 }
@@ -335,7 +524,13 @@ func checkUsable(q: in ActiveMqQueue): Result[Unit, String] {
   if q.closed {
     return Err("activemq: the connection is closed")
   }
+  if q.gaveUp.length > 0 {
+    return Err("activemq: connection lost: " + q.gaveUp)
+  }
   if q.lost.length > 0 {
+    if q.options.reconnect.enabled {
+      return Err(NOT_CONNECTED_PREFIX + " (nothing was sent); connection lost: " + q.lost)
+    }
     return Err("activemq: connection lost: " + q.lost)
   }
   Ok(())
@@ -343,10 +538,31 @@ func checkUsable(q: in ActiveMqQueue): Result[Unit, String] {
 
 func writeFrame(q: in ActiveMqQueue, frame: in Stomp.Frame): Result[Unit, String] {
   val bytes = match Stomp.encodeFrame(frame) { case Ok(b) -> b; case Err(e) -> return Err("activemq: " + e) }
-  match K.sockWriteWithin(q.sock, bytes, q.options.requestTimeoutMs) {
+  K.lockEnter(q.writeLock)
+  val outcome = K.sockWriteWithin(q.sock, bytes, q.options.requestTimeoutMs)
+  q.lastWriteAt = K.monotonicMillis()
+  K.lockExit(q.writeLock)
+  match outcome {
     case Ok(_) -> Ok(())
     case Err(e) -> Err(markLost(q, e))
   }
+}
+
+// Why the broker must be taken for dead, "" when it need not: it agreed to
+// send something every `receiveIntervalMs` and nothing arrived for
+// `HEART_BEAT_TOLERANCE` times that. Only meaningful right after a read that
+// found the socket empty.
+func peerSilence(q: in ActiveMqQueue): String {
+  if q.receiveIntervalMs == 0 {
+    return ""
+  }
+  val silentFor = K.monotonicMillis() - q.lastReadAt
+  if silentFor <= q.receiveIntervalMs.toLong() * HEART_BEAT_TOLERANCE.toLong() {
+    return ""
+  }
+  "the broker sent nothing for " + silentFor.toString() + " ms, having agreed to a heart-beat every " +
+    q.receiveIntervalMs.toString() +
+    " ms"
 }
 
 // The next frame, waiting at most `timeoutMs` for it (0 = only what has
@@ -364,8 +580,17 @@ func readFrame(q: in ActiveMqQueue, timeoutMs: in Int): Result[Option[Stomp.Deco
     match K.sockRead(q.sock, READ_CHUNK_BYTES, wait) {
       case Err(e) -> return Err(markLost(q, e))
       case Ok(Eof) -> return Err(markLost(q, "the broker closed the connection"))
-      case Ok(TimedOut) -> return Ok(None)
-      case Ok(Data(bytes)) -> Stomp.feed(q.decoder, bytes)
+      case Ok(TimedOut) -> {
+        val silence = peerSilence(q)
+        if silence.length > 0 {
+          return Err(markLost(q, silence))
+        }
+        return Ok(None)
+      }
+      case Ok(Data(bytes)) -> {
+        q.lastReadAt = K.monotonicMillis()
+        Stomp.feed(q.decoder, bytes)
+      }
     }
   }
   Ok(None)
@@ -416,6 +641,7 @@ func route(q: in ActiveMqQueue, item: in Stomp.Decoded, awaited: in String): Res
   }
   if answersSubscribe {
     q.subscribeReceipt = ""
+    q.wantSubscription = false
     if not answersAwaited {
       q.subscribeFailure = errorText(frame)
       return Ok(false)
@@ -501,6 +727,25 @@ func validate(options: in ConnectOptions): Result[Unit, String] {
   if options.maxFrameBytes < 1 {
     return Err("activemq: maxFrameBytes must be at least 1")
   }
+  if options.heartBeatSendMs < 0 or options.heartBeatReceiveMs < 0 {
+    return Err("activemq: heartBeatSendMs and heartBeatReceiveMs must not be negative")
+  }
+  val r = options.reconnect
+  if r.initialDelayMs < 1 {
+    return Err("activemq: reconnect.initialDelayMs must be at least 1")
+  }
+  if r.maxDelayMs < r.initialDelayMs {
+    return Err("activemq: reconnect.maxDelayMs must not be less than reconnect.initialDelayMs")
+  }
+  if r.maxAttempts < 0 {
+    return Err("activemq: reconnect.maxAttempts must not be negative (0 is no limit)")
+  }
+  if r.jitterPercent < 0 or r.jitterPercent > 100 {
+    return Err("activemq: reconnect.jitterPercent must be between 0 and 100")
+  }
+  if r.publishWaitMs < 0 {
+    return Err("activemq: reconnect.publishWaitMs must not be negative")
+  }
   match validateTlsOptions(options.tls) {
     case Ok(_) -> Ok(())
     case Err(problem) -> Err("activemq: " + tlsProblemText(problem, "a stomp+ssl:// URL"))
@@ -526,20 +771,55 @@ func openTransport(options: in ConnectOptions, endpoint: in String): Result[K.So
   }
 }
 
-/// Connect to the broker and authenticate. The subscription is opened by the
-/// first `consume` (or by `subscribe`).
-pub func connectWith(options: in ConnectOptions): Result[ActiveMqQueue, String] {
-  match validate(options) {
-    case Err(e) -> return Err(e)
-    case Ok(_) -> ()
+// Why a connection could not be opened. `permanent`: the broker answered
+// and refused, so trying again with the same options cannot succeed.
+record OpenFailure {
+  text: String
+  permanent: Bool
+}
+
+func transient(text: in String): Result[ActiveMqQueue, OpenFailure] {
+  Err(OpenFailure(text = text, permanent = false))
+}
+
+func permanent(text: in String): Result[ActiveMqQueue, OpenFailure] {
+  Err(OpenFailure(text = text, permanent = true))
+}
+
+// One number of a `heart-beat` header; anything that is not one counts as 0.
+func heartBeatNumber(text: in String): Int {
+  match parseOptInt(Str.trim(text)) {
+    case Some(n) -> if n > 0 { n } else { 0 }
+    case None -> 0
   }
+}
+
+// The interval agreed for one direction (STOMP 1.2, "Heart-beating"): none
+// when either side says 0, otherwise the larger of what the sender
+// guarantees and what the receiver asks for.
+func agreedInterval(guaranteed: in Int, wanted: in Int): Int {
+  if guaranteed == 0 or wanted == 0 {
+    0
+  } else if guaranteed > wanted {
+    guaranteed
+  } else {
+    wanted
+  }
+}
+
+// Open a transport, send CONNECT and read the answer. The result is a
+// connection without a keeper.
+func openSession(options: in ConnectOptions): Result[ActiveMqQueue, OpenFailure] {
   val endpoint = options.host + ":" + options.port.toString()
-  val sock = match openTransport(options, endpoint) { case Ok(s) -> s; case Err(e) -> return Err(e) }
+  val sock = match openTransport(options, endpoint) { case Ok(s) -> s; case Err(e) -> return transient(e) }
+  val now = K.monotonicMillis()
   val q = ActiveMqQueue(
     options = options,
     sock = sock,
     decoder = Stomp.newDecoder(options.maxFrameBytes),
     lock = K.newLock(),
+    writeLock = K.newLock(),
+    flagsLock = K.newLock(),
     server = "",
     lost = "",
     closed = false,
@@ -549,7 +829,20 @@ pub func connectWith(options: in ConnectOptions): Result[ActiveMqQueue, String] 
     inFlight = newMap(),
     subscribeReceipt = "",
     subscribeDeadline = 0i64,
-    subscribeFailure = ""
+    subscribeFailure = "",
+    wantSubscription = false,
+    gaveUp = "",
+    epoch = 0,
+    attempts = 0,
+    lastAttemptError = "",
+    sendIntervalMs = 0,
+    receiveIntervalMs = 0,
+    lastReadAt = now,
+    lastWriteAt = now,
+    writable = false,
+    closing = false,
+    keeperRunning = false,
+    keeperTurn = false
   )
   val headers: List[Stomp.Header] = newList()
   headers.add(header("accept-version", "1.2"))
@@ -558,16 +851,16 @@ pub func connectWith(options: in ConnectOptions): Result[ActiveMqQueue, String] 
     headers.add(header("login", options.login))
     headers.add(header("passcode", options.passcode))
   }
-  headers.add(header("heart-beat", "0,0"))
+  headers.add(header("heart-beat", options.heartBeatSendMs.toString() + "," + options.heartBeatReceiveMs.toString()))
   match send(q, "CONNECT", headers, noBody()) {
-    case Err(e) -> return Err(e)
+    case Err(e) -> return transient(e)
     case Ok(_) -> ()
   }
   val answer = match readFrame(q, options.requestTimeoutMs) {
     // ActiveMQ refuses a login with an ERROR frame and closes the connection
     // at once; now and then the close overtakes the frame, or cuts a TLS
     // record short, and the refusal arrives as a bare close or a read error.
-    case Err(_) -> return Err(
+    case Err(_) -> return transient(
       "activemq: connection lost: " + endpoint +
         " ended the connection during login without a readable answer; a broker does that when it refuses the login or passcode (" +
         q.lost +
@@ -575,13 +868,15 @@ pub func connectWith(options: in ConnectOptions): Result[ActiveMqQueue, String] 
     )
     case Ok(None) -> {
       K.sockClose(sock)
-      return Err("activemq: " + endpoint + " did not answer CONNECT within " + options.requestTimeoutMs.toString() + " ms")
+      return transient(
+        "activemq: " + endpoint + " did not answer CONNECT within " + options.requestTimeoutMs.toString() + " ms"
+      )
     }
     case Ok(Some(item)) -> match item {
       case Complete(f) -> f
       case TooLarge(skipped) -> {
         K.sockClose(sock)
-        return Err(
+        return permanent(
           "activemq: " + endpoint + " answered CONNECT with a " + skipped.command + " frame this client cannot read: " +
             skipped.reason
         )
@@ -590,18 +885,42 @@ pub func connectWith(options: in ConnectOptions): Result[ActiveMqQueue, String] 
   }
   if answer.command == "ERROR" {
     K.sockClose(sock)
-    return Err(errorText(answer))
+    return permanent(errorText(answer))
   }
   if answer.command != "CONNECTED" {
     K.sockClose(sock)
-    return Err("activemq: " + endpoint + " answered CONNECT with " + answer.command)
+    return permanent("activemq: " + endpoint + " answered CONNECT with " + answer.command)
   }
   val version = Stomp.headerOr(answer, "version", "1.0")
   if version != "1.2" {
     K.sockClose(sock)
-    return Err("activemq: the broker speaks STOMP " + version + "; this client needs 1.2")
+    return permanent("activemq: the broker speaks STOMP " + version + "; this client needs 1.2")
   }
   q.server = Stomp.headerOr(answer, "server", "")
+  val theirs = Stomp.headerOr(answer, "heart-beat", "0,0")
+  val comma = Str.indexOfRaw(theirs, ",")
+  val brokerSends = if comma < 0 { 0 } else { heartBeatNumber(Str.substring(theirs, 0, comma)) }
+  val brokerWants = if comma < 0 { 0 } else { heartBeatNumber(Str.substring(theirs, comma + 1)) }
+  q.sendIntervalMs = agreedInterval(options.heartBeatSendMs, brokerWants)
+  q.receiveIntervalMs = agreedInterval(brokerSends, options.heartBeatReceiveMs)
+  q.lastReadAt = K.monotonicMillis()
+  q.writable = true
+  Ok(q)
+}
+
+/// Connect to the broker and authenticate. The subscription is opened by the
+/// first `consume` (or by `subscribe`). Connecting is tried once; it is a
+/// connection that was established and then lost that `reconnect` restores.
+pub func connectWith(options: in ConnectOptions): Result[ActiveMqQueue, String] {
+  match validate(options) {
+    case Err(e) -> return Err(e)
+    case Ok(_) -> ()
+  }
+  val q = match openSession(options) { case Ok(opened) -> opened; case Err(failure) -> return Err(failure.text) }
+  if options.reconnect.enabled or q.sendIntervalMs > 0 or q.receiveIntervalMs > 0 {
+    q.keeperRunning = true
+    val _ = Threads.start({ -> keeperMain(q) })
+  }
   Ok(q)
 }
 
@@ -649,6 +968,19 @@ func envOr(field: in String, fallback: in String): String {
   }
 }
 
+// The variable `field` as a number that is not negative, `fallback` when it
+// is unset or empty.
+func envInt(field: in String, fallback: in Int): Result[Int, String] {
+  val text = envOr(field, "")
+  if text.length == 0 {
+    return Ok(fallback)
+  }
+  match parseOptInt(Str.trim(text)) {
+    case Some(n) -> if n >= 0 { Ok(n) } else { Err("activemq: " + envName(field) + " must not be negative") }
+    case None -> Err("activemq: " + envName(field) + " must be a whole number")
+  }
+}
+
 // The TLS settings of `connectFromEnv`, applied to `base`.
 func tlsFromEnv(base: in ConnectOptions): Result[ConnectOptions, String] {
   match tlsOptionsFromEnv(envName(""), base.tls) {
@@ -665,6 +997,14 @@ func tlsFromEnv(base: in ConnectOptions): Result[ConnectOptions, String] {
 /// - `LYRIC_CONFIG_MQ_ACTIVEMQ_ACKMODE`: `Manual` (default) or `Auto`
 /// - `LYRIC_CONFIG_MQ_ACTIVEMQ_ONUNDELIVERABLE`: `Leave` (default) or
 ///   `Reject`, the `onUndeliverable` option
+/// - `LYRIC_CONFIG_MQ_ACTIVEMQ_HEARTBEATSENDMS`,
+///   `LYRIC_CONFIG_MQ_ACTIVEMQ_HEARTBEATRECEIVEMS`: the heart-beat options in
+///   milliseconds (default 10000 each; 0 = none)
+/// - `LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECT`: `true` (default) or `false`
+/// - `LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECTINITIALDELAYMS`,
+///   `LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECTMAXDELAYMS`,
+///   `LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECTMAXATTEMPTS`: the `reconnect` options
+///   of the same names (defaults 1000, 30000 and 0 = no limit)
 ///
 /// and, for a `stomp+ssl://` URL:
 ///
@@ -705,7 +1045,41 @@ pub func connectFromEnv(): Result[ActiveMqQueue, String] {
     return Err("activemq: LYRIC_CONFIG_MQ_ACTIVEMQ_ONUNDELIVERABLE must be Leave or Reject")
   }
   val base = match optionsFromUrl(url, queueName) { case Ok(o) -> o; case Err(e) -> return Err(e) }
-  match tlsFromEnv(base.copy(ackMode = mode, onUndeliverable = policy)) {
+  val sendMs = match envInt("HEARTBEATSENDMS", base.heartBeatSendMs) { case Ok(n) -> n; case Err(e) -> return Err(e) }
+  val receiveMs = match envInt("HEARTBEATRECEIVEMS", base.heartBeatReceiveMs) {
+    case Ok(n) -> n
+    case Err(e) -> return Err(e)
+  }
+  val reconnectText = Str.toLower(envOr("RECONNECT", "true"))
+  if reconnectText != "true" and reconnectText != "false" {
+    return Err("activemq: LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECT must be true or false")
+  }
+  val r = base.reconnect
+  val initialDelay = match envInt("RECONNECTINITIALDELAYMS", r.initialDelayMs) {
+    case Ok(n) -> n
+    case Err(e) -> return Err(e)
+  }
+  val maxDelay = match envInt("RECONNECTMAXDELAYMS", if initialDelay > r.maxDelayMs { initialDelay } else { r.maxDelayMs }) {
+    case Ok(n) -> n
+    case Err(e) -> return Err(e)
+  }
+  val maxAttempts = match envInt("RECONNECTMAXATTEMPTS", r.maxAttempts) {
+    case Ok(n) -> n
+    case Err(e) -> return Err(e)
+  }
+  val tuned = base.copy(
+    ackMode = mode,
+    onUndeliverable = policy,
+    heartBeatSendMs = sendMs,
+    heartBeatReceiveMs = receiveMs,
+    reconnect = r.copy(
+      enabled = reconnectText == "true",
+      initialDelayMs = initialDelay,
+      maxDelayMs = maxDelay,
+      maxAttempts = maxAttempts
+    )
+  )
+  match tlsFromEnv(tuned) {
     case Ok(options) -> connectWith(options)
     case Err(e) -> Err(e)
   }
@@ -781,6 +1155,7 @@ pub func publishWithHeaders(
     case Err(e) -> return Err(e)
     case Ok(_) -> ()
   }
+  awaitConnection(q)
   K.lockEnter(q.lock)
   defer {
     K.lockExit(q.lock)
@@ -789,7 +1164,56 @@ pub func publishWithHeaders(
     case Err(e) -> return Err(e)
     case Ok(_) -> ()
   }
-  request(q, "SEND", sendHeaders(q, message, extra), encodeUtf8(message.body))
+  unknownIfLost(
+    q,
+    request(q, "SEND", sendHeaders(q, message, extra), encodeUtf8(message.body)),
+    "the broker may or may not have accepted the message, and it was not sent again"
+  )
+}
+
+// Whether the connection is lost and the keeper is opening a new one.
+func isReconnecting(q: in ActiveMqQueue): Bool {
+  K.lockEnter(q.lock)
+  defer {
+    K.lockExit(q.lock)
+  }
+  not q.closed and q.gaveUp.length == 0 and q.lost.length > 0 and q.options.reconnect.enabled
+}
+
+// Give a connection that is being re-established `reconnect.publishWaitMs`
+// to come back. The caller checks the state again under the lock.
+func awaitConnection(q: in ActiveMqQueue): Unit {
+  val limit = q.options.reconnect.publishWaitMs
+  if limit == 0 {
+    return
+  }
+  val deadline = K.monotonicMillis() + limit.toLong()
+  while true {
+    val left = millisUntil(deadline)
+    if left == 0 or not isReconnecting(q) {
+      return
+    }
+    K.sleepMs(if left > 20 { 20 } else { left })
+  }
+}
+
+// The result of a request that was written, or partly written, to a
+// connection that is lost now: the broker's answer will never arrive, and
+// the request is not repeated on the next connection.
+func unknownIfLost(q: in ActiveMqQueue, outcome: in Result[Unit, String], what: in String): Result[Unit, String] {
+  match outcome {
+    case Ok(_) -> Ok(())
+    case Err(e) -> if q.lost.length > 0 { Err(e + "; " + OUTCOME_UNKNOWN + ": " + what) } else { Err(e) }
+  }
+}
+
+// The same for the frames of a transaction that was never committed.
+func notCommittedIfLost(q: in ActiveMqQueue, e: in String): String {
+  if q.lost.length > 0 {
+    e + "; the transaction was not committed, so nothing of it was applied"
+  } else {
+    e
+  }
 }
 
 func abortQuietly(q: in ActiveMqQueue, tx: in String): Unit {
@@ -817,7 +1241,11 @@ func commitTransaction(q: in ActiveMqQueue, tx: in String): Result[Unit, String]
     case Ok(_) -> Ok(())
     case Err(e) -> {
       abortQuietly(q, tx)
-      Err(e)
+      unknownIfLost(
+        q,
+        Err(e),
+        "the broker may or may not have committed the transaction (all of it or none), and it was not sent again"
+      )
     }
   }
 }
@@ -827,7 +1255,7 @@ func publishBatchLocked(q: in ActiveMqQueue, messages: in slice[Mq.Message]): Re
     case Err(e) -> return Err(e)
     case Ok(_) -> ()
   }
-  val tx = match beginTransaction(q) { case Ok(t) -> t; case Err(e) -> return Err(e) }
+  val tx = match beginTransaction(q) { case Ok(t) -> t; case Err(e) -> return Err(notCommittedIfLost(q, e)) }
   val none: slice[Stomp.Header] = []
   for m in messages {
     val headers = sendHeaders(q, m, none)
@@ -836,7 +1264,7 @@ func publishBatchLocked(q: in ActiveMqQueue, messages: in slice[Mq.Message]): Re
       case Ok(_) -> ()
       case Err(e) -> {
         abortQuietly(q, tx)
-        return Err(e)
+        return Err(notCommittedIfLost(q, e))
       }
     }
   }
@@ -878,6 +1306,7 @@ impl Mq.MessageQueue for ActiveMqQueue {
         case Ok(_) -> ()
       }
     }
+    awaitConnection(self)
     K.lockEnter(self.lock)
     defer {
       K.lockExit(self.lock)
@@ -927,6 +1356,7 @@ func subscribeLocked(q: in ActiveMqQueue, waitMs: in Int): Result[Bool, String] 
       headers.add(header("activemq.prefetchSize", q.options.prefetchSize.toString()))
     }
     headers.add(header("receipt", receiptId))
+    q.wantSubscription = true
     match send(q, "SUBSCRIBE", headers, noBody()) {
       case Err(e) -> return Err(e)
       case Ok(_) -> ()
@@ -1075,8 +1505,14 @@ func ackHeaders(ackId: in String): List[Stomp.Header] {
   headers
 }
 
+// A delivery of `id` replaces what is remembered of deliveries of `id` on
+// lost connections: it is the broker's redelivery of them.
 func track(q: in ActiveMqQueue, id: in String, delivery: in Delivery): Unit {
   if q.inFlight.containsKey(id) {
+    val waiting = q.inFlight[id]
+    while waiting.count > 0 and waiting[0].stale {
+      waiting.removeAt(0)
+    }
     q.inFlight[id].add(delivery)
   } else {
     val waiting: List[Delivery] = newList()
@@ -1099,7 +1535,15 @@ func refuseDelivery(
   if brokerId.length == 0 {
     return Err(markLost(q, "the broker sent a MESSAGE without a message-id header"))
   }
-  val delivery = Delivery(ackId = ackId, frame = frame, deliveryCount = 0, requeueable = requeueable, byHand = true)
+  val delivery = Delivery(
+    ackId = ackId,
+    frame = frame,
+    deliveryCount = 0,
+    requeueable = requeueable,
+    byHand = true,
+    epoch = q.epoch,
+    stale = false
+  )
   val problem = "activemq: message " + brokerId + " cannot be delivered: " + why
   val settleHint = "ack or nack the id " + brokerId + " to settle it"
   match q.options.onUndeliverable {
@@ -1145,7 +1589,15 @@ func admitLocked(q: in ActiveMqQueue, item: in Stomp.Decoded): Result[Mq.Message
   track(
     q,
     message.id,
-    Delivery(ackId = ackId, frame = frame, deliveryCount = message.deliveryCount, requeueable = true, byHand = false)
+    Delivery(
+      ackId = ackId,
+      frame = frame,
+      deliveryCount = message.deliveryCount,
+      requeueable = true,
+      byHand = false,
+      epoch = q.epoch,
+      stale = false
+    )
   )
   Ok(message)
 }
@@ -1156,7 +1608,16 @@ func admitLocked(q: in ActiveMqQueue, item: in Stomp.Decoded): Result[Mq.Message
 // lock is given up between slices.
 func nextDelivery(q: in ActiveMqQueue, deadline: in Long): Result[Option[Mq.Message], String] {
   if not K.lockTryEnter(q.lock, millisUntil(deadline)) {
-    return Ok(None)
+    // The keeper holds the lock for a moment at a time, and that moment is
+    // waited out. An operation may hold it for as long as a request takes,
+    // which is not waited for.
+    var entered = false
+    while not entered and keeperHasTurn(q) {
+      entered = K.lockTryEnter(q.lock, KEEPER_GRACE_MS)
+    }
+    if not entered {
+      return Ok(None)
+    }
   }
   defer {
     K.lockExit(q.lock)
@@ -1203,7 +1664,7 @@ func isRequeueDropped(name: in String): Bool {
 }
 
 func requeueLocked(q: in ActiveMqQueue, delivery: in Delivery): Result[Unit, String] {
-  val tx = match beginTransaction(q) { case Ok(t) -> t; case Err(e) -> return Err(e) }
+  val tx = match beginTransaction(q) { case Ok(t) -> t; case Err(e) -> return Err(notCommittedIfLost(q, e)) }
   val copy: List[Stomp.Header] = newList()
   copy.add(header("destination", Stomp.headerOr(delivery.frame, "destination", q.options.destination)))
   for h in delivery.frame.headers {
@@ -1222,7 +1683,7 @@ func requeueLocked(q: in ActiveMqQueue, delivery: in Delivery): Result[Unit, Str
     case Ok(_) -> ()
     case Err(e) -> {
       abortQuietly(q, tx)
-      return Err(e)
+      return Err(notCommittedIfLost(q, e))
     }
   }
   val ack = ackHeaders(delivery.ackId)
@@ -1231,7 +1692,7 @@ func requeueLocked(q: in ActiveMqQueue, delivery: in Delivery): Result[Unit, Str
     case Ok(_) -> ()
     case Err(e) -> {
       abortQuietly(q, tx)
-      return Err(e)
+      return Err(notCommittedIfLost(q, e))
     }
   }
   commitTransaction(q, tx)
@@ -1250,15 +1711,26 @@ func settle(q: in ActiveMqQueue, messageId: in String, how: in Int, automatic: i
   defer {
     K.lockExit(q.lock)
   }
+  if q.closed {
+    return Err("activemq: the connection is closed")
+  }
+  if q.inFlight.containsKey(messageId) and q.inFlight[messageId][0].stale {
+    forgetDelivery(q, messageId)
+    return Err(
+      STALE_DELIVERY_PREFIX + ": message '" + messageId +
+        "' was delivered on a connection that has since been lost, so that delivery cannot be settled; the broker redelivers the message"
+    )
+  }
   match checkUsable(q) {
     case Err(e) -> return Err(e)
     case Ok(_) -> ()
   }
   val delivery = match oldestDelivery(q, messageId) { case Ok(d) -> d; case Err(e) -> return Err(e) }
+  val unsettled = "the broker may or may not have applied this settlement; if it did not, it redelivers the message"
   val outcome = if how == 0 {
-    request(q, "ACK", ackHeaders(delivery.ackId), noBody())
+    unknownIfLost(q, request(q, "ACK", ackHeaders(delivery.ackId), noBody()), unsettled)
   } else if how == 1 {
-    request(q, "NACK", ackHeaders(delivery.ackId), noBody())
+    unknownIfLost(q, request(q, "NACK", ackHeaders(delivery.ackId), noBody()), unsettled)
   } else if not delivery.requeueable {
     Err(
       "activemq: message " + messageId +
@@ -1273,7 +1745,9 @@ func settle(q: in ActiveMqQueue, messageId: in String, how: in Int, automatic: i
       Ok(())
     }
     case Err(e) -> {
-      if automatic and not delivery.byHand {
+      // A delivery of a connection that this request lost is stale now and
+      // stays as `markLost` left it.
+      if automatic and not delivery.byHand and q.lost.length == 0 {
         q.inFlight[messageId][0] = delivery.copy(byHand = true)
       }
       Err(e)
@@ -1315,6 +1789,9 @@ func closeLocked(q: in ActiveMqQueue): Unit {
     return
   }
   q.closed = true
+  K.lockEnter(q.writeLock)
+  q.writable = false
+  K.lockExit(q.writeLock)
   if q.lost.length > 0 {
     return
   }
@@ -1346,14 +1823,27 @@ impl Mq.QueueConsumer for ActiveMqQueue {
   {
     val deadline = K.monotonicMillis() + timeoutMs.toLong()
     var first = true
+    // The error of a connection that is being re-established, for as long
+    // as it is: `consume` waits for the new connection, within `timeoutMs`,
+    // whether the loss was there before the call or happened during it.
+    var notConnected = ""
     while true {
       if not first and K.monotonicMillis() >= deadline {
-        return Err("timeout")
+        return Err(if notConnected.length > 0 { notConnected } else { "timeout" })
       }
       first = false
       match nextDelivery(self, deadline) {
-        case Err(e) -> return Err(e)
-        case Ok(None) -> ()
+        case Err(e) -> {
+          val left = millisUntil(deadline)
+          if left == 0 or not isReconnecting(self) {
+            return Err(e)
+          }
+          notConnected = e
+          K.sleepMs(if left > 20 { 20 } else { left })
+        }
+        case Ok(None) -> {
+          notConnected = ""
+        }
         case Ok(Some(message)) -> {
           val outcome = handler(message)
           if not isAuto(self) {
@@ -1383,6 +1873,9 @@ impl Mq.QueueConsumer for ActiveMqQueue {
   }
 
   func close(): Unit {
+    K.lockEnter(self.flagsLock)
+    self.closing = true
+    K.lockExit(self.flagsLock)
     K.lockEnter(self.lock)
     defer {
       K.lockExit(self.lock)
@@ -1391,7 +1884,409 @@ impl Mq.QueueConsumer for ActiveMqQueue {
   }
 }
 
+// ─── The keeper: heart-beats and reconnecting ────────────────────────────────
+// One background thread per connection. Every tick it writes a heart-beat
+// when one is due, and, when no operation holds the lock, reads what the
+// broker has sent and checks that the broker is still there. When the
+// connection is lost it opens a new one. It ends when the connection is
+// closed, when reconnecting is switched off and the connection is lost, or
+// when reconnecting is given up.
+func isClosing(q: in ActiveMqQueue): Bool {
+  K.lockEnter(q.flagsLock)
+  val closing = q.closing
+  K.lockExit(q.flagsLock)
+  closing
+}
+
+func setKeeperTurn(q: in ActiveMqQueue, on: in Bool): Unit {
+  K.lockEnter(q.flagsLock)
+  q.keeperTurn = on
+  K.lockExit(q.flagsLock)
+}
+
+func keeperHasTurn(q: in ActiveMqQueue): Bool {
+  K.lockEnter(q.flagsLock)
+  val turn = q.keeperTurn
+  K.lockExit(q.flagsLock)
+  turn
+}
+
+// The keeper's ways to the lock. Its round every tick is announced before
+// it tries, so that a `consume` that finds the lock taken knows by whom and
+// waits. Where the keeper itself waits for the lock (behind an operation,
+// when the connection is lost), the announcement follows, so that nobody
+// waits behind both.
+func keeperEnter(q: in ActiveMqQueue): Unit {
+  K.lockEnter(q.lock)
+  setKeeperTurn(q, true)
+}
+
+func keeperTryEnter(q: in ActiveMqQueue): Bool {
+  setKeeperTurn(q, true)
+  if K.lockTryEnter(q.lock, 0) {
+    return true
+  }
+  setKeeperTurn(q, false)
+  false
+}
+
+func keeperExit(q: in ActiveMqQueue): Unit {
+  K.lockExit(q.lock)
+  setKeeperTurn(q, false)
+}
+
+func newline(): slice[Byte] {
+  encodeUtf8("\n")
+}
+
+// Write a heart-beat when nothing was written for half of the agreed
+// interval: ActiveMQ's inactivity monitor allows no grace on top of the
+// interval, so writing exactly on time would be too late now and then.
+// Returns the failure of the write, "" when there was none.
+func beat(q: in ActiveMqQueue): String {
+  if not K.lockTryEnter(q.writeLock, 0) {
+    // Somebody is writing a frame, which is as good as a heart-beat.
+    return ""
+  }
+  defer {
+    K.lockExit(q.writeLock)
+  }
+  if not q.writable or q.sendIntervalMs == 0 {
+    return ""
+  }
+  if K.monotonicMillis() - q.lastWriteAt < (q.sendIntervalMs / 2).toLong() {
+    return ""
+  }
+  match K.sockWriteWithin(q.sock, newline(), q.options.requestTimeoutMs) {
+    case Ok(_) -> {
+      q.lastWriteAt = K.monotonicMillis()
+      ""
+    }
+    case Err(e) -> {
+      q.writable = false
+      e
+    }
+  }
+}
+
+// Read what has arrived (lock held, connection usable): messages go to the
+// backlog, a pending SUBSCRIBE receipt is recorded, heart-beats count as a
+// sign of life. With a full backlog nothing is read, so that a consumer that
+// has stopped consuming does not have its whole prefetch window buffered
+// here; the broker is then not judged by its silence either.
+func readAhead(q: in ActiveMqQueue): Unit {
+  var more = true
+  while more and q.lost.length == 0 {
+    if q.backlog.count >= KEEPER_BACKLOG_LIMIT {
+      q.lastReadAt = K.monotonicMillis()
+      more = false
+    } else {
+      match readFrame(q, 0) {
+        case Ok(Some(item)) -> {
+          more = isOk(route(q, item, ""))
+        }
+        case _ -> {
+          more = false
+        }
+      }
+    }
+  }
+}
+
+// How long the keeper sleeps between two rounds: a quarter of the shorter
+// heart-beat interval, between 10 ms and `KEEPER_TICK_MS`.
+func tickOf(sendMs: in Int, receiveMs: in Int): Int {
+  var shortest = KEEPER_TICK_MS * 4
+  if sendMs > 0 and sendMs < shortest {
+    shortest = sendMs
+  }
+  if receiveMs > 0 and receiveMs < shortest {
+    shortest = receiveMs
+  }
+  val tick = shortest / 4
+  if tick < 10 {
+    10
+  } else {
+    tick
+  }
+}
+
+// Sleep `ms`, in pieces, unless the connection is being closed. False when
+// it is.
+func sleepUnlessClosing(q: in ActiveMqQueue, ms: in Int): Bool {
+  val deadline = K.monotonicMillis() + ms.toLong()
+  while true {
+    if isClosing(q) {
+      return false
+    }
+    val left = millisUntil(deadline)
+    if left == 0 {
+      return true
+    }
+    K.sleepMs(if left > 50 { 50 } else { left })
+  }
+  true
+}
+
+// `delayMs` shortened by a random part of up to `percent` percent of it.
+func jittered(delayMs: in Int, percent: in Int): Int {
+  val span = (delayMs.toLong() * percent.toLong() / 100i64).toInt()
+  if span < 1 {
+    delayMs
+  } else {
+    delayMs - secureNextInt(span + 1)
+  }
+}
+
+func giveUp(q: in ActiveMqQueue, why: in String): Unit {
+  keeperEnter(q)
+  q.gaveUp = q.lost + "; " + why
+  keeperExit(q)
+}
+
+// What the new connection must have before it replaces the lost one: the
+// subscription, when the lost one had or wanted one. `Ok("")`: it has.
+// `Ok(text)`: this attempt failed with `text`, try again. `Err`: the broker
+// refused the subscription.
+func resubscribe(fresh: in ActiveMqQueue, wanted: in Bool): Result[String, String] {
+  if not wanted {
+    return Ok("")
+  }
+  K.lockEnter(fresh.lock)
+  val outcome = subscribeLocked(fresh, fresh.options.requestTimeoutMs)
+  val lost = fresh.lost.length > 0
+  K.lockExit(fresh.lock)
+  match outcome {
+    case Ok(true) -> Ok("")
+    case Ok(false) -> {
+      K.sockClose(fresh.sock)
+      Ok("the broker did not confirm the subscription in time")
+    }
+    case Err(e) -> {
+      K.sockClose(fresh.sock)
+      if lost {
+        Ok(e)
+      } else {
+        Err(e)
+      }
+    }
+  }
+}
+
+// Make `fresh` the connection of `q`. False when `q` was closed meanwhile.
+func install(q: in ActiveMqQueue, fresh: in ActiveMqQueue): Bool {
+  keeperEnter(q)
+  defer {
+    keeperExit(q)
+  }
+  if q.closed or isClosing(q) {
+    K.sockClose(fresh.sock)
+    return false
+  }
+  val now = K.monotonicMillis()
+  K.lockEnter(q.writeLock)
+  q.sock = fresh.sock
+  q.sendIntervalMs = fresh.sendIntervalMs
+  q.lastWriteAt = now
+  q.writable = true
+  K.lockExit(q.writeLock)
+  q.decoder = fresh.decoder
+  q.backlog = fresh.backlog
+  q.server = fresh.server
+  q.subscribed = fresh.subscribed
+  q.subscribeReceipt = ""
+  q.subscribeFailure = ""
+  q.receiveIntervalMs = fresh.receiveIntervalMs
+  q.lastReadAt = now
+  q.epoch = q.epoch + 1
+  q.attempts = 0
+  q.lastAttemptError = ""
+  q.lost = ""
+  // What is remembered of deliveries of connections long gone is dropped.
+  for id in mapKeys(q.inFlight).toArray() {
+    val waiting = q.inFlight[id]
+    while waiting.count > 0 and waiting[0].stale and q.epoch - waiting[0].epoch > STALE_EPOCHS_KEPT {
+      waiting.removeAt(0)
+    }
+    if waiting.count == 0 {
+      q.inFlight.remove(id)
+    }
+  }
+  true
+}
+
+// Open a new connection in place of the lost one, as often as the options
+// allow. False when the keeper has nothing left to do: the connection was
+// closed, or reconnecting was given up.
+func reconnect(q: in ActiveMqQueue): Bool {
+  val r = q.options.reconnect
+  var attempt = 0
+  var delay = r.initialDelayMs
+  var lastError = ""
+  while true {
+    if r.maxAttempts > 0 and attempt >= r.maxAttempts {
+      giveUp(
+        q,
+        "reconnecting was given up after " + attempt.toString() + " failed attempt(s), the last one with: " + lastError
+      )
+      return false
+    }
+    if not sleepUnlessClosing(q, jittered(delay, r.jitterPercent)) {
+      return false
+    }
+    attempt += 1
+    keeperEnter(q)
+    val wanted = q.wantSubscription
+    keeperExit(q)
+    match openSession(q.options) {
+      case Err(failure) -> {
+        if failure.permanent {
+          giveUp(q, "reconnecting was given up because the broker refused the new connection: " + failure.text)
+          return false
+        }
+        lastError = failure.text
+      }
+      case Ok(fresh) -> match resubscribe(fresh, wanted) {
+        case Err(refusal) -> {
+          giveUp(q, "reconnecting was given up because the broker refused the subscription: " + refusal)
+          return false
+        }
+        case Ok(problem) -> {
+          if problem.length == 0 {
+            return install(q, fresh)
+          }
+          lastError = problem
+        }
+      }
+    }
+    keeperEnter(q)
+    q.attempts = attempt
+    q.lastAttemptError = lastError
+    keeperExit(q)
+    delay = if delay > r.maxDelayMs / 2 { r.maxDelayMs } else { delay * 2 }
+  }
+  false
+}
+
+func keeperLoop(q: in ActiveMqQueue): Unit {
+  var tick = KEEPER_TICK_MS
+  // The first round comes one tick after the connect, not on top of the
+  // application's first operation.
+  var first = false
+  while true {
+    if not first {
+      K.sleepMs(tick)
+    }
+    first = false
+    if isClosing(q) {
+      return
+    }
+    val writeFailure = beat(q)
+    if writeFailure.length > 0 {
+      keeperEnter(q)
+    } else if not keeperTryEnter(q) {
+      // An operation is using the connection; it reads and checks itself.
+      continue
+    }
+    if q.closed {
+      keeperExit(q)
+      return
+    }
+    if q.lost.length == 0 and writeFailure.length > 0 {
+      val _ = markLost(q, writeFailure)
+    }
+    if q.lost.length == 0 {
+      readAhead(q)
+    }
+    if q.lost.length == 0 {
+      val silence = peerSilence(q)
+      if silence.length > 0 {
+        val _ = markLost(q, silence)
+      }
+    }
+    val down = q.lost.length > 0
+    tick = tickOf(q.sendIntervalMs, q.receiveIntervalMs)
+    keeperExit(q)
+    if down {
+      if not q.options.reconnect.enabled {
+        return
+      }
+      if not reconnect(q) {
+        return
+      }
+      first = true
+    }
+  }
+}
+
+func keeperMain(q: in ActiveMqQueue): Unit {
+  try {
+    keeperLoop(q)
+  } catch Bug as b {
+    // Nothing above is expected to raise. If something does, the
+    // connection must not look alive without its keeper.
+    keeperEnter(q)
+    val _ = markLost(q, "the connection's background thread failed: " + b.message)
+    q.gaveUp = q.lost
+    keeperExit(q)
+  }
+  K.lockEnter(q.flagsLock)
+  q.keeperRunning = false
+  K.lockExit(q.flagsLock)
+}
+
 // ─── Introspection ───────────────────────────────────────────────────────────
+/// What a connection is doing about its link to the broker.
+pub record ConnectionStatus {
+  /// There is a connection now.
+  connected: Bool
+  /// The connection is lost and the keeper is opening a new one.
+  reconnecting: Bool
+  /// Why the connection is lost; empty while connected. After reconnecting
+  /// was given up it also says so, and why.
+  lostBecause: String
+  /// Failed attempts since the connection was lost, and what the last one
+  /// failed with.
+  failedAttempts: Int
+  lastAttemptError: String
+  /// How many times a lost connection was replaced by a new one.
+  reconnects: Int
+  /// The agreed heart-beat intervals in milliseconds: how often this client
+  /// writes at least, and how often the broker does; 0 = no heart-beat in
+  /// that direction.
+  heartBeatSendMs: Int
+  heartBeatReceiveMs: Int
+}
+
+/// The state of the connection, without probing it.
+pub func status(q: in ActiveMqQueue): ConnectionStatus {
+  K.lockEnter(q.lock)
+  defer {
+    K.lockExit(q.lock)
+  }
+  val down = q.lost.length > 0
+  ConnectionStatus(
+    connected = not q.closed and not down,
+    reconnecting = not q.closed and down and q.gaveUp.length == 0 and q.options.reconnect.enabled,
+    lostBecause = if q.gaveUp.length > 0 { q.gaveUp } else { q.lost },
+    failedAttempts = q.attempts,
+    lastAttemptError = q.lastAttemptError,
+    reconnects = q.epoch,
+    heartBeatSendMs = if down { 0 } else { q.sendIntervalMs },
+    heartBeatReceiveMs = if down { 0 } else { q.receiveIntervalMs }
+  )
+}
+
+/// True while the connection's background thread (heart-beats, reconnecting)
+/// runs. It ends shortly after `close`.
+pub func hasBackgroundThread(q: in ActiveMqQueue): Bool {
+  K.lockEnter(q.flagsLock)
+  defer {
+    K.lockExit(q.flagsLock)
+  }
+  q.keeperRunning
+}
+
 /// The broker's product and version from its `CONNECTED` frame, e.g.
 /// `ActiveMQ/5.17.6`.
 pub func serverInfo(q: in ActiveMqQueue): String {
@@ -1403,7 +2298,8 @@ pub func destination(q: in ActiveMqQueue): String {
   q.options.destination
 }
 
-/// True until `close` is called or the connection is lost.
+/// True while there is a connection: false after `close`, and while a lost
+/// connection is being re-established or was given up.
 pub func isOpen(q: in ActiveMqQueue): Bool {
   K.lockEnter(q.lock)
   defer {
@@ -1413,6 +2309,8 @@ pub func isOpen(q: in ActiveMqQueue): Bool {
 }
 
 /// The number of deliveries handed to a handler and not yet settled.
+/// Deliveries of a connection that was lost do not count: they cannot be
+/// settled any more.
 pub func unsettledCount(q: in ActiveMqQueue): Int {
   K.lockEnter(q.lock)
   defer {
@@ -1420,7 +2318,11 @@ pub func unsettledCount(q: in ActiveMqQueue): Int {
   }
   var total = 0
   for waiting in mapValues(q.inFlight).toArray() {
-    total = total + waiting.count
+    for delivery in waiting.toArray() {
+      if not delivery.stale {
+        total = total + 1
+      }
+    }
   }
   total
 }

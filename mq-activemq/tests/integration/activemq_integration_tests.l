@@ -923,6 +923,164 @@ test "two consumers on their own threads share a queue without loss or duplicati
   publisher.close()
 }
 
+// ─── Heart-beats and reconnecting ────────────────────────────────────────────
+// Wait for `condition`, looking every 20 ms; the limits are far above what a
+// healthy run needs.
+func waitUntil(label: in String, limitMs: in Int, condition: in () -> Bool): Unit {
+  val deadline = K.monotonicMillis() + limitMs.toLong()
+  while not condition() {
+    if K.monotonicMillis() >= deadline {
+      assertTrue(false, label + ": not within " + limitMs.toString() + " ms")
+      return
+    }
+    K.sleepMs(20)
+  }
+}
+
+func reconnectsOf(q: in ActiveMq.ActiveMqQueue): Int {
+  val status = ActiveMq.status(q)
+  status.reconnects
+}
+
+func takeWithin(q: in ActiveMq.ActiveMqQueue, limitMs: in Int, label: in String): Mq.Message {
+  val got = Got(messages = newList())
+  match q.consume(limitMs, { m -> keep(got, m) }) {
+    case Ok(_) -> got.messages[0]
+    case Err(e) -> panic(label + ": consume failed: " + e)
+  }
+}
+
+// Cut the connection under the client, as a network failure would: the
+// socket is closed without a DISCONNECT and without telling the client. The
+// broker sees the connection end and takes back what was not settled.
+func cutConnection(q: in ActiveMq.ActiveMqQueue): Unit {
+  // `writeLock` guards the socket field as well, and no consume holds it.
+  K.lockEnter(q.writeLock)
+  K.sockClose(q.sock)
+  K.lockExit(q.writeLock)
+}
+
+test "heart-beats are agreed with ActiveMQ" {
+  val q = openQueue()
+  val byDefault = ActiveMq.status(q)
+  assertEqualInt(byDefault.heartBeatSendMs, 10000, "the default towards the broker")
+  assertEqualInt(byDefault.heartBeatReceiveMs, 10000, "the default from the broker")
+  q.close()
+  val base = optionsFor(Extras.queueDestination(unique("lyric.it")))
+  val off = open(base.copy(heartBeatSendMs = 0, heartBeatReceiveMs = 0))
+  val none = ActiveMq.status(off)
+  assertEqualInt(none.heartBeatSendMs, 0, "switched off towards the broker")
+  assertEqualInt(none.heartBeatReceiveMs, 0, "switched off from the broker")
+  off.close()
+}
+
+// What ActiveMQ does to a client that agrees to heart-beats and then sends
+// nothing: it closes the connection. This is the control for the next test.
+test "ActiveMQ drops a connection that promised heart-beats and stays silent" {
+  val address = brokerAddress()
+  val sock = match K.sockConnect(address.host, address.port, 5000) { case Ok(s) -> s; case Err(e) -> panic(e) }
+  val connect = Stomp.bareFrame(
+    "CONNECT",
+    [
+      Stomp.Header(name = "accept-version", value = "1.2"),
+      Stomp.Header(name = "host", value = address.host),
+      Stomp.Header(name = "login", value = address.login),
+      Stomp.Header(name = "passcode", value = address.passcode),
+      Stomp.Header(name = "heart-beat", value = "500,0")
+    ]
+  )
+  match Stomp.encodeFrame(connect) {
+    case Ok(bytes) -> {
+      val _ = K.sockWrite(sock, bytes)
+    }
+    case Err(e) -> panic(e)
+  }
+  val deadline = K.monotonicMillis() + 60000i64
+  var ended = false
+  var sawConnected = false
+  while not ended and K.monotonicMillis() < deadline {
+    match K.sockRead(sock, 4096, 1000) {
+      case Ok(Data(bytes)) -> {
+        sawConnected = true
+      }
+      case Ok(TimedOut) -> ()
+      case _ -> {
+        ended = true
+      }
+    }
+  }
+  K.sockClose(sock)
+  assertTrue(sawConnected, "the broker answered CONNECT")
+  assertTrue(ended, "the broker ended the silent connection")
+}
+
+test "an idle connection with short heart-beats stays open, in both directions" {
+  val base = optionsFor(Extras.queueDestination(unique("lyric.it")))
+  val q = open(base.copy(heartBeatSendMs = 500, heartBeatReceiveMs = 500))
+  val agreed = ActiveMq.status(q)
+  assertEqualInt(agreed.heartBeatSendMs, 500, "towards the broker")
+  assertEqualInt(agreed.heartBeatReceiveMs, 500, "from the broker")
+  // Ten intervals of idling: without the client's heart-beats the broker
+  // would have closed the connection (the test above), and without the
+  // broker's the client would have declared it dead after 1 s.
+  K.sleepMs(5000)
+  val later = ActiveMq.status(q)
+  assertTrue(later.connected, "still connected: " + later.lostBecause)
+  assertEqualInt(later.reconnects, 0, "on the first connection")
+  mustPublish(q, message("hb-1", "after idling"))
+  assertEqual(mustTake(q).id, "hb-1", "the connection works")
+  assertTrue(isOk(q.ack("hb-1")), "ack")
+  // A subscribed consumer idles the same way.
+  K.sleepMs(3000)
+  expectNothing(q, 200, "nothing arrived meanwhile")
+  assertEqualInt(reconnectsOf(q), 0, "still the first connection")
+  q.close()
+}
+
+func survivesACut(options: in ActiveMq.ConnectOptions, label: in String): Unit {
+  val quick = ActiveMq.defaultReconnect().copy(initialDelayMs = 200, maxDelayMs = 1000)
+  val q = open(options.copy(reconnect = quick))
+  mustPublish(q, message("cut-1", "before"))
+  assertEqual(mustTake(q).id, "cut-1", label + ": delivered on the first connection")
+  cutConnection(q)
+  waitUntil(label + ": the reconnect", 60000, { -> reconnectsOf(q) == 1 })
+  // The delivery of the cut connection cannot be settled any more.
+  val stale = errorOf(q.ack("cut-1"), label + ": ack of the old delivery")
+  assertTrue(ActiveMq.isStaleDeliveryError(stale), label + ": the stale error: " + stale)
+  // The broker redelivers it on the new subscription, flagged.
+  val again = takeWithin(q, 30000, label + ": the redelivery")
+  assertEqual(again.id, "cut-1", label + ": redelivered")
+  assertEqualInt(again.deliveryCount, 1, label + ": flagged redelivered by ActiveMQ")
+  assertTrue(isOk(q.ack("cut-1")), label + ": the redelivery is settled")
+  // Publishing and consuming go on.
+  mustPublish(q, message("cut-2", "after"))
+  assertEqual(mustTake(q).id, "cut-2", label + ": published and delivered on the new connection")
+  assertTrue(isOk(q.ack("cut-2")), label + ": ack")
+  expectNothing(q, 300, label + ": nothing was duplicated")
+  // A consume that is waiting when the connection is cut goes on waiting and
+  // receives what is published afterwards.
+  val publisher = open(options)
+  val cutter = KT.startBackground(
+    { ->
+      K.sleepMs(500)
+      cutConnection(q)
+      K.sleepMs(500)
+      mustPublish(publisher, message("cut-3", "during a consume"))
+    }
+  )
+  assertEqual(takeWithin(q, 60000, label + ": a consume across a cut").id, "cut-3", label + ": delivered after the cut")
+  KT.waitBackground(cutter)
+  assertTrue(isOk(q.ack("cut-3")), label + ": ack")
+  assertEqualInt(reconnectsOf(q), 2, label + ": two reconnects")
+  publisher.close()
+  q.close()
+  waitUntil(label + ": the background thread ends", 10000, { -> not ActiveMq.hasBackgroundThread(q) })
+}
+
+test "a cut connection is re-established against ActiveMQ: resubscribed, redelivered, and usable" {
+  survivesACut(optionsFor(Extras.queueDestination(unique("lyric.it"))), "plain TCP")
+}
+
 // ─── TLS ─────────────────────────────────────────────────────────────────────
 func requiredEnv(name: in String, what: in String): String {
   val value = Env.getVarOrDefault(name, "")
@@ -1172,6 +1330,10 @@ test "TLS: deliveries left unsettled at close are redelivered to the next consum
   assertEqualInt(got.deliveryCount, 1, "flagged redelivered")
   assertTrue(isOk(second.ack(got.id)), "ack")
   second.close()
+}
+
+test "TLS: a cut connection is re-established against ActiveMQ" {
+  survivesACut(tlsOptionsFor(tlsQueueName()), "TLS")
 }
 
 test "TLS: connectFromEnv reads the CA, the client identity and the server name" {

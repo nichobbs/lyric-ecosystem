@@ -23,6 +23,8 @@ output_assembly = "Mq.ActiveMq.dll"
 "Mq.ActiveMq.UrlTests"      = "tests/url_tests.l"
 "Mq.ActiveMq.ExtrasTests"   = "tests/extras_tests.l"
 "Mq.ActiveMq.ReexportTests" = "tests/reexport_tests.l"
+# The README examples, compiled, and run as far as a refused connection.
+"Mq.ActiveMq.ReadmeTests"   = "tests/readme_tests.l"
 # The client against an in-process STOMP broker on a loopback socket.
 "Mq.ActiveMq.ClientTests"   = "tests/client_tests.l"
 # Needs a real ActiveMQ: file-level `@cfg(feature = "integration")`, so a plain
