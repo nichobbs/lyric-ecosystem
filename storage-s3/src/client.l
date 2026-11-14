@@ -14,6 +14,15 @@
 //! `SignatureDoesNotMatch`), except that `NoSuchKey` and a bodyless 404 are
 //! the interface's `NOT_FOUND`; a response with no error document is
 //! `HTTP_<status>`, and a request that got no response is `CONNECTION_FAILED`.
+//! `CREDENTIALS_UNAVAILABLE` means the configured credential provider had no
+//! credentials to sign with.
+//!
+//! Credentials are static (the access key fields of `S3Config`) or come from
+//! an `Aws.Credentials.CredentialProvider` (`withCredentialProvider`), which
+//! is asked before every attempt, so temporary credentials are replaced when
+//! the provider refreshes them. A request that is throttled, answered with a
+//! 5xx, cut off or not answered in time is sent again, signed afresh, as the
+//! `Aws.Retry` policy of the configuration says (`withRetry`).
 @runtime_checked
 @io
 package Storage.S3.Client
@@ -29,6 +38,10 @@ import Std.String as Str
 import Std.Task
 import Std.Time as Time
 import Std.Tls as Tls
+import Aws.Credentials
+import Aws.Credentials.Chain
+import Aws.Credentials.Profile
+import Aws.Retry
 import Aws.SigV4
 import Aws.SigV4.Env as AwsEnv
 import Storage
@@ -66,6 +79,12 @@ pub record S3Config {
   /// A certificate authority trusted in addition to the system trust store
   /// (PEM text); `""` adds none. Ignored when `caCertificatePem` is set.
   additionalCaCertificatePem: String = ""
+  /// Where the credentials come from; `None` uses `accessKeyId`,
+  /// `secretAccessKey` and `sessionToken`. Set with `withCredentialProvider`.
+  credentialProvider: Option[CredentialProvider] = None
+  /// When a failed request is sent again. Set with `withRetry` or
+  /// `withoutRetries`.
+  retry: RetryPolicy = standardRetry()
 }
 
 /// Configuration for a bucket on AWS, virtual-hosted.
@@ -116,6 +135,25 @@ pub func S3Config.withPathStyle(cfg: in S3Config, pathStyle: in Bool): S3Config 
 /// `cfg` with a per-request deadline in milliseconds.
 pub func S3Config.withRequestTimeout(cfg: in S3Config, requestTimeoutMs: in Int): S3Config {
   cfg.copy(requestTimeoutMs = requestTimeoutMs)
+}
+
+/// `cfg` signing with the credentials `provider` returns instead of the
+/// access key fields. The provider is asked before every request and every
+/// retry: wrap one that calls a service or reads a file in
+/// `Aws.Credentials.cached` (`Aws.Credentials.Chain.defaultProvider()` is).
+pub func S3Config.withCredentialProvider(cfg: in S3Config, provider: in CredentialProvider): S3Config {
+  cfg.copy(credentialProvider = Some(value = provider))
+}
+
+/// `cfg` retrying as `policy` says (`Aws.Retry`). The default is
+/// `standardRetry()`: three attempts.
+pub func S3Config.withRetry(cfg: in S3Config, policy: in RetryPolicy): S3Config {
+  cfg.copy(retry = policy)
+}
+
+/// `cfg` sending every request once.
+pub func S3Config.withoutRetries(cfg: in S3Config): S3Config {
+  cfg.copy(retry = noRetry())
 }
 
 /// `cfg` trusting the certificate authority `caPem` (PEM text, one
@@ -173,33 +211,69 @@ pub func S3Config.withExclusiveCaCertificateFile(cfg: in S3Config, path: in Stri
   }
 }
 
-/// Configuration for `bucket` from the standard AWS environment variables:
-/// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`,
-/// the region from `AWS_REGION` or `AWS_DEFAULT_REGION`, and an optional
-/// endpoint from `AWS_ENDPOINT_URL_S3` or `AWS_ENDPOINT_URL` (path-style when
-/// set). `Err(INVALID_CONFIG)` names the first variable that is missing.
+/// Configuration for `bucket` from the process environment and the AWS
+/// shared files: `configFromEnvironment` over
+/// `Aws.Credentials.processEnvironment()`.
 pub func configFromEnv(bucket: in String): Result[S3Config, StorageError] {
-  val creds = match AwsEnv.credentialsFromEnv() {
+  configFromEnvironment(bucket, processEnvironment())
+}
+
+/// Configuration for `bucket` as the AWS SDKs would find it, reading
+/// variables through `lookup`:
+///
+///   * credentials from the default chain (`Aws.Credentials.Chain`): the
+///     environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional
+///     `AWS_SESSION_TOKEN`), web identity, the shared config and credentials
+///     files (`AWS_PROFILE`), the container endpoint, the EC2 instance
+///     metadata service. The chain is asked once here, so that missing
+///     credentials are an error now. Credentials from the environment become
+///     the static fields of the configuration, as they always did; any other
+///     source is kept as a cached credential provider, which refreshes
+///     temporary credentials before they expire;
+///   * the region from `AWS_REGION`, `AWS_DEFAULT_REGION` or the profile's
+///     `region`;
+///   * an optional endpoint from `AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL` or
+///     the profile's `endpoint_url` (path-style when set);
+///   * an optional certificate authority, trusted in addition to the system
+///     trust store, from `AWS_CA_BUNDLE` or the profile's `ca_bundle`.
+///
+/// `Err(INVALID_CONFIG)` says what is missing; for credentials it holds the
+/// reason of every provider of the chain.
+pub func configFromEnvironment(bucket: in String, lookup: in (String) -> String): Result[S3Config, StorageError] {
+  val provider = cached(defaultChain(lookup))
+  val resolved = match provider.resolve() {
     case Ok(c) -> c
-    case Err(message) -> return Err(StorageError(message = message, code = "INVALID_CONFIG"))
+    case Err(e) -> return Err(invalidConfig("no AWS credentials: " + e.text()))
   }
-  val region = match AwsEnv.regionFromEnv() {
-    case Ok(r) -> r
-    case Err(message) -> return Err(StorageError(message = message, code = "INVALID_CONFIG"))
+  val settings = match settingsFromEnvironment(lookup, "S3") {
+    case Ok(s) -> s
+    case Err(e) -> return Err(invalidConfig(e.text()))
   }
-  val endpoint = AwsEnv.endpointFromEnv("S3")
-  Ok(
-    S3Config(
-      bucket = bucket,
-      region = region,
-      accessKeyId = creds.accessKeyId,
-      secretAccessKey = creds.secretAccessKey,
-      sessionToken = creds.sessionToken,
-      endpoint = endpoint,
-      pathStyle = endpoint.length > 0,
-      requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS
+  if settings.region.length == 0 {
+    return Err(
+      invalidConfig(
+        "no AWS region: neither AWS_REGION nor AWS_DEFAULT_REGION is set, and the profile has no region"
+      )
     )
+  }
+  val fromEnvironment = resolved.source == "environment"
+  var cfg = S3Config(
+    bucket = bucket,
+    region = settings.region,
+    accessKeyId = if fromEnvironment { resolved.credentials.accessKeyId } else { "" },
+    secretAccessKey = if fromEnvironment { resolved.credentials.secretAccessKey } else { "" },
+    sessionToken = if fromEnvironment { resolved.credentials.sessionToken } else { "" },
+    endpoint = settings.endpointUrl,
+    pathStyle = settings.endpointUrl.length > 0,
+    requestTimeoutMs = DEFAULT_REQUEST_TIMEOUT_MS
   )
+  if not fromEnvironment {
+    cfg = cfg.withCredentialProvider(provider)
+  }
+  if settings.caBundlePath.length > 0 {
+    cfg = match cfg.withCaCertificateFile(settings.caBundlePath) { case Ok(c) -> c; case Err(e) -> return Err(e) }
+  }
+  Ok(cfg)
 }
 
 /// A connection to one bucket. Build one with `openClient`; the fields are
@@ -207,7 +281,9 @@ pub func configFromEnv(bucket: in String): Result[S3Config, StorageError] {
 pub record S3Client {
   bucket: String
   region: String
-  creds: Credentials
+  // Asked for the credentials of every attempt.
+  credentials: CredentialProvider
+  retry: RetryPolicy
   // `https://host[:port]`, no trailing slash.
   origin: String
   // The authority sent as `Host` and signed: `host[:port]`.
@@ -370,7 +446,7 @@ func httpClientFor(cfg: in S3Config): Result[HttpClient, StorageError] {
 /// wrong credential or a missing bucket shows up on the first operation.
 ///
 /// `Err(INVALID_CONFIG)` for an invalid bucket or region name, empty
-/// credentials, a malformed endpoint, a plain `http://` endpoint that is not
+/// credentials when there is no credential provider, a malformed endpoint, a plain `http://` endpoint that is not
 /// loopback, a non-positive timeout, or a CA certificate that is not a PEM
 /// certificate.
 pub func openClient(cfg: in S3Config): Result[S3Client, StorageError] {
@@ -380,8 +456,19 @@ pub func openClient(cfg: in S3Config): Result[S3Client, StorageError] {
   if not isValidRegion(cfg.region) {
     return Err(invalidConfig("invalid AWS region: '" + cfg.region + "'"))
   }
-  if cfg.accessKeyId.length == 0 or cfg.secretAccessKey.length == 0 {
-    return Err(invalidConfig("S3 access key id and secret access key must be non-empty"))
+  val credentials = match cfg.credentialProvider {
+    case Some(provider) -> provider
+    case None -> {
+      if cfg.accessKeyId.length == 0 or cfg.secretAccessKey.length == 0 {
+        return Err(invalidConfig("S3 access key id and secret access key must be non-empty"))
+      }
+      staticProviderOf(
+        Credentials(accessKeyId = cfg.accessKeyId, secretAccessKey = cfg.secretAccessKey, sessionToken = cfg.sessionToken)
+      )
+    }
+  }
+  if cfg.retry.maxAttempts < 1 {
+    return Err(invalidConfig("retry.maxAttempts must be >= 1, got " + cfg.retry.maxAttempts.toString()))
   }
   if cfg.requestTimeoutMs <= 0 {
     return Err(invalidConfig("requestTimeoutMs must be > 0, got " + cfg.requestTimeoutMs.toString()))
@@ -400,11 +487,8 @@ pub func openClient(cfg: in S3Config): Result[S3Client, StorageError] {
     S3Client(
       bucket = cfg.bucket,
       region = cfg.region,
-      creds = Credentials(
-        accessKeyId = cfg.accessKeyId,
-        secretAccessKey = cfg.secretAccessKey,
-        sessionToken = cfg.sessionToken
-      ),
+      credentials = credentials,
+      retry = cfg.retry,
       origin = endpoint.scheme + "://" + host,
       host = host,
       basePath = if cfg.pathStyle { "/" + cfg.bucket } else { "" },
@@ -455,9 +539,39 @@ func transportError(message: in String): StorageError {
   StorageError(message = message, code = "CONNECTION_FAILED")
 }
 
+/// The credentials to sign with now, from the client's provider.
+/// `Err(CREDENTIALS_UNAVAILABLE)` when it has none.
+pub func S3Client.currentCredentials(client: in S3Client): Result[Credentials, StorageError] {
+  val resolved = try {
+    client.credentials.resolve()
+  } catch Bug as bug {
+    Err(error = CredentialError(code = "REQUEST_FAILED", provider = "provider", message = bug.message))
+  }
+  match resolved {
+    case Ok(c) -> Ok(c.credentials)
+    case Err(e) -> Err(StorageError(message = "no AWS credentials: " + e.text(), code = "CREDENTIALS_UNAVAILABLE"))
+  }
+}
+
+// What one attempt came to: the result, and for a failure what kind it is
+// (`NotRetryable` for a success).
+record Attempt {
+  outcome: Result[S3Response, StorageError]
+  kind: FailureKind
+  retryAfterMs: Int
+}
+
+func failedAttempt(e: in StorageError, kind: in FailureKind): Attempt {
+  Attempt(outcome = Err(e), kind = kind, retryAfterMs = -1)
+}
+
+func isTimeoutCause(cause: in String): Bool {
+  cause == "request timed out" or cause == "HTTP connect timed out" or Str.contains(cause, "HttpClient.Timeout")
+}
+
 // Plain (non-`async`) so it may `await` in place and still wrap the send in
 // `try` (V0012 forbids `await` inside `try` in an `async func`).
-func sendCatching(client: in S3Client, req: in HttpRequest, url: in String): Result[HttpResponse, StorageError] {
+func sendCatching(client: in S3Client, req: in HttpRequest, url: in String): Attempt {
   val src = makeCancelSourceTimeout(client.requestTimeoutMs)
   val tok = sourceToken(src)
   val sent = try {
@@ -465,15 +579,33 @@ func sendCatching(client: in S3Client, req: in HttpRequest, url: in String): Res
   } catch Bug as bug {
     Err(error = ConnectionFailed(url = url, message = bug.message))
   }
-  val timedOut = isCancelled(tok)
+  val deadlinePassed = isCancelled(tok)
   disposeSource(src)
-  match sent {
-    case Ok(resp) -> Ok(resp)
-    case Err(e) -> if timedOut {
-      Err(transportError("S3 request timed out after " + client.requestTimeoutMs.toString() + " ms: " + url))
-    } else {
-      Err(transportError(HttpError.message(e)))
+  val resp = match sent {
+    case Ok(r) -> r
+    case Err(e) -> {
+      val timedOut = deadlinePassed or
+        match e {
+          case ConnectionFailed(_, cause) -> isTimeoutCause(cause)
+          case Timeout(_, _) -> true
+          case _ -> false
+        }
+      if timedOut {
+        return failedAttempt(
+          transportError("S3 request timed out after " + client.requestTimeoutMs.toString() + " ms: " + url),
+          FailureKind.TimedOut
+        )
+      }
+      val message = HttpError.message(e)
+      return failedAttempt(
+        transportError(message),
+        if isConnectFailure(message) { FailureKind.ConnectFailed } else { FailureKind.NoResponse }
+      )
     }
+  }
+  match readBody(resp) {
+    case Err(e) -> failedAttempt(e, FailureKind.NoResponse)
+    case Ok(bytes) -> answered(resp, bytes)
   }
 }
 
@@ -489,23 +621,39 @@ func readBody(resp: in HttpResponse): Result[slice[Byte], StorageError] {
   }
 }
 
-/// Sign and send one request to the bucket.
-///
-/// `canonicalUri` is the encoded path (`objectPath`), `query` the unencoded
-/// query parameters, `amzHeaders` extra `x-amz-*` headers to sign and send
-/// (lowercase names), and `body` the payload, or `None` for a request without
-/// one. Any HTTP response is `Ok`, whatever its status;
-/// `Err` means no response arrived (`CONNECTION_FAILED`) or the request could
-/// not be built (`INVALID_ARGUMENT`).
-pub func S3Client.send(
+// The attempt that got `resp`: a response of any status is `Ok`; a failed
+// one is classified for the retry policy.
+func answered(resp: in HttpResponse, bytes: in slice[Byte]): Attempt {
+  val status = HttpResponse.statusCode(resp)
+  var kind = FailureKind.NotRetryable
+  var retryAfterMs = -1
+  if status >= 400 {
+    val text = match Enc.tryDecodeUtf8(bytes) { case Some(t) -> t; case None -> "" }
+    val code = match parseFault(text) { case Some(fault) -> fault.code; case None -> "" }
+    kind = classifyResponse(status, code)
+    retryAfterMs = retryAfterMsOf(
+      match HttpResponse.header(resp, "Retry-After") { case Some(v) -> v; case None -> "" },
+      match HttpResponse.header(resp, "x-amz-retry-after") { case Some(v) -> v; case None -> "" }
+    )
+  }
+  Attempt(
+    outcome = Ok(S3Response(status = status, body = bytes, response = resp)),
+    kind = kind,
+    retryAfterMs = retryAfterMs
+  )
+}
+
+// One signed attempt.
+func attempt(
   client: in S3Client,
+  creds: in Credentials,
   method: in HttpMethod,
   methodName: in String,
   canonicalUri: in String,
   query: in List[Pair],
   amzHeaders: in List[Pair],
   body: in Option[Payload],
-): Result[S3Response, StorageError] {
+): Attempt {
   val payloadHash = match body {
     case Some(payload) -> Str.toLower(Hash.sha256OfBytes(payload.bytes))
     case None -> emptyPayloadSha256()
@@ -518,7 +666,7 @@ pub func S3Client.send(
     amzHeaders,
     payloadHash,
     true,
-    client.creds,
+    creds,
     client.region,
     "s3",
     amzDateNow()
@@ -527,7 +675,10 @@ pub func S3Client.send(
   val url = client.origin + canonicalUri + (if queryString.length > 0 { "?" + queryString } else { "" })
   val parsed = match Url.tryFrom(url) {
     case Ok(u) -> u
-    case Err(_) -> return Err(StorageError(message = "cannot build an S3 request URL: " + url, code = "INVALID_ARGUMENT"))
+    case Err(_) -> return failedAttempt(
+      StorageError(message = "cannot build an S3 request URL: " + url, code = "INVALID_ARGUMENT"),
+      FailureKind.NotRetryable
+    )
   }
   var req = request(method, parsed)
   match body {
@@ -536,7 +687,10 @@ pub func S3Client.send(
         case Ok(r) -> {
           req = r
         }
-        case Err(e) -> return Err(StorageError(message = HttpError.message(e), code = "INVALID_ARGUMENT"))
+        case Err(e) -> return failedAttempt(
+          StorageError(message = HttpError.message(e), code = "INVALID_ARGUMENT"),
+          FailureKind.NotRetryable
+        )
       }
     }
     case None -> ()
@@ -549,19 +703,80 @@ pub func S3Client.send(
       case Ok(r) -> {
         req = r
       }
-      case Err(e) -> return Err(StorageError(message = HttpError.message(e), code = "INVALID_ARGUMENT"))
+      case Err(e) -> return failedAttempt(
+        StorageError(message = HttpError.message(e), code = "INVALID_ARGUMENT"),
+        FailureKind.NotRetryable
+      )
     }
     k = k + 1
   }
-  match sendCatching(client, req, url) {
-    case Err(e) -> Err(e)
-    case Ok(resp) -> {
-      match readBody(resp) {
-        case Err(e) -> Err(e)
-        case Ok(bytes) -> Ok(S3Response(status = HttpResponse.statusCode(resp), body = bytes, response = resp))
-      }
+  sendCatching(client, req, url)
+}
+
+func sendRetrying(
+  client: in S3Client,
+  method: in HttpMethod,
+  methodName: in String,
+  canonicalUri: in String,
+  query: in List[Pair],
+  amzHeaders: in List[Pair],
+  body: in Option[Payload],
+  idempotent: in Bool,
+): Result[S3Response, StorageError] {
+  var number = 1
+  while true {
+    // Asked again for every attempt: a retry is signed with the credentials
+    // and the date of its own moment.
+    val creds = match client.currentCredentials() { case Ok(c) -> c; case Err(e) -> return Err(e) }
+    val made = attempt(client, creds, method, methodName, canonicalUri, query, amzHeaders, body)
+    match client.retry.decide(number, made.kind, idempotent, made.retryAfterMs) {
+      case GiveUp -> return made.outcome
+      case RetryAfter(delayMs) -> client.retry.pause(delayMs)
     }
+    number = number + 1
   }
+  Err(transportError("unreachable"))
+}
+
+/// Sign and send one request to the bucket, again if the client's retry
+/// policy says so. The request must be idempotent: after a failure that
+/// leaves its outcome unknown (a 5xx, a cut connection, a timeout) it is
+/// sent again. Every object operation of S3 is; use `sendUnrepeatable` for
+/// one that is not.
+///
+/// `canonicalUri` is the encoded path (`objectPath`), `query` the unencoded
+/// query parameters, `amzHeaders` extra `x-amz-*` headers to sign and send
+/// (lowercase names), and `body` the payload, or `None` for a request without
+/// one. Any HTTP response is `Ok`, whatever its status (the last one, when
+/// the request was retried); `Err` means no response arrived
+/// (`CONNECTION_FAILED`), the request could not be built
+/// (`INVALID_ARGUMENT`), or there are no credentials
+/// (`CREDENTIALS_UNAVAILABLE`).
+pub func S3Client.send(
+  client: in S3Client,
+  method: in HttpMethod,
+  methodName: in String,
+  canonicalUri: in String,
+  query: in List[Pair],
+  amzHeaders: in List[Pair],
+  body: in Option[Payload],
+): Result[S3Response, StorageError] {
+  sendRetrying(client, method, methodName, canonicalUri, query, amzHeaders, body, true)
+}
+
+/// `send` for a request that must not be carried out twice: it is sent again
+/// only when S3 throttled it or the connection could not be opened, never
+/// after a 5xx, a cut connection or a timeout.
+pub func S3Client.sendUnrepeatable(
+  client: in S3Client,
+  method: in HttpMethod,
+  methodName: in String,
+  canonicalUri: in String,
+  query: in List[Pair],
+  amzHeaders: in List[Pair],
+  body: in Option[Payload],
+): Result[S3Response, StorageError] {
+  sendRetrying(client, method, methodName, canonicalUri, query, amzHeaders, body, false)
 }
 
 /// The `StorageError` for a response that is not the success the caller
@@ -864,20 +1079,24 @@ pub func S3Client.listObjects(
 
 /// A URL that performs `methodName` (`GET`, `PUT`) on `key` without
 /// credentials until `expiresInSeconds` after `amzDate` (`amzDateNow()`).
-/// Computed locally; S3 is not contacted and the object need not exist.
-@pure
+/// Computed locally with the client's current credentials; S3 is not
+/// contacted and the object need not exist. `Err(CREDENTIALS_UNAVAILABLE)`
+/// when the credential provider has none.
 pub func S3Client.presign(
   client: in S3Client,
   methodName: in String,
   key: in String,
   expiresInSeconds: in Int,
   amzDate: in String,
-): String
+): Result[String, StorageError]
   requires: expiresInSeconds >= 1 and expiresInSeconds <= 604800
   requires: amzDate.length == 16
 {
+  val creds = match client.currentCredentials() { case Ok(c) -> c; case Err(e) -> return Err(e) }
   val path = client.objectPath(key)
   val none: List[Pair] = newList()
-  client.origin + path + "?" +
-    presignQuery(methodName, client.host, path, none, client.creds, client.region, "s3", amzDate, expiresInSeconds)
+  Ok(
+    client.origin + path + "?" +
+      presignQuery(methodName, client.host, path, none, creds, client.region, "s3", amzDate, expiresInSeconds)
+  )
 }

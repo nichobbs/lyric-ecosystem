@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start a disposable AWS Emulator (https://github.com/aws/aws-emulator) for the
-# mq-sqs and storage-s3 integration suites, on https://127.0.0.1:$port
+# aws-credentials, mq-sqs and storage-s3 integration suites, on https://127.0.0.1:$port
 # (default 9297).
 #
 # The pinned Debian package is downloaded into $AWS_EMULATOR_PKG_DIR (default
@@ -14,7 +14,9 @@
 # It serves HTTPS with a certificate generated at start, from its own CA. No
 # process-wide trust setting is exported: scripts/ci/test-aws-emulator.sh hands
 # ca.pem to the suites (LYRIC_SQS_CA_FILE, LYRIC_S3_CA_FILE), which trust it
-# through the packages' own CA option. The PKCS12 trust store is exported for
+# through the packages' own CA option. The aws-credentials suite is given the
+# two INI files the emulator writes (its credentials file and its config
+# file) and reads the key, the region, the endpoint and the CA out of them. The PKCS12 trust store is exported for
 # other JVM clients; these suites do not use it.
 #
 # Under GitHub Actions these go to $GITHUB_ENV (the secret masked); otherwise
@@ -25,6 +27,8 @@
 #   LYRIC_S3_BUCKET                         lyric-it
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 #   AWS_EMULATOR_CA_FILE                    ca.pem (PEM)
+#   AWS_EMULATOR_CREDENTIALS_FILE           emulator_credentials (INI, [default])
+#   AWS_EMULATOR_CONFIG_FILE                config (INI: region, endpoint_url, ca_bundle)
 #   AWS_EMULATOR_TRUSTSTORE                 truststore.p12 (PKCS12, no password)
 set -euo pipefail
 
@@ -83,6 +87,8 @@ for _ in $(seq 60); do
       "AWS_ACCESS_KEY_ID=$key_id"
       "AWS_SECRET_ACCESS_KEY=$secret"
       "AWS_EMULATOR_CA_FILE=$dir/ca.pem"
+      "AWS_EMULATOR_CREDENTIALS_FILE=$dir/emulator_credentials"
+      "AWS_EMULATOR_CONFIG_FILE=$dir/config"
       "AWS_EMULATOR_TRUSTSTORE=$dir/truststore.p12"
     )
     if [ -n "${GITHUB_ENV:-}" ]; then

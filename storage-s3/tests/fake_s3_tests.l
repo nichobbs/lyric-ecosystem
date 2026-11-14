@@ -19,6 +19,9 @@
 //! `Testing.Conformance.Storage` runs against it end to end, then the
 //! backend-specific behaviour: binary payloads, error mapping, redirects,
 //! presigned GET and PUT fetched with a plain HTTP client, storage classes,
+//! throttling and failures that are retried or not, credentials that are
+//! replaced while a client is in use (the server accepts a second,
+//! temporary key and reports which key signed the last request),
 //! and the same server over HTTPS (`startListenerTls`) with a fixture
 //! certificate from a private CA, for the CA certificate options.
 //!
@@ -43,6 +46,8 @@ import Std.Time as Time
 import Std.Tls as Tls
 import Testing.Conformance
 import Testing.Conformance.Storage as StorageConformance
+import Aws.Credentials
+import Aws.Retry
 import Storage.S3
 import Storage.S3.Extras
 import Storage.S3.SigV4
@@ -55,7 +60,21 @@ val SECRET_KEY: String = "fake/secret+key/for-tests-only"
 
 val REGION: String = "eu-test-1"
 
+// A second, temporary key the server accepts, with its session token.
+val ROTATED_KEY: String = "ASIAROTATEDROTATED00"
+
+val ROTATED_SECRET: String = "rotated/secret+key/for-tests-only"
+
+val ROTATED_TOKEN: String = "fixture-rotated-session-token"
+
 val STOP_PATH: String = "/__stop"
+
+// `GET /__attempts/<bucket>/<key>`: how many requests a misbehaving key or
+// bucket has received.
+val ATTEMPTS_PATH: String = "/__attempts/"
+
+// `GET /__lastkey`: the access key id that signed the last accepted request.
+val LAST_KEY_PATH: String = "/__lastkey"
 
 // Every stored object reports this modification time.
 val LAST_MODIFIED_HTTP: String = "Thu, 12 Nov 2026 10:15:00 GMT"
@@ -77,10 +96,30 @@ ref record FakeS3 {
   // except the few names the handlers treat specially.
   var created: Map[String, Bool]
   var requestCount: Int
+  // Requests received per misbehaving key (`<bucket>/<key>`) or bucket.
+  var attempts: Map[String, Int]
+  var lastKeyId: String
 }
 
 func newFakeS3(): FakeS3 {
-  FakeS3(objects = newMap(), created = newMap(), requestCount = 0)
+  FakeS3(objects = newMap(), created = newMap(), requestCount = 0, attempts = newMap(), lastKeyId = "")
+}
+
+// How many requests a misbehaving name has had.
+func attemptsOn(s3: in FakeS3, name: in String): Int {
+  if s3.attempts.containsKey(name) {
+    val n: Int = s3.attempts[name]
+    n
+  } else {
+    0
+  }
+}
+
+// Counts a request to a misbehaving name and returns how many it has had.
+func countAttempt(s3: in FakeS3, name: in String): Int {
+  val n = attemptsOn(s3, name) + 1
+  s3.attempts[name] = n
+  n
 }
 
 // ─── Request inspection ──────────────────────────────────────────────────────
@@ -217,11 +256,17 @@ func verifyHeaderAuth(ctx: in HttpContext, body: in slice[Byte]): String {
   if amzDate.length != 16 {
     return "AccessDenied"
   }
-  if credential != ACCESS_KEY + "/" + credentialScope(amzDate, REGION, "s3") {
-    if not Str.startsWith(credential, ACCESS_KEY + "/") {
+  val rotated = Str.startsWith(credential, ROTATED_KEY + "/")
+  val keyId = if rotated { ROTATED_KEY } else { ACCESS_KEY }
+  if credential != keyId + "/" + credentialScope(amzDate, REGION, "s3") {
+    if not Str.startsWith(credential, keyId + "/") {
       return "InvalidAccessKeyId"
     }
     return "AuthorizationHeaderMalformed"
+  }
+  // Temporary credentials: the session token must be sent, and signed.
+  if rotated and (headerValue(ctx, "x-amz-security-token") != ROTATED_TOKEN or not Str.contains(";" + authField(authorization, "SignedHeaders") + ";", ";x-amz-security-token;")) {
+    return "InvalidToken"
   }
   val payloadHash = headerValue(ctx, "x-amz-content-sha256")
   if payloadHash != sha256Hex(body) {
@@ -245,7 +290,11 @@ func verifyHeaderAuth(ctx: in HttpContext, body: in slice[Byte]): String {
     queryPairs(requestQuery(ctx)),
     headers,
     payloadHash,
-    fakeCreds(),
+    if rotated {
+      Credentials(accessKeyId = ROTATED_KEY, secretAccessKey = ROTATED_SECRET, sessionToken = ROTATED_TOKEN)
+    } else {
+      fakeCreds()
+    },
     REGION,
     "s3",
     amzDate
@@ -459,6 +508,34 @@ func serveObject(s3: in FakeS3, ctx: in HttpContext, bucket: in String, key: in 
     respondBytesWithHeaders(ctx, 502, "text/html", Enc.encodeUtf8("<html><body>502 Bad Gateway</body></html>"), none)
     return
   }
+  if key == "boom/denied" {
+    val _ = countAttempt(s3, fullKey)
+    respondFault(ctx, 403, "AccessDenied", "Access Denied")
+    return
+  }
+  // Throttled twice, then served.
+  if key == "flaky/slowdown" and countAttempt(s3, fullKey) <= 2 {
+    respondFault(ctx, 503, "SlowDown", "Please reduce your request rate.")
+    return
+  }
+  // Throttled once, with the wait the server wants.
+  if key == "flaky/retry-after" and countAttempt(s3, fullKey) == 1 {
+    val headers: Map[String, String] = newMap()
+    headers.add("Retry-After", "1")
+    val text = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>SlowDown</Code><Message>Please reduce your request rate.</Message></Error>"
+    respondBytesWithHeaders(ctx, 503, "application/xml", Enc.encodeUtf8(text), headers)
+    return
+  }
+  // Fails once inside the server, then served.
+  if key == "flaky/internal-once" and countAttempt(s3, fullKey) == 1 {
+    respondFault(ctx, 500, "InternalError", "We encountered an internal error. Please try again.")
+    return
+  }
+  if key == "flaky/always" {
+    val _ = countAttempt(s3, fullKey)
+    respondFault(ctx, 503, "SlowDown", "Please reduce your request rate.")
+    return
+  }
   if key == "boom/moved" {
     val headers: Map[String, String] = newMap()
     headers.add("Location", "http://127.0.0.1:1/elsewhere")
@@ -528,6 +605,10 @@ func handle(s3: in FakeS3, ctx: in HttpContext): Unit {
     )
     return
   }
+  val authorization = headerValue(ctx, "Authorization")
+  if authorization.length > 0 {
+    s3.lastKeyId = if Str.contains(authorization, "Credential=" + ROTATED_KEY + "/") { ROTATED_KEY } else { ACCESS_KEY }
+  }
   // Path-style: /<bucket>[/<key>].
   val path = urlDecode(requestPath(ctx))
   val rest = path.substring(1)
@@ -544,6 +625,10 @@ func handle(s3: in FakeS3, ctx: in HttpContext): Unit {
     } else if requestMethod(ctx) == "HEAD" {
       val none: Map[String, String] = newMap()
       respondEmpty(ctx, if s3.created.containsKey(bucket) or bucket == "owned-bucket" { 200 } else { 404 }, none)
+    } else if requestMethod(ctx) == "PUT" and bucket == "create-fails-once" and countAttempt(s3, bucket) == 1 {
+      respondFault(ctx, 500, "InternalError", "We encountered an internal error. Please try again.")
+    } else if requestMethod(ctx) == "PUT" and bucket == "create-throttled-once" and countAttempt(s3, bucket) == 1 {
+      respondFault(ctx, 503, "SlowDown", "Please reduce your request rate.")
     } else if requestMethod(ctx) == "PUT" {
       createBucketFake(s3, ctx, bucket, body)
     } else {
@@ -562,6 +647,11 @@ func serveUntilStopped(l: in HttpListener): Unit {
     if requestPath(ctx) == STOP_PATH {
       respondText(ctx, 200, "served " + s3.requestCount.toString())
       running = false
+    } else if Str.startsWith(requestPath(ctx), ATTEMPTS_PATH) {
+      val name = urlDecode(requestPath(ctx)).substring(ATTEMPTS_PATH.length)
+      respondText(ctx, 200, attemptsOn(s3, name).toString())
+    } else if requestPath(ctx) == LAST_KEY_PATH {
+      respondText(ctx, 200, s3.lastKeyId)
     } else {
       // A bug in the fake must surface as a failed request, not as a server
       // thread that died and a test run that waits for it.
@@ -621,6 +711,14 @@ func stopFake(endpoint: in String): String {
   match await defaultClient().get(endpoint + STOP_PATH) {
     case Err(e) -> "stop failed: " + HttpError.message(e)
     case Ok(resp) -> match await HttpResponse.bodyText(resp) { case Ok(text) -> text; case Err(_) -> "stop unreadable" }
+  }
+}
+
+// `S3Client.presign` as text: the URL, or the error code.
+func presigned(client: in S3Client, methodName: in String, key: in String, seconds: in Int, amzDate: in String): String {
+  match client.presign(methodName, key, seconds, amzDate) {
+    case Ok(url) -> url
+    case Err(e) -> e.code + " " + e.message
   }
 }
 
@@ -920,7 +1018,9 @@ test "S3 error documents map to StorageError codes, and a redirect is not follow
   assertEqual(lines[11], "noBucketList=NoSuchBucket", "a missing bucket on list")
   assertEqual(lines[12], "badToken=InvalidArgument", "a continuation token the server does not know")
   assertEqual(lines[13], "stillWorks=ok", "the correctly signed client is unaffected")
-  assertEqual(lines[14], "served 14", "every request reached the server")
+  // The two GETs of boom/internal and the one of boom/gateway are idempotent
+  // and answered 5xx: each is attempted three times.
+  assertEqual(lines[14], "served 20", "every request reached the server, the 5xx answers three times each")
 }
 
 func fetch(url: in String): String {
@@ -970,7 +1070,7 @@ func presignScenario(endpoint: in String): String {
     }
   }
   // A URL signed years ago for one minute has expired.
-  text = text + "\nexpired=" + fetch(client.presign("GET", key, 60, "20200101T000000Z"))
+  text = text + "\nexpired=" + fetch(presigned(client, "GET", key, 60, "20200101T000000Z"))
   // A presigned PUT: upload without credentials, then read it back signed.
   match presignedPutUrl(client, "inbox/upload.txt", 300) {
     case Err(e) -> {
@@ -1045,7 +1145,7 @@ test "addressing: AWS is virtual-hosted, a custom endpoint is path-style" {
     case Ok(c) -> c
     case Err(e) -> panic(e.message)
   }
-  val awsUrl = aws.presign("GET", "a/b c.txt", 60, "20261112T101500Z")
+  val awsUrl = presigned(aws, "GET", "a/b c.txt", 60, "20261112T101500Z")
   assertTrue(
     awsUrl.startsWith("https://my-bucket.s3.eu-west-1.amazonaws.com/a/b%20c.txt?X-Amz-Algorithm=AWS4-HMAC-SHA256&"),
     "virtual-hosted AWS URL: " + awsUrl
@@ -1059,7 +1159,7 @@ test "addressing: AWS is virtual-hosted, a custom endpoint is path-style" {
     case Err(e) -> panic(e.message)
   }
   assertTrue(
-    awsPath.presign("GET", "k", 60, "20261112T101500Z").startsWith(
+    presigned(awsPath, "GET", "k", 60, "20261112T101500Z").startsWith(
       "https://s3.us-east-1.amazonaws.com/my.dotted.bucket/k?"
     ),
     "path-style on AWS, for a bucket name a TLS wildcard cannot cover"
@@ -1069,7 +1169,7 @@ test "addressing: AWS is virtual-hosted, a custom endpoint is path-style" {
     case Err(e) -> panic(e.message)
   }
   assertTrue(
-    minio.presign("PUT", "k", 60, "20261112T101500Z").startsWith("https://minio.example.com:9000/data/k?"),
+    presigned(minio, "PUT", "k", 60, "20261112T101500Z").startsWith("https://minio.example.com:9000/data/k?"),
     "a custom endpoint is path-style, trailing slash dropped"
   )
   val hosted = match openClient(endpointConfig("https://objects.example.com:443", "data", "auto", "id", "secret").withPathStyle(false)) {
@@ -1077,7 +1177,7 @@ test "addressing: AWS is virtual-hosted, a custom endpoint is path-style" {
     case Err(e) -> panic(e.message)
   }
   assertTrue(
-    hosted.presign("GET", "k", 60, "20261112T101500Z").startsWith("https://data.objects.example.com/k?"),
+    presigned(hosted, "GET", "k", 60, "20261112T101500Z").startsWith("https://data.objects.example.com/k?"),
     "virtual-hosted on a custom endpoint, default port dropped so the signed host is the Host header"
   )
   val token = match openClient(awsConfig("my-bucket", "eu-west-1", "ASIAEXAMPLE", "secret").withSessionToken("tok")) {
@@ -1085,7 +1185,7 @@ test "addressing: AWS is virtual-hosted, a custom endpoint is path-style" {
     case Err(e) -> panic(e.message)
   }
   assertTrue(
-    token.presign("GET", "k", 60, "20261112T101500Z").contains("&X-Amz-Security-Token=tok&"),
+    presigned(token, "GET", "k", 60, "20261112T101500Z").contains("&X-Amz-Security-Token=tok&"),
     "temporary credentials put the session token in a presigned URL"
   )
 }
@@ -1370,4 +1470,440 @@ test "withCaCertificateFile reads a PEM file, and a missing or empty one is INVA
     "INVALID_CONFIG the path of the CA certificate is empty",
     "an empty path"
   )
+}
+
+// ─── Retries ─────────────────────────────────────────────────────────────────
+// The standard policy with its waits recorded instead of slept, and the
+// random source at the top of its range: the waits are 100 ms, then 200 ms.
+func recordingRetry(sleeps: in List[Int]): RetryPolicy {
+  standardRetry().withSleep({ ms: Int -> sleeps.add(ms) }).withRandom({ -> 1.0 })
+}
+
+func control(endpoint: in String, path: in String): String {
+  match await defaultClient().get(endpoint + path) {
+    case Err(e) -> "failed: " + HttpError.message(e)
+    case Ok(resp) -> match await HttpResponse.bodyText(resp) { case Ok(text) -> text; case Err(_) -> "unreadable" }
+  }
+}
+
+func attemptsOf(endpoint: in String, name: in String): String {
+  control(endpoint, ATTEMPTS_PATH + name)
+}
+
+func sleepsText(sleeps: in List[Int]): String {
+  val acc: List[String] = newList()
+  for ms in sleeps {
+    acc.add(ms.toString())
+  }
+  Str.joinList(",", acc)
+}
+
+func retryScenario(endpoint: in String): String {
+  val acc: List[String] = newList()
+  val sleeps: List[Int] = newList()
+  val noMeta: Map[String, String] = newMap()
+  val cfg = configFor(endpoint, "retries").withRetry(recordingRetry(sleeps))
+  val client = match openClient(cfg) { case Ok(c) -> c; case Err(e) -> panic(e.message) }
+  val bucket = bucketOf(client)
+  // Throttled twice, then stored: the caller sees success.
+  acc.add(
+    "slowdown=" +
+      (match bucket.put("flaky/slowdown", "aGk=", "text/plain", noMeta) { case Ok(_) -> "ok"; case Err(e) -> e.code }) +
+      " attempts=" +
+      attemptsOf(endpoint, "retries/flaky/slowdown") +
+      " waits=" +
+      sleepsText(sleeps)
+  )
+  acc.add("stored=" + (match bucket.get("flaky/slowdown") { case Ok(o) -> o.dataBase64; case Err(e) -> e.code }))
+  sleeps.clear()
+  // The server names the wait: it replaces a shorter backoff.
+  acc.add(
+    "retryAfter=" + getCode(bucket, "flaky/retry-after") + " attempts=" +
+      attemptsOf(endpoint, "retries/flaky/retry-after") +
+      " waits=" +
+      sleepsText(sleeps)
+  )
+  sleeps.clear()
+  // A 500 on an idempotent request is retried.
+  acc.add(
+    "internalOnce=" + getCode(bucket, "flaky/internal-once") + " attempts=" +
+      attemptsOf(endpoint, "retries/flaky/internal-once") +
+      " waits=" +
+      sleepsText(sleeps)
+  )
+  sleeps.clear()
+  // Throttled every time: three attempts, then the error.
+  acc.add(
+    "always=" + getCode(bucket, "flaky/always") + " attempts=" + attemptsOf(endpoint, "retries/flaky/always") +
+      " waits=" +
+      sleepsText(sleeps)
+  )
+  sleeps.clear()
+  // An error that would be the same next time is not retried.
+  acc.add(
+    "denied=" + getCode(bucket, "boom/denied") + " attempts=" + attemptsOf(endpoint, "retries/boom/denied") + " waits=" +
+      sleepsText(sleeps)
+  )
+  acc.add("missing=" + getCode(bucket, "no/such/key") + " waits=" + sleepsText(sleeps))
+  // Retries switched off: one attempt.
+  val once = match connect(configFor(endpoint, "once").withoutRetries()) {
+    case Ok(b) -> b
+    case Err(e) -> panic(e.message)
+  }
+  acc.add("withoutRetries=" + getCode(once, "flaky/always") + " attempts=" + attemptsOf(endpoint, "once/flaky/always"))
+  // More attempts than the default.
+  val five = match connect(configFor(endpoint, "five").withRetry(recordingRetry(sleeps).withMaxAttempts(5))) {
+    case Ok(b) -> b
+    case Err(e) -> panic(e.message)
+  }
+  acc.add(
+    "five=" + getCode(five, "flaky/always") + " attempts=" + attemptsOf(endpoint, "five/flaky/always") + " waits=" +
+      sleepsText(sleeps)
+  )
+  sleeps.clear()
+  // CreateBucket is not idempotent: a 500 leaves its outcome unknown and is
+  // returned; throttling means it was not carried out and is retried.
+  val failing = match openClient(configFor(endpoint, "create-fails-once").withRetry(recordingRetry(sleeps))) {
+    case Ok(c) -> c
+    case Err(e) -> panic(e.message)
+  }
+  acc.add(
+    "createAfter500=" + boolCode(createBucket(failing)) + " attempts=" + attemptsOf(endpoint, "create-fails-once") +
+      " waits=" +
+      sleepsText(sleeps)
+  )
+  val throttled = match openClient(configFor(endpoint, "create-throttled-once").withRetry(recordingRetry(sleeps))) {
+    case Ok(c) -> c
+    case Err(e) -> panic(e.message)
+  }
+  acc.add(
+    "createThrottled=" + boolCode(createBucket(throttled)) + " attempts=" +
+      attemptsOf(endpoint, "create-throttled-once") +
+      " waits=" +
+      sleepsText(sleeps)
+  )
+  acc.add(stopFake(endpoint))
+  Str.joinList("\n", acc)
+}
+
+test "throttling and server errors are retried with backoff; other errors and unrepeatable requests are not" {
+  val lines = Str.split(withFakeS3(19531, retryScenario), "\n")
+  assertEqualInt(lines.length, 12, "twelve lines: " + Str.join(" | ", lines))
+  assertEqual(
+    lines[0],
+    "slowdown=ok attempts=3 waits=100,200",
+    "SlowDown twice, then success: three attempts, two waits"
+  )
+  assertEqual(lines[1], "stored=aGk=", "the object the third attempt stored")
+  assertEqual(lines[2], "retryAfter=NOT_FOUND attempts=2 waits=1000", "Retry-After: 1 is a wait of 1000 ms, not 100")
+  assertEqual(
+    lines[3],
+    "internalOnce=NOT_FOUND attempts=2 waits=100",
+    "a 500 on GET is retried, and the second answer is the result"
+  )
+  assertEqual(lines[4], "always=SlowDown attempts=3 waits=100,200", "three attempts, then the last error")
+  assertEqual(lines[5], "denied=AccessDenied attempts=1 waits=", "AccessDenied is not retried")
+  assertEqual(lines[6], "missing=NOT_FOUND waits=", "nor is a missing key")
+  assertEqual(lines[7], "withoutRetries=SlowDown attempts=1", "withoutRetries sends once")
+  assertEqual(lines[8], "five=SlowDown attempts=5 waits=100,200,400,800", "withMaxAttempts(5), the waits doubling")
+  assertEqual(lines[9], "createAfter500=InternalError attempts=1 waits=", "CreateBucket is not repeated after a 500")
+  assertEqual(lines[10], "createThrottled=true attempts=2 waits=100", "but it is after throttling")
+  assertTrue(lines[11].startsWith("served "), "the fake server stopped cleanly: " + lines[11])
+}
+
+test "a connection that cannot be opened is retried for every request, since nothing was sent" {
+  val sleeps: List[Int] = newList()
+  val cfg = endpointConfig("http://127.0.0.1:1", "data", "us-east-1", "id", "secret").withRetry(recordingRetry(sleeps))
+  val client = match openClient(cfg) { case Ok(c) -> c; case Err(e) -> panic(e.message) }
+  assertEqual(getCode(bucketOf(client), "k"), "CONNECTION_FAILED", "get")
+  assertEqual(sleepsText(sleeps), "100,200", "an idempotent request: three attempts")
+  sleeps.clear()
+  assertEqual(boolCode(createBucket(client)), "CONNECTION_FAILED", "createBucket")
+  assertEqual(sleepsText(sleeps), "100,200", "an unrepeatable request too: the connection was refused")
+}
+
+// ─── Credential providers ────────────────────────────────────────────────────
+ref record Clock {
+  var nowMs: Long
+}
+
+// A provider that hands out the long-term test key until `switchAtMs`, with
+// an expiry, and the rotated temporary key after it.
+ref record Rotating {
+  clock: Clock
+  switchAtMs: Long
+  var calls: Int
+  var broken: Bool
+}
+
+impl CredentialProvider for Rotating {
+  func resolve(): Result[ResolvedCredentials, CredentialError] {
+    self.calls = self.calls + 1
+    if self.broken {
+      return Err(
+        CredentialError(code = "REQUEST_FAILED", provider = "rotating", message = "the credential service is down")
+      )
+    }
+    if self.clock.nowMs < self.switchAtMs {
+      Ok(
+        ResolvedCredentials(
+          credentials = fakeCreds(),
+          expiresAtEpochMs = Some(value = self.switchAtMs + 300000i64),
+          source = "rotating"
+        )
+      )
+    } else {
+      Ok(
+        ResolvedCredentials(
+          credentials = Credentials(
+            accessKeyId = ROTATED_KEY,
+            secretAccessKey = ROTATED_SECRET,
+            sessionToken = ROTATED_TOKEN
+          ),
+          expiresAtEpochMs = Some(value = self.switchAtMs + 7200000i64),
+          source = "rotating"
+        )
+      )
+    }
+  }
+}
+
+func rotationScenario(endpoint: in String): String {
+  val acc: List[String] = newList()
+  val noMeta: Map[String, String] = newMap()
+  val t0 = 1800000000000i64
+  val clock = Clock(nowMs = t0)
+  // The first credentials expire five minutes after `switchAtMs`; the cache
+  // refreshes five minutes before expiry, which is at `switchAtMs`.
+  val inner = Rotating(clock = clock, switchAtMs = t0 + 3600000i64, calls = 0, broken = false)
+  val cache = cachedWith(
+    inner,
+    CacheOptions(refreshWindowMs = 300000i64, retryAfterFailureMs = 30000i64, nowMs = { -> clock.nowMs })
+  )
+  // Empty static keys: the provider is the only source.
+  val cfg = endpointConfig(endpoint, "rotation", REGION, "", "").withCredentialProvider(cache.asProvider()).withRequestTimeout(
+    10000
+  )
+  val client = match openClient(cfg) { case Ok(c) -> c; case Err(e) -> panic(e.code + " " + e.message) }
+  val bucket = bucketOf(client)
+  acc.add("put=" + (match bucket.put("a", "aGk=", "text/plain", noMeta) { case Ok(_) -> "ok"; case Err(e) -> e.code }))
+  acc.add("signedBy=" + control(endpoint, LAST_KEY_PATH) + " calls=" + inner.calls.toString())
+  clock.nowMs = t0 + 3599999i64
+  acc.add("get=" + (match bucket.get("a") { case Ok(o) -> o.dataBase64; case Err(e) -> e.code }))
+  acc.add("signedBy=" + control(endpoint, LAST_KEY_PATH) + " calls=" + inner.calls.toString())
+  // The clock reaches the refresh window: the next request is signed with
+  // the new key and its session token, which the server verifies.
+  clock.nowMs = t0 + 3600000i64
+  acc.add("get=" + (match bucket.get("a") { case Ok(o) -> o.dataBase64; case Err(e) -> e.code + " " + e.message }))
+  acc.add("signedBy=" + control(endpoint, LAST_KEY_PATH) + " calls=" + inner.calls.toString())
+  acc.add(
+    "presigned=" +
+      (
+        if presigned(client, "GET", "a", 60, "20261112T101500Z").contains("X-Amz-Credential=" + ROTATED_KEY + "%2F") and presigned(client, "GET", "a", 60, "20261112T101500Z").contains("&X-Amz-Security-Token=" + ROTATED_TOKEN + "&") {
+          "rotated key and token"
+        } else {
+          "other"
+        }
+      )
+  )
+  // A provider with nothing to give: the operation fails without a request.
+  inner.broken = true
+  cache.invalidate()
+  acc.add("noCredentials=" + (match bucket.get("a") { case Ok(_) -> "ok"; case Err(e) -> e.code + ": " + e.message }))
+  acc.add("presignNoCredentials=" + codeOf(bucket.presignedUrl("a", 60)))
+  acc.add(stopFake(endpoint))
+  Str.joinList("\n", acc)
+}
+
+test "credentials from a provider are refreshed mid-run, and the next request is signed with the new ones" {
+  val lines = Str.split(withFakeS3(19532, rotationScenario), "\n")
+  assertEqualInt(lines.length, 10, "ten lines: " + Str.join(" | ", lines))
+  assertEqual(lines[0], "put=ok", "the first credentials work")
+  assertEqual(lines[1], "signedBy=" + ACCESS_KEY + " calls=1", "signed with the first key; the provider asked once")
+  assertEqual(lines[2], "get=aGk=", "still valid a millisecond before the refresh window")
+  assertEqual(lines[3], "signedBy=" + ACCESS_KEY + " calls=1", "and the provider was not asked again")
+  assertEqual(lines[4], "get=aGk=", "the request after the refresh succeeds")
+  assertEqual(lines[5], "signedBy=" + ROTATED_KEY + " calls=2", "signed with the new key; one refresh")
+  assertEqual(lines[6], "presigned=rotated key and token", "presigned URLs use the current credentials")
+  assertEqual(
+    lines[7],
+    "noCredentials=CREDENTIALS_UNAVAILABLE: no AWS credentials: rotating: the credential service is down",
+    "no credentials is an error of the operation"
+  )
+  assertEqual(lines[8], "presignNoCredentials=CREDENTIALS_UNAVAILABLE", "and of presigning")
+  // put, get, get (control requests are not counted): the get without
+  // credentials sent nothing.
+  assertEqual(lines[9], "served 3", "the operation without credentials sent no request")
+}
+
+// ─── Configuration from the environment and the shared files ────────────────
+func envConfigText(lookup: in (String) -> String): String {
+  match configFromEnvironment("data", lookup) {
+    case Err(e) -> e.code + ": " + e.message
+    case Ok(cfg) -> "key=" + cfg.accessKeyId + " secret=" + (if cfg.secretAccessKey.length > 0 { "set" } else { "" }) +
+      " token=" +
+      cfg.sessionToken +
+      " provider=" +
+      (if isSome(cfg.credentialProvider) { "yes" } else { "no" }) +
+      " region=" +
+      cfg.region +
+      " endpoint=" +
+      cfg.endpoint +
+      " pathStyle=" +
+      cfg.pathStyle.toString() +
+      " ca=" +
+      cfg.additionalCaCertificatePem.length.toString()
+  }
+}
+
+func writeFile(path: in String, text: in String): Unit {
+  match File.writeText(path, text) {
+    case Ok(_) -> ()
+    case Err(_) -> panic("cannot write " + path)
+  }
+}
+
+func scratchDir(label: in String): String {
+  val dir = Env.getVarOrDefault("TMPDIR", "/tmp") + "/lyric-s3-" + label + "-" + Time.nowEpochMillis().toString()
+  match File.createDir(dir) {
+    case Ok(_) -> dir
+    case Err(_) -> panic("cannot create " + dir)
+  }
+}
+
+// An environment in which no provider of the default chain has anything,
+// and none looks outside `dir`.
+func isolated(dir: in String): Map[String, String] {
+  val values: Map[String, String] = newMap()
+  values["AWS_CONFIG_FILE"] = dir + "/config"
+  values["AWS_SHARED_CREDENTIALS_FILE"] = dir + "/credentials"
+  values["AWS_EC2_METADATA_DISABLED"] = "true"
+  values
+}
+
+test "configFromEnvironment: environment credentials stay static fields, as before" {
+  val dir = scratchDir("env")
+  val values = isolated(dir)
+  val lookup = environmentOf(values)
+  assertEqual(
+    envConfigText(lookup),
+    "INVALID_CONFIG: no AWS credentials: chain: no provider has credentials: environment: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are not set; web-identity: AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN are not set; profile: there is no profile 'default' in " +
+      dir +
+      "/config or " +
+      dir +
+      "/credentials; container: neither AWS_CONTAINER_CREDENTIALS_RELATIVE_URI nor AWS_CONTAINER_CREDENTIALS_FULL_URI is set; imds: AWS_EC2_METADATA_DISABLED is true",
+    "nothing anywhere: every provider's reason"
+  )
+  values["AWS_ACCESS_KEY_ID"] = "AKIDEXAMPLE"
+  assertEqual(
+    envConfigText(lookup),
+    "INVALID_CONFIG: no AWS credentials: environment: AWS_ACCESS_KEY_ID is set but AWS_SECRET_ACCESS_KEY is not",
+    "half a key pair"
+  )
+  values["AWS_SECRET_ACCESS_KEY"] = SECRET_KEY
+  assertEqual(
+    envConfigText(lookup),
+    "INVALID_CONFIG: no AWS region: neither AWS_REGION nor AWS_DEFAULT_REGION is set, and the profile has no region",
+    "no region"
+  )
+  values["AWS_DEFAULT_REGION"] = "eu-west-2"
+  assertEqual(
+    envConfigText(lookup),
+    "key=AKIDEXAMPLE secret=set token= provider=no region=eu-west-2 endpoint= pathStyle=false ca=0",
+    "keys and region from the environment: a static configuration"
+  )
+  values["AWS_SESSION_TOKEN"] = "tok"
+  values["AWS_REGION"] = "eu-west-3"
+  values["AWS_ENDPOINT_URL"] = "http://127.0.0.1:4566"
+  assertEqual(
+    envConfigText(lookup),
+    "key=AKIDEXAMPLE secret=set token=tok provider=no region=eu-west-3 endpoint=http://127.0.0.1:4566 pathStyle=true ca=0",
+    "token, AWS_REGION, AWS_ENDPOINT_URL"
+  )
+  values["AWS_ENDPOINT_URL_S3"] = "http://127.0.0.1:9000"
+  assertTrue(envConfigText(lookup).contains(" endpoint=http://127.0.0.1:9000 "), "AWS_ENDPOINT_URL_S3 wins")
+  val _ = File.deleteDirRecursive(dir)
+}
+
+test "configFromEnvironment: a profile gives a credential provider, region, endpoint and CA" {
+  val dir = scratchDir("profile")
+  val values = isolated(dir)
+  val lookup = environmentOf(values)
+  writeFile(
+    dir + "/credentials",
+    "[default]\naws_access_key_id = " + ACCESS_KEY + "\naws_secret_access_key = " + SECRET_KEY + "\n"
+  )
+  writeFile(
+    dir + "/config",
+    "[default]\nregion = " + REGION + "\nendpoint_url = https://127.0.0.1:9297\nca_bundle = " + dir +
+      "/ca.pem\ns3 =\n  signature_version = s3v4\n"
+  )
+  assertEqual(
+    envConfigText(lookup),
+    "INVALID_CONFIG: cannot read the CA certificate: " + dir + "/ca.pem",
+    "a ca_bundle that is not there"
+  )
+  writeFile(dir + "/ca.pem", FIXTURE_CA_PEM)
+  assertEqual(
+    envConfigText(lookup),
+    "key= secret= token= provider=yes region=" + REGION + " endpoint=https://127.0.0.1:9297 pathStyle=true ca=" +
+      FIXTURE_CA_PEM.length.toString(),
+    "everything from the two files; the keys are not copied into the configuration"
+  )
+  values["AWS_CA_BUNDLE"] = dir + "/missing.pem"
+  assertEqual(
+    envConfigText(lookup),
+    "INVALID_CONFIG: cannot read the CA certificate: " + dir + "/missing.pem",
+    "AWS_CA_BUNDLE wins over the profile"
+  )
+  writeFile(dir + "/config", "[default]\nsso_session = corp\nregion = " + REGION + "\n")
+  writeFile(dir + "/credentials", "")
+  assertEqual(
+    envConfigText(lookup),
+    "INVALID_CONFIG: no AWS credentials: profile: the profile 'default' sets sso_session: IAM Identity Center (SSO) and console login sessions are not supported",
+    "a profile this package cannot use is named, not skipped"
+  )
+  val _ = File.deleteDirRecursive(dir)
+}
+
+func sharedFilesScenario(endpoint: in String): String {
+  val dir = scratchDir("shared")
+  val values = isolated(dir)
+  writeFile(
+    dir + "/credentials",
+    "[ci]\naws_access_key_id = " + ACCESS_KEY + "\naws_secret_access_key = " + SECRET_KEY + "\n"
+  )
+  writeFile(dir + "/config", "[profile ci]\nregion = " + REGION + "\nendpoint_url = " + endpoint + "\n")
+  values["AWS_PROFILE"] = "ci"
+  val noMeta: Map[String, String] = newMap()
+  var text = match configFromEnvironment("shared-files", environmentOf(values)) {
+    case Err(e) -> "config=" + e.code + " " + e.message
+    case Ok(cfg) -> match connect(cfg) {
+      case Err(e) -> "connect=" + e.code + " " + e.message
+      case Ok(bucket) -> "put=" +
+        (
+          match bucket.put("k", "aGk=", "text/plain", noMeta) {
+            case Ok(_) -> "ok"
+            case Err(e) -> e.code + " " + e.message
+          }
+        ) +
+        "\nget=" +
+        (
+          match bucket.get("k") {
+            case Ok(o) -> o.dataBase64
+            case Err(e) -> e.code
+          }
+        )
+    }
+  }
+  val _ = File.deleteDirRecursive(dir)
+  text + "\n" + stopFake(endpoint)
+}
+
+test "a bucket configured from a profile of the shared files signs requests the server accepts" {
+  val lines = Str.split(withFakeS3(19533, sharedFilesScenario), "\n")
+  assertEqualInt(lines.length, 3, "three lines: " + Str.join(" | ", lines))
+  assertEqual(lines[0], "put=ok", "signed with the profile's keys")
+  assertEqual(lines[1], "get=aGk=", "and read back")
+  assertEqual(lines[2], "served 2", "both requests reached the server")
 }

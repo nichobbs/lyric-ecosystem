@@ -8,6 +8,8 @@ import Std.Testing
 import Mq
 import Mq.Sqs as Sqs
 import Mq.Sqs.Extras as SqsExtras
+import Aws.Credentials.Chain
+import Aws.Retry
 
 func handle(m: in Mq.Message): Result[Unit, String] {
   println(m.id + ": " + m.body)
@@ -57,7 +59,22 @@ func privateCa(queueUrl: in String, keyId: in String, secret: in String): Result
   Ok(queue)
 }
 
+func withDefaultChain(queueUrl: in String): Result[Sqs.SqsQueue, String] {
+  val cfg = Sqs.awsConfig(queueUrl, "", "").withCredentialProvider(defaultProvider()).withRetry(
+    standardRetry().withMaxAttempts(5)
+  )
+  Sqs.connectWith(cfg)
+}
+
+func sentOnce(queueUrl: in String, keyId: in String, secret: in String): Result[Sqs.SqsQueue, String] {
+  Sqs.connectWith(Sqs.awsConfig(queueUrl, keyId, secret).withoutRetries())
+}
+
 test "the README examples compile and fail cleanly without a server" {
+  // Opening a queue asks the provider for nothing and makes no request.
+  val aws = "https://sqs.eu-west-1.amazonaws.com/123456789012/orders"
+  assertTrue(isOk(withDefaultChain(aws)), "a queue with the default chain")
+  assertTrue(isOk(sentOnce(aws, "x", "x")), "a queue without retries")
   val cfg = Sqs.endpointConfig("http://127.0.0.1:1", "http://127.0.0.1:1/000000000000/orders", "elasticmq", "x", "x").withRequestTimeout(
     2000
   )

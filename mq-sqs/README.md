@@ -14,7 +14,7 @@ both interfaces.
 | Stability | `experimental` (0.1.0) |
 | Service | Amazon SQS, standard and FIFO queues, and SQS-compatible servers that speak the JSON protocol (ElasticMQ 1.6.11 is what CI runs) |
 | Protocol | AWS JSON 1.0 (`X-Amz-Target: AmazonSQS.<Action>`, `Content-Type: application/x-amz-json-1.0`), AWS Signature Version 4, service `sqs` |
-| Dependencies | `Lyric.Aws.SigV4` (`aws-sigv4/` in this repository), a `{ workspace = true }` dependency. No SDK, `[nuget]` and `[maven]` are empty |
+| Dependencies | `Lyric.Aws.SigV4` (`aws-sigv4/`, the signing) and `Lyric.Aws.Credentials` (`aws-credentials/`, credential providers and the retry policy), `{ workspace = true }` dependencies. No SDK, `[nuget]` and `[maven]` are empty |
 
 ## Usage
 
@@ -58,8 +58,28 @@ func example(queueUrl: in String): Result[Unit, String] {
 ```
 
 `example("https://sqs.eu-west-1.amazonaws.com/123456789012/orders")` takes the credentials from
-`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`, the endpoint and the region from the queue URL,
-publishes, waits up to five seconds for a message, deletes it and closes.
+the AWS default chain (`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` first; see "Configuration"),
+the endpoint and the region from the queue URL, publishes, waits up to five seconds for a message,
+deletes it and closes.
+
+A credential provider and a retry policy of your own (`Aws.Credentials`, `Aws.Retry`, from
+`aws-credentials/`):
+
+```lyric
+import Aws.Credentials.Chain
+import Aws.Retry
+
+func withDefaultChain(queueUrl: in String): Result[Sqs.SqsQueue, String] {
+  val cfg = Sqs.awsConfig(queueUrl, "", "")
+    .withCredentialProvider(defaultProvider())
+    .withRetry(standardRetry().withMaxAttempts(5))
+  Sqs.connectWith(cfg)
+}
+
+func sentOnce(queueUrl: in String, keyId: in String, secret: in String): Result[Sqs.SqsQueue, String] {
+  Sqs.connectWith(Sqs.awsConfig(queueUrl, keyId, secret).withoutRetries())
+}
+```
 
 Creating a FIFO queue with a dead-letter queue, and publishing to a message group:
 
@@ -141,7 +161,8 @@ requests are not either. What is lost compared with a transactional broker, exac
 - An entry SQS lists neither as successful nor as failed is reported as `not acknowledged`.
 - When a request gets no response (a timeout, a dropped connection), the text says that it is not
   known whether SQS accepted its messages.
-- Nothing is rolled back and nothing is retried. Messages accepted before the failure are in the
+- Nothing is rolled back, and `publishBatch` itself repeats nothing (a single request may be sent
+  again by the retry policy; see "Surprises"). Messages accepted before the failure are in the
   queue and will be delivered. A caller that publishes the batch again must expect those twice on a
   standard queue; on a FIFO queue with `Deduplication.ById` (the default) SQS drops the repeats for
   five minutes.
@@ -193,16 +214,20 @@ prefetch window delivers the next message before the previous one is acknowledge
 
 `SqsConfig` (`awsConfig(queueUrl, accessKeyId, secretAccessKey)`,
 `endpointConfig(endpoint, queueUrl, region, accessKeyId, secretAccessKey)`, `configFromEnv(queueUrl)`,
-then `.copy(...)` or the `with...` functions):
+`configFromEnvironment(queueUrl, lookup)` (the same, reading variables through a lookup such as
+`Aws.Credentials.environmentOf(map)` instead of the process environment), then `.copy(...)` or the
+`with...` functions):
 
 | Field | Default | Meaning |
 |---|---|---|
 | `queueUrl` | required by `connectWith` | the full queue URL. May be empty for `openClient` (queue management only) |
 | `region` | from the queue URL or the endpoint | required when neither is an AWS host name (`sqs.<region>.amazonaws.com`) |
-| `accessKeyId`, `secretAccessKey` | required | |
+| `accessKeyId`, `secretAccessKey` | required unless `credentialProvider` is set | ignored when there is a credential provider |
+| `credentialProvider` | `None` | an `Aws.Credentials.CredentialProvider` asked for the credentials of every attempt, instead of the access key fields (`withCredentialProvider`). Wrap a provider that calls a service or reads a file in `Aws.Credentials.cached` |
+| `retry` | `Aws.Retry.standardRetry()`: 3 attempts, waits of up to 100 ms and 200 ms | when a failed request is sent again (`withRetry(policy)`, `withoutRetries()`); `maxAttempts` must be at least 1 |
 | `sessionToken` | `""` | temporary credentials (`withSessionToken`) |
 | `endpoint` | the queue URL's scheme and host | the base URL requests are sent to, for an SQS-compatible server, a VPC endpoint, or a queue URL whose host is not reachable as written |
-| `requestTimeoutMs` | 30000 | deadline of one request, not counting the seconds a long poll waits (`withRequestTimeout`) |
+| `requestTimeoutMs` | 30000 | deadline of one attempt, not counting the seconds a long poll waits (`withRequestTimeout`) |
 | `ackMode` | `Mq.AckMode.Manual` | `Auto`: `consume` deletes on `Ok` and requeues on `Err`; `ack` and `nack` do nothing (`withAckMode`) |
 | `visibilityTimeoutSeconds` | 30 | 1 to 43200; sent with every receive (`withVisibilityTimeout`) |
 | `receiveBatchSize` | 1 | 1 to 10 messages per `ReceiveMessage` (`withReceiveBatch`) |
@@ -214,7 +239,7 @@ then `.copy(...)` or the `with...` functions):
 | `caCertificatePem` | `""` | the only certificate authority the server certificate may chain to; the system trust store is not consulted, and it wins over `additionalCaCertificatePem` (`withExclusiveCaCertificate(pem)`, `withExclusiveCaCertificateFile(path)`) |
 
 `connectWith` and `openClient` make no request; they return `Err` (`INVALID_CONFIG` for
-`openClient`) for empty credentials, a malformed queue URL or endpoint, a missing or malformed
+`openClient`) for empty credentials when there is no credential provider, a malformed queue URL or endpoint, a missing or malformed
 region, a non-positive timeout, a visibility timeout outside 1 to 43200, a receive batch outside 1
 to 10, a non-positive `maxBatchBytes`, a malformed dead-letter queue URL, a CA certificate that is
 not a PEM certificate, and, for a FIFO queue, a message group id SQS would refuse.
@@ -245,10 +270,14 @@ Environment variables:
 
 | Variable | Read by | Meaning |
 |---|---|---|
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | `configFromEnv`, `connectFromEnv` | required |
-| `AWS_SESSION_TOKEN` | same | optional |
-| `AWS_REGION`, else `AWS_DEFAULT_REGION` | same | optional when the queue URL carries the region |
-| `AWS_ENDPOINT_URL_SQS`, else `AWS_ENDPOINT_URL` | same | optional endpoint override |
+| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN` | `configFromEnv`, `connectFromEnv` | the first source of credentials |
+| `AWS_WEB_IDENTITY_TOKEN_FILE`, `AWS_ROLE_ARN`, `AWS_ROLE_SESSION_NAME` | same | the second: STS `AssumeRoleWithWebIdentity` |
+| `AWS_PROFILE`, `AWS_CONFIG_FILE`, `AWS_SHARED_CREDENTIALS_FILE` | same | the third: a profile of the shared files (`default`, `~/.aws/config`, `~/.aws/credentials`), static keys or `credential_process`; the profile also supplies `region`, `endpoint_url` and `ca_bundle` |
+| `AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, `AWS_CONTAINER_CREDENTIALS_FULL_URI`, `AWS_CONTAINER_AUTHORIZATION_TOKEN`, `AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE` | same | the fourth: the ECS / EKS Pod Identity endpoint |
+| `AWS_EC2_METADATA_DISABLED`, `AWS_EC2_METADATA_SERVICE_ENDPOINT` | same | the fifth: the EC2 instance metadata service (IMDSv2); `true` skips it |
+| `AWS_REGION`, else `AWS_DEFAULT_REGION`, else the profile's `region` | same | optional when the queue URL carries the region |
+| `AWS_ENDPOINT_URL_SQS`, else `AWS_ENDPOINT_URL`, else the profile's `endpoint_url` | same | optional endpoint override; none of them when `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true` |
+| `AWS_CA_BUNDLE`, else the profile's `ca_bundle` | same | optional: a PEM file with a certificate authority, as `withCaCertificateFile` |
 | `LYRIC_CONFIG_MQ_SQS_QUEUEURL` | `connectFromEnv` | the queue URL (required) |
 | `LYRIC_CONFIG_MQ_SQS_ACKMODE` | `connectFromEnv` | `Manual` (default) or `Auto` |
 | `LYRIC_CONFIG_MQ_SQS_VISIBILITYTIMEOUT` | `connectFromEnv` | seconds, default 30 |
@@ -258,6 +287,23 @@ Environment variables:
 | `LYRIC_CONFIG_MQ_SQS_CACERTIFICATEFILE` | `connectFromEnv` | a PEM file with a certificate authority to trust in addition to the system trust store (`withCaCertificateFile`), default none |
 | `LYRIC_SQS_ENDPOINT`, `LYRIC_SQS_REGION` | the integration suite only | where the test server is |
 | `LYRIC_SQS_CA_FILE` | the integration suite only | optional: a PEM file with a certificate authority, passed to `withCaCertificateFile` |
+
+Credentials come from the AWS default chain of `Aws.Credentials` (`aws-credentials/README.md`
+describes every provider). `configFromEnv` asks the chain once, so missing credentials are
+`INVALID_CONFIG` there, with the reason of every provider. Credentials from the environment
+variables become the static fields of the `SqsConfig`, exactly as before this package had
+providers; credentials from any other source are not copied into the configuration, which carries
+the cached chain as its `credentialProvider`, so temporary credentials are refreshed five minutes
+before they expire.
+
+**Changed from earlier versions of this package**, which read the three credential variables and
+the region and endpoint variables only: (1) when the credential variables are unset, the shared
+files, the container endpoint and the instance metadata service are now consulted, where
+`configFromEnv` used to fail at once; off EC2 that costs up to a second for the metadata service
+unless `AWS_EC2_METADATA_DISABLED=true`; (2) the error text for missing credentials is the chain's,
+not `AWS_ACCESS_KEY_ID is not set`; (3) the region, the endpoint and a CA bundle are also taken
+from the profile, and `AWS_CA_BUNDLE` is honoured; (4) only one of the two credential variables set
+is `INVALID_CONFIG` naming both, and the chain does not go on to another source.
 
 `Mq`'s own `LYRIC_CONFIG_MQ_CONNECTION_*` variables are for `Mq.connect()` and are not read. A
 variable set to the empty string counts as unset. Credentials are never read from a file and never
@@ -379,8 +425,38 @@ Waiting and failures:
 - **A CA certificate is for the endpoint and for every queue URL the client is used with**: there is
   one HTTP client per `SqsClient`. On an `http://` (loopback) endpoint the option is validated and
   then has nothing to verify.
-- **Nothing is retried.** Throttling (`RequestThrottled`, `ThrottlingException`), 5xx responses and
-  transport errors are returned as they are.
+- **A failed request is sent again only when that cannot do harm**, up to three attempts, each
+  signed again with the current date and credentials, after a wait of up to 100 ms, then up to
+  200 ms (full jitter, doubling, 20 s at most; `Retry-After` / `x-amz-retry-after` when longer).
+  `withRetry` changes the policy; `withoutRetries()` sends everything once. What is retried:
+
+  | Failure | `SendMessage`, `SendMessageBatch` to a standard queue | the same to a FIFO queue | `ReceiveMessage` | `DeleteMessage`, `ChangeMessageVisibility` (and `...Batch`), `CreateQueue`, `GetQueueUrl`, `GetQueueAttributes`, `SetQueueAttributes` | `PurgeQueue`, `DeleteQueue` |
+  |---|---|---|---|---|---|
+  | Throttling (`RequestThrottled`, `ThrottlingException`, `Throttling`, HTTP 429, 503): SQS did not take the request | retried | retried | retried | retried | retried |
+  | The connection could not be opened (refused, host not found): nothing was sent | retried | retried | retried | retried | retried |
+  | HTTP 500, 502, 504, a connection cut after it was opened, `TIMEOUT`: the outcome is unknown | **not retried** | retried | **not retried** | retried | **not retried** |
+  | Anything else (`QueueDoesNotExist`, `AccessDenied`, an invalid signature) | not retried | not retried | not retried | not retried | not retried |
+
+  A send to a standard queue whose outcome is unknown is not repeated, because SQS would hold the
+  message twice; the error says so and the caller decides. A send to a FIFO queue is repeated:
+  the retry carries the same `MessageDeduplicationId` (or, with `Deduplication.ContentBased`, the
+  same body), and SQS accepts it without storing the message again, for five minutes. A receive is
+  not repeated: the messages of a lost answer are in flight and stay hidden until their visibility
+  timeout, and a second receive would not return them. A repeated `ChangeMessageVisibility` or
+  `DeleteMessage` can fail with `ReceiptHandleIsInvalid` or `MessageNotInflight` although the first
+  one worked; it changes nothing. `PurgeQueue` and `DeleteQueue` are not repeated because the repeat
+  fails (`PurgeQueueInProgress`, `QueueDoesNotExist`) although the first succeeded.
+  `SqsClient.call` applies this table through `isIdempotentAction`; `SqsClient.callWith` takes the
+  decision as a parameter.
+- **`consume` can take longer than its timeout when SQS throttles**: a throttled `ReceiveMessage`
+  is waited on and sent again within the same poll.
+- **Clock skew and expired credentials are not retried.** An `InvalidSignatureException` for a
+  clock that is off, or `ExpiredToken`, is returned; the cache replaces credentials by the clock,
+  five minutes ahead of their expiry.
+- **A credential provider is asked before every attempt**, on the calling thread. An uncached
+  provider that calls a service makes every request pay for that call; `Aws.Credentials.cached`
+  avoids it. When the provider has nothing the operation fails with `CREDENTIALS_UNAVAILABLE`
+  (`sqs: no AWS credentials: ...`) and no request is made.
 - **Redirects are not followed**: a redirect would send a signed request to a host the signature
   does not cover; it is reported as `HTTP_3xx`.
 - **`close` makes requests.** It returns unsettled deliveries to the queue (best effort) and does
@@ -432,7 +508,13 @@ lyric test --manifest mq-sqs/lyric.toml --target jvm
   `connectFromEnv` accept, derive and refuse. They set and restore the `AWS_*` and
   `LYRIC_CONFIG_MQ_SQS_*` variables.
 - `tests/reexport_tests.l` (1 test), `tests/readme_tests.l` (1 test).
-- `tests/fake_sqs_tests.l` (17 tests): the client over real HTTP against an SQS server written in
+- `tests/fake_sqs_tests.l` (21 tests, four of them for retries and credentials on ports 19541 to
+  19543: queues that throttle twice and then serve, that fail once with a 500, and that store a
+  message and then answer 500, with the policy's sleep and random source injected so the waits are
+  asserted exactly and nothing sleeps; the standard queue holds the message once because the send
+  was not repeated, the FIFO queue once because the repeat was deduplicated; a provider whose
+  credentials change when an injected clock reaches the refresh window, the server reporting which
+  key signed the last request; a queue configured from a profile of the shared files): the client over real HTTP against an SQS server written in
   the test on `Std.HttpServer`. The server verifies the SigV4 signature of every request (and the
   session token of temporary credentials), implements visibility timeouts, receive counts, receipt
   handles, long polling, FIFO group blocking and deduplication, redrive policies and SQS's limits.
@@ -474,7 +556,7 @@ emulator, in the `aws-emulator` CI job and by hand:
 
 ```sh
 set -a; eval "$(bash scripts/ci/start-aws-emulator.sh)"; set +a   # downloads, verifies and installs the pinned package
-bash scripts/ci/test-aws-emulator.sh dotnet                        # or jvm; runs mq-sqs and storage-s3
+bash scripts/ci/test-aws-emulator.sh dotnet                        # or jvm; runs aws-credentials, mq-sqs and storage-s3
 ```
 
 The emulator checks every SigV4 signature against a key it generates at start (a wrong secret is
@@ -496,6 +578,7 @@ There is no third-party library (`[nuget]` and `[maven]` are empty). What the su
 |---|---|
 | Interface | `Lyric.Mq` 0.1.0 and `Lyric.Testing` from the lyric-lang commit in `.lyric-lang-rev` |
 | Signing | `Lyric.Aws.SigV4` 0.1.0, the version in this repository (`aws-sigv4/`) |
+| Credentials and retries | `Lyric.Aws.Credentials` 0.1.0, the version in this repository (`aws-credentials/`) |
 | SQS API | the JSON 1.0 protocol of the 2012-11-05 API |
 | ElasticMQ (CI and development) | `org.elasticmq:elasticmq-server_2.13` 1.6.11 from Maven Central, `sqs-limits = strict`, started by `scripts/ci/start-elasticmq.sh` |
 | AWS Emulator (CI) | 1.0.341, the signed Debian package, started by `scripts/ci/start-aws-emulator.sh`; all 14 integration tests pass on both targets |
@@ -509,8 +592,13 @@ There is no third-party library (`[nuget]` and `[maven]` are empty). What the su
   but it is an emulator, in memory and in one region: behaviour that only the service has
   (short-poll sampling across servers, the 120000 in-flight limit, KMS, IAM policy errors,
   throttling) is untested. No issue filed.
-- No retries, backoff or throttling handling; no issue filed.
-- Credentials from the environment or explicit values only (no profiles, IMDS, ECS, SSO, STS).
+- Retries have no retry quota and no clock-skew correction; a request refused with `ExpiredToken`
+  is not sent again with fresh credentials; `ReceiveMessage` on a FIFO queue is not made
+  repeatable with `ReceiveRequestAttemptId`. No issue filed.
+- No IAM Identity Center (SSO) credentials and no `role_arn` profiles; see the Known gaps of
+  `aws-credentials/README.md`. The container, instance metadata and web identity providers have
+  been run against in-process fakes only, not on ECS, EKS or EC2.
+- A `ca_bundle` / `AWS_CA_BUNDLE` file holding more than one certificate is untested.
 - `MD5OfMessageBody` and `MD5OfMessageAttributes` are not verified: `Std.Hash` has no MD5. No issue
   filed.
 - Binary message attributes are dropped on receipt and cannot be sent; message system attributes

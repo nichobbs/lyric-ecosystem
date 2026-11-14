@@ -165,7 +165,15 @@ test "the defaults are SQS's" {
   assertEqual(cfg.withSessionToken("t").sessionToken, "t", "withSessionToken")
 }
 
-val NAMES: slice[String] = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_SQS", "LYRIC_CONFIG_MQ_SQS_QUEUEURL", "LYRIC_CONFIG_MQ_SQS_ACKMODE", "LYRIC_CONFIG_MQ_SQS_VISIBILITYTIMEOUT", "LYRIC_CONFIG_MQ_SQS_RECEIVEBATCH", "LYRIC_CONFIG_MQ_SQS_MESSAGEGROUP", "LYRIC_CONFIG_MQ_SQS_DEADLETTERQUEUEURL", "LYRIC_CONFIG_MQ_SQS_CACERTIFICATEFILE"]
+val NAMES: slice[String] = ["AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_REGION", "AWS_DEFAULT_REGION", "AWS_ENDPOINT_URL", "AWS_ENDPOINT_URL_SQS", "AWS_PROFILE", "AWS_CONFIG_FILE", "AWS_SHARED_CREDENTIALS_FILE", "AWS_CA_BUNDLE", "AWS_WEB_IDENTITY_TOKEN_FILE", "AWS_ROLE_ARN", "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI", "AWS_CONTAINER_CREDENTIALS_FULL_URI", "AWS_EC2_METADATA_DISABLED", "LYRIC_CONFIG_MQ_SQS_QUEUEURL", "LYRIC_CONFIG_MQ_SQS_ACKMODE", "LYRIC_CONFIG_MQ_SQS_VISIBILITYTIMEOUT", "LYRIC_CONFIG_MQ_SQS_RECEIVEBATCH", "LYRIC_CONFIG_MQ_SQS_MESSAGEGROUP", "LYRIC_CONFIG_MQ_SQS_DEADLETTERQUEUEURL", "LYRIC_CONFIG_MQ_SQS_CACERTIFICATEFILE"]
+
+// Shared files that do not exist: the tests must not read this machine's.
+val NO_CONFIG: String = "/nonexistent/lyric-mq-sqs-tests/config"
+
+val NO_CREDENTIALS: String = "/nonexistent/lyric-mq-sqs-tests/credentials"
+
+// What the default chain says when no provider has anything.
+val NOTHING: String = "no AWS credentials: chain: no provider has credentials: environment: AWS_ACCESS_KEY_ID and AWS_SECRET_ACCESS_KEY are not set; web-identity: AWS_WEB_IDENTITY_TOKEN_FILE and AWS_ROLE_ARN are not set; profile: there is no profile 'default' in /nonexistent/lyric-mq-sqs-tests/config or /nonexistent/lyric-mq-sqs-tests/credentials; container: neither AWS_CONTAINER_CREDENTIALS_RELATIVE_URI nor AWS_CONTAINER_CREDENTIALS_FULL_URI is set; imds: AWS_EC2_METADATA_DISABLED is true"
 
 func saved(): slice[String] {
   val acc: List[String] = newList()
@@ -183,10 +191,15 @@ func restore(values: in slice[String]): Unit {
   }
 }
 
+// Every variable unset, and the default credential chain confined: no shared
+// files of this machine, no instance metadata service.
 func clearAll(): Unit {
   for name in NAMES {
     Env.setVar(name, "")
   }
+  Env.setVar("AWS_CONFIG_FILE", NO_CONFIG)
+  Env.setVar("AWS_SHARED_CREDENTIALS_FILE", NO_CREDENTIALS)
+  Env.setVar("AWS_EC2_METADATA_DISABLED", "true")
 }
 
 func envConfigText(queueUrl: in String): String {
@@ -215,9 +228,13 @@ func envConnectText(): String {
 test "configFromEnv reads the standard AWS variables" {
   val before = saved()
   clearAll()
-  assertEqual(envConfigText(AWS_QUEUE), "INVALID_CONFIG: AWS_ACCESS_KEY_ID is not set", "nothing set")
+  assertEqual(envConfigText(AWS_QUEUE), "INVALID_CONFIG: " + NOTHING, "nothing set: every provider's reason")
   Env.setVar("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
-  assertEqual(envConfigText(AWS_QUEUE), "INVALID_CONFIG: AWS_SECRET_ACCESS_KEY is not set", "no secret")
+  assertEqual(
+    envConfigText(AWS_QUEUE),
+    "INVALID_CONFIG: no AWS credentials: environment: AWS_ACCESS_KEY_ID is set but AWS_SECRET_ACCESS_KEY is not",
+    "no secret"
+  )
   Env.setVar("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
   assertEqual(envConfigText(AWS_QUEUE), "AKIDEXAMPLE |  |  | ", "the region is optional: the queue URL carries it")
   Env.setVar("AWS_SESSION_TOKEN", "token")
@@ -243,7 +260,7 @@ test "connectFromEnv opens the queue the environment describes" {
   clearAll()
   assertEqual(envConnectText(), "sqs: no queue URL configured (set LYRIC_CONFIG_MQ_SQS_QUEUEURL)", "no queue URL")
   Env.setVar("LYRIC_CONFIG_MQ_SQS_QUEUEURL", AWS_QUEUE + ".fifo")
-  assertEqual(envConnectText(), "sqs: AWS_ACCESS_KEY_ID is not set", "no credentials")
+  assertEqual(envConnectText(), "sqs: " + NOTHING, "no credentials")
   Env.setVar("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE")
   Env.setVar("AWS_SECRET_ACCESS_KEY", "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY")
   assertEqual(

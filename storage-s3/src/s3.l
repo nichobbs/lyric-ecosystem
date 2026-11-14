@@ -12,7 +12,9 @@
 //!   put(bucket, "reports/q3.pdf", base64Data, "application/pdf")?
 //!   val url = bucket.presignedUrl("reports/q3.pdf", 3600)?
 //!
-//! `connectFromEnv(bucket)` reads the standard `AWS_*` variables instead, and
+//! `connectFromEnv(bucket)` uses the AWS default credential chain and the
+//! standard `AWS_*` variables instead, `withCredentialProvider` any
+//! `Aws.Credentials` provider, and
 //! `endpointConfig(...)` addresses MinIO, LocalStack and other compatible
 //! servers path-style. Take credentials from the application's `config { }`
 //! block or the environment, never from source.
@@ -132,7 +134,7 @@ impl StorageBucket for S3Bucket {
     if expiresInSeconds < 1 or expiresInSeconds > 604800 {
       return Err(StorageError(message = "expiresInSeconds must be in [1, 604800]", code = "INVALID_ARGUMENT"))
     }
-    Ok(self.client.presign("GET", key, expiresInSeconds, amzDateNow()))
+    self.client.presign("GET", key, expiresInSeconds, amzDateNow())
   }
 
   func exists(key: in String): Result[Bool, StorageError] {
@@ -161,8 +163,9 @@ pub func connect(cfg: in S3Config): Result[StorageBucket, StorageError] {
   }
 }
 
-/// Open `bucket` with the credentials, region and optional endpoint in the
-/// standard `AWS_*` environment variables (`configFromEnv`).
+/// Open `bucket` with the credentials, region, optional endpoint and
+/// optional certificate authority the environment and the AWS shared files
+/// give (`configFromEnv`): the default credential chain.
 pub func connectFromEnv(bucket: in String): Result[StorageBucket, StorageError] {
   match configFromEnv(bucket) {
     case Err(e) -> Err(e)

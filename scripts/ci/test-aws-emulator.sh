@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Run the mq-sqs and storage-s3 integration suites against the AWS Emulator
+# Run the aws-credentials, mq-sqs and storage-s3 integration suites against the AWS Emulator
 # that scripts/ci/start-aws-emulator.sh started (its variables must be in the
 # environment).
 #
@@ -22,12 +22,17 @@ target="${1:?usage: test-aws-emulator.sh <dotnet|jvm>}"
 lyric="${LYRIC:-lyric}"
 cd "$(dirname "$0")/../.."
 
-for name in LYRIC_SQS_ENDPOINT LYRIC_S3_ENDPOINT AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_EMULATOR_CA_FILE; do
+for name in LYRIC_SQS_ENDPOINT LYRIC_S3_ENDPOINT AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_EMULATOR_CA_FILE \
+  AWS_EMULATOR_CREDENTIALS_FILE AWS_EMULATOR_CONFIG_FILE; do
   [ -n "${!name:-}" ] || { echo "error: $name is not set; run scripts/ci/start-aws-emulator.sh first" >&2; exit 1; }
 done
 
 failed=()
-for pkg in mq-sqs storage-s3; do
+# aws-credentials reads the emulator's own credentials and config files
+# (AWS_EMULATOR_CREDENTIALS_FILE, AWS_EMULATOR_CONFIG_FILE) and takes nothing
+# from AWS_ACCESS_KEY_ID: its suite is the shared-files provider against files
+# a real tool wrote.
+for pkg in aws-credentials mq-sqs storage-s3; do
   echo "== $pkg against AWS Emulator (--target $target)"
   "$lyric" restore --manifest "$pkg/lyric.toml"
   case "$target" in
@@ -47,4 +52,4 @@ if [ "${#failed[@]}" -gt 0 ]; then
   echo "FAILED against AWS Emulator: ${failed[*]}" >&2
   exit 1
 fi
-echo "mq-sqs and storage-s3 passed against AWS Emulator on $target"
+echo "aws-credentials, mq-sqs and storage-s3 passed against AWS Emulator on $target"

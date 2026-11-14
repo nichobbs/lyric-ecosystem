@@ -14,10 +14,21 @@
 //! (refused, reset, TLS) `CONNECTION_FAILED`, one that could not be built
 //! `INVALID_ARGUMENT`, a configuration that cannot be
 //! used `INVALID_CONFIG`, and a successful response this client cannot read
-//! `MALFORMED_RESPONSE`.
+//! `MALFORMED_RESPONSE`. `CREDENTIALS_UNAVAILABLE` means the configured
+//! credential provider had no credentials to sign with.
 //!
-//! Requests are not retried: a throttled or failed request is returned as the
-//! error it is.
+//! Credentials are static (the access key fields of `SqsConfig`) or come from
+//! an `Aws.Credentials.CredentialProvider` (`withCredentialProvider`), which
+//! is asked before every attempt, so temporary credentials are replaced when
+//! the provider refreshes them.
+//!
+//! A failed request is sent again, signed afresh, as the `Aws.Retry` policy
+//! of the configuration says (`withRetry`), when sending it again cannot do
+//! harm. Throttling and a connection that could not be opened are retried
+//! for every action. A failure that leaves the outcome unknown (HTTP 500,
+//! 502, 504, a cut connection, a timeout) is retried only for an action that
+//! is idempotent (`isIdempotentAction`), and for `SendMessage` and
+//! `SendMessageBatch` to a FIFO queue, whose deduplication makes them so.
 @runtime_checked
 @io
 package Mq.Sqs.Client
@@ -32,6 +43,10 @@ import Std.JsonValue
 import Std.String as Str
 import Std.Task
 import Std.Tls as Tls
+import Aws.Credentials
+import Aws.Credentials.Chain
+import Aws.Credentials.Profile
+import Aws.Retry
 import Aws.SigV4
 import Aws.SigV4.Env as AwsEnv
 import Mq
@@ -132,6 +147,12 @@ pub record SqsConfig {
   /// (PEM text); `""` adds none. Ignored when `caCertificatePem` is set. Set
   /// with `withCaCertificate`.
   additionalCaCertificatePem: String = ""
+  /// Where the credentials come from; `None` uses `accessKeyId`,
+  /// `secretAccessKey` and `sessionToken`. Set with `withCredentialProvider`.
+  credentialProvider: Option[CredentialProvider] = None
+  /// When a failed request is sent again. Set with `withRetry` or
+  /// `withoutRetries`.
+  retry: RetryPolicy = standardRetry()
 }
 
 /// Configuration for a queue on an SQS-compatible server at `endpoint`
@@ -167,28 +188,85 @@ pub func awsConfig(queueUrl: in String, accessKeyId: in String, secretAccessKey:
   endpointConfig("", queueUrl, "", accessKeyId, secretAccessKey)
 }
 
-/// Configuration for `queueUrl` from the standard AWS environment variables:
-/// `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional `AWS_SESSION_TOKEN`,
-/// the region from `AWS_REGION` or `AWS_DEFAULT_REGION` (optional when the
-/// queue URL carries it), and an optional endpoint from
-/// `AWS_ENDPOINT_URL_SQS` or `AWS_ENDPOINT_URL`. `Err(INVALID_CONFIG)` names
-/// the first required variable that is missing.
+/// Configuration for `queueUrl` from the process environment and the AWS
+/// shared files: `configFromEnvironment` over
+/// `Aws.Credentials.processEnvironment()`.
 pub func configFromEnv(queueUrl: in String): Result[SqsConfig, SqsError] {
-  val creds = match AwsEnv.credentialsFromEnv() {
+  configFromEnvironment(queueUrl, processEnvironment())
+}
+
+/// Configuration for `queueUrl` as the AWS SDKs would find it, reading
+/// variables through `lookup`:
+///
+///   * credentials from the default chain (`Aws.Credentials.Chain`): the
+///     environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, optional
+///     `AWS_SESSION_TOKEN`), web identity, the shared config and credentials
+///     files (`AWS_PROFILE`), the container endpoint, the EC2 instance
+///     metadata service. The chain is asked once here, so that missing
+///     credentials are an error now. Credentials from the environment become
+///     the static fields of the configuration, as they always did; any other
+///     source is kept as a cached credential provider, which refreshes
+///     temporary credentials before they expire;
+///   * the region from `AWS_REGION`, `AWS_DEFAULT_REGION` or the profile's
+///     `region` (optional when the queue URL carries it);
+///   * an optional endpoint from `AWS_ENDPOINT_URL_SQS`, `AWS_ENDPOINT_URL`
+///     or the profile's `endpoint_url`;
+///   * an optional certificate authority, trusted in addition to the system
+///     trust store, from `AWS_CA_BUNDLE` or the profile's `ca_bundle`.
+///
+/// `Err(INVALID_CONFIG)` says what is missing; for credentials it holds the
+/// reason of every provider of the chain.
+pub func configFromEnvironment(queueUrl: in String, lookup: in (String) -> String): Result[SqsConfig, SqsError] {
+  val provider = cached(defaultChain(lookup))
+  val resolved = match provider.resolve() {
     case Ok(c) -> c
-    case Err(message) -> return Err(invalidConfig(message))
+    case Err(e) -> return Err(invalidConfig("no AWS credentials: " + e.text()))
   }
-  val region = match AwsEnv.regionFromEnv() { case Ok(r) -> r; case Err(_) -> "" }
-  Ok(
-    endpointConfig(AwsEnv.endpointFromEnv("SQS"), queueUrl, region, creds.accessKeyId, creds.secretAccessKey).copy(
-      sessionToken = creds.sessionToken
-    )
+  val settings = match settingsFromEnvironment(lookup, "SQS") {
+    case Ok(s) -> s
+    case Err(e) -> return Err(invalidConfig(e.text()))
+  }
+  val fromEnvironment = resolved.source == "environment"
+  var cfg = endpointConfig(
+    settings.endpointUrl,
+    queueUrl,
+    settings.region,
+    if fromEnvironment { resolved.credentials.accessKeyId } else { "" },
+    if fromEnvironment { resolved.credentials.secretAccessKey } else { "" }
   )
+  if fromEnvironment {
+    cfg = cfg.copy(sessionToken = resolved.credentials.sessionToken)
+  } else {
+    cfg = cfg.withCredentialProvider(provider)
+  }
+  if settings.caBundlePath.length > 0 {
+    cfg = match cfg.withCaCertificateFile(settings.caBundlePath) { case Ok(c) -> c; case Err(e) -> return Err(e) }
+  }
+  Ok(cfg)
 }
 
 /// `cfg` with temporary credentials' session token.
 pub func SqsConfig.withSessionToken(cfg: in SqsConfig, sessionToken: in String): SqsConfig {
   cfg.copy(sessionToken = sessionToken)
+}
+
+/// `cfg` signing with the credentials `provider` returns instead of the
+/// access key fields. The provider is asked before every request and every
+/// retry: wrap one that calls a service or reads a file in
+/// `Aws.Credentials.cached` (`Aws.Credentials.Chain.defaultProvider()` is).
+pub func SqsConfig.withCredentialProvider(cfg: in SqsConfig, provider: in CredentialProvider): SqsConfig {
+  cfg.copy(credentialProvider = Some(value = provider))
+}
+
+/// `cfg` retrying as `policy` says (`Aws.Retry`). The default is
+/// `standardRetry()`: three attempts.
+pub func SqsConfig.withRetry(cfg: in SqsConfig, policy: in RetryPolicy): SqsConfig {
+  cfg.copy(retry = policy)
+}
+
+/// `cfg` sending every request once.
+pub func SqsConfig.withoutRetries(cfg: in SqsConfig): SqsConfig {
+  cfg.copy(retry = noRetry())
 }
 
 /// `cfg` with a per-request deadline in milliseconds.
@@ -320,7 +398,9 @@ func httpClientFor(cfg: in SqsConfig): Result[HttpClient, SqsError] {
 /// hand.
 pub record SqsClient {
   region: String
-  creds: Credentials
+  // Asked for the credentials of every attempt.
+  credentials: CredentialProvider
+  retry: RetryPolicy
   // `https://host[:port]`, no trailing slash.
   origin: String
   // The authority sent as `Host` and signed: `host[:port]`.
@@ -332,13 +412,25 @@ pub record SqsClient {
 /// Validate the connection part of `cfg` and open a client for its endpoint.
 /// No request is made: a wrong credential shows up on the first operation.
 ///
-/// `Err(INVALID_CONFIG)` for empty credentials, a malformed endpoint or
+/// `Err(INVALID_CONFIG)` for empty credentials when there is no credential
+/// provider, a malformed endpoint or
 /// queue URL, a plain `http://` URL that is not loopback, a region that is
 /// neither given nor part of an AWS host name, a non-positive timeout, or a
 /// CA certificate that is not a PEM certificate.
 pub func openClient(cfg: in SqsConfig): Result[SqsClient, SqsError] {
-  if cfg.accessKeyId.length == 0 or cfg.secretAccessKey.length == 0 {
-    return Err(invalidConfig("SQS access key id and secret access key must be non-empty"))
+  val credentials = match cfg.credentialProvider {
+    case Some(provider) -> provider
+    case None -> {
+      if cfg.accessKeyId.length == 0 or cfg.secretAccessKey.length == 0 {
+        return Err(invalidConfig("SQS access key id and secret access key must be non-empty"))
+      }
+      staticProviderOf(
+        Credentials(accessKeyId = cfg.accessKeyId, secretAccessKey = cfg.secretAccessKey, sessionToken = cfg.sessionToken)
+      )
+    }
+  }
+  if cfg.retry.maxAttempts < 1 {
+    return Err(invalidConfig("retry.maxAttempts must be >= 1, got " + cfg.retry.maxAttempts.toString()))
   }
   if cfg.requestTimeoutMs <= 0 {
     return Err(invalidConfig("requestTimeoutMs must be > 0, got " + cfg.requestTimeoutMs.toString()))
@@ -379,11 +471,8 @@ pub func openClient(cfg: in SqsConfig): Result[SqsClient, SqsError] {
   Ok(
     SqsClient(
       region = region,
-      creds = Credentials(
-        accessKeyId = cfg.accessKeyId,
-        secretAccessKey = cfg.secretAccessKey,
-        sessionToken = cfg.sessionToken
-      ),
+      credentials = credentials,
+      retry = cfg.retry,
       origin = endpoint.origin(),
       host = endpoint.authority,
       requestTimeoutMs = cfg.requestTimeoutMs,
@@ -429,11 +518,27 @@ func timeoutError(action: in String, timeoutMs: in Int, origin: in String): SqsE
   )
 }
 
+// What one attempt came to: the outcome, and for a failure what kind it is
+// (`NotRetryable` for a success).
+record Attempt {
+  outcome: Result[JsonValue, SqsError]
+  kind: FailureKind
+  retryAfterMs: Int
+}
+
+func failedAttempt(e: in SqsError, kind: in FailureKind): Attempt {
+  Attempt(outcome = Err(e), kind = kind, retryAfterMs = -1)
+}
+
+// A response, or the failed attempt that there was none.
+union Sent {
+  case Answered(response: HttpResponse)
+  case Unanswered(failed: Attempt)
+}
+
 // Plain (non-`async`) so it may `await` in place and still wrap the send in
 // `try` (V0012 forbids `await` inside `try` in an `async func`).
-func sendCatching(
-  client: in SqsClient, req: in HttpRequest, action: in String, timeoutMs: in Int
-): Result[HttpResponse, SqsError] {
+func sendCatching(client: in SqsClient, req: in HttpRequest, action: in String, timeoutMs: in Int): Sent {
   val src = makeCancelSourceTimeout(timeoutMs)
   val tok = sourceToken(src)
   val sent = try {
@@ -444,7 +549,7 @@ func sendCatching(
   val deadlinePassed = isCancelled(tok)
   disposeSource(src)
   match sent {
-    case Ok(resp) -> Ok(resp)
+    case Ok(resp) -> Answered(response = resp)
     case Err(e) -> {
       val timedOut = deadlinePassed or
         match e {
@@ -453,9 +558,15 @@ func sendCatching(
           case _ -> false
         }
       if timedOut {
-        Err(timeoutError(action, timeoutMs, client.origin))
+        Unanswered(failed = failedAttempt(timeoutError(action, timeoutMs, client.origin), FailureKind.TimedOut))
       } else {
-        Err(transportError(action + " got no response from " + client.origin + ": " + HttpError.message(e)))
+        val cause = HttpError.message(e)
+        Unanswered(
+          failed = failedAttempt(
+            transportError(action + " got no response from " + client.origin + ": " + cause),
+            if isConnectFailure(cause) { FailureKind.ConnectFailed } else { FailureKind.NoResponse }
+          )
+        )
       }
     }
   }
@@ -492,18 +603,26 @@ pub func faultOf(action: in String, status: in Int, body: in String): SqsError {
   }
 }
 
-/// Sign and send one action and return the response document.
-///
-/// `action` is the SQS action name (`SendMessage`), `body` the JSON request
-/// (`Mq.Sqs.Wire`), and `extraWaitMs` what the server may legitimately spend
-/// before it answers (the wait of a long poll), added to the request
-/// deadline.
-pub func SqsClient.call(
-  client: in SqsClient, action: in String, body: in String, extraWaitMs: in Int
-): Result[JsonValue, SqsError]
-  requires: extraWaitMs >= 0
-{
-  val bytes = Enc.encodeUtf8(body)
+/// The credentials to sign with now, from the client's provider.
+/// `Err(CREDENTIALS_UNAVAILABLE)` when it has none.
+pub func SqsClient.currentCredentials(client: in SqsClient): Result[Credentials, SqsError] {
+  val resolved = try {
+    client.credentials.resolve()
+  } catch Bug as bug {
+    Err(error = CredentialError(code = "REQUEST_FAILED", provider = "provider", message = bug.message))
+  }
+  match resolved {
+    case Ok(c) -> Ok(c.credentials)
+    case Err(e) -> Err(
+      SqsError(code = "CREDENTIALS_UNAVAILABLE", message = "no AWS credentials: " + e.text(), status = 0)
+    )
+  }
+}
+
+// One signed attempt.
+func attempt(
+  client: in SqsClient, creds: in Credentials, action: in String, bytes: in slice[Byte], extraWaitMs: in Int
+): Attempt {
   val extra: List[Pair] = newList()
   extra.add(Pair(name = "content-type", value = "application/x-amz-json-1.0"))
   extra.add(Pair(name = "x-amz-target", value = "AmazonSQS." + action))
@@ -516,7 +635,7 @@ pub func SqsClient.call(
     extra,
     sha256Hex(bytes),
     false,
-    client.creds,
+    creds,
     client.region,
     "sqs",
     AwsEnv.amzDateNow()
@@ -524,11 +643,11 @@ pub func SqsClient.call(
   val url = client.origin + "/"
   val parsed = match Url.tryFrom(url) {
     case Ok(u) -> u
-    case Err(_) -> return Err(invalidArgument("cannot build an SQS request URL: " + url))
+    case Err(_) -> return failedAttempt(invalidArgument("cannot build an SQS request URL: " + url), FailureKind.NotRetryable)
   }
   var req = match withBytesBody(request(POST, parsed), "application/x-amz-json-1.0", bytes) {
     case Ok(r) -> r
-    case Err(e) -> return Err(invalidArgument(HttpError.message(e)))
+    case Err(e) -> return failedAttempt(invalidArgument(HttpError.message(e)), FailureKind.NotRetryable)
   }
   // `Host` is set by the HTTP client from the URL and `Content-Type` by the
   // body; every other signed header is sent as signed, then `Authorization`.
@@ -539,25 +658,118 @@ pub func SqsClient.call(
         case Ok(r) -> {
           req = r
         }
-        case Err(e) -> return Err(invalidArgument(HttpError.message(e)))
+        case Err(e) -> return failedAttempt(invalidArgument(HttpError.message(e)), FailureKind.NotRetryable)
       }
     }
     k = k + 1
   }
   val resp = match sendCatching(client, req, action, client.requestTimeoutMs + extraWaitMs) {
-    case Ok(r) -> r
-    case Err(e) -> return Err(e)
+    case Answered(r) -> r
+    case Unanswered(failed) -> return failed
   }
-  val responseBytes = match readBody(resp, action) { case Ok(b) -> b; case Err(e) -> return Err(e) }
+  val responseBytes = match readBody(resp, action) {
+    case Ok(b) -> b
+    case Err(e) -> return failedAttempt(e, FailureKind.NoResponse)
+  }
   val status = HttpResponse.statusCode(resp)
   val responseText = match Enc.tryDecodeUtf8(responseBytes) { case Some(t) -> t; case None -> "" }
   if status != 200 {
-    return Err(faultOf(action, status, responseText))
+    val fault = faultOf(action, status, responseText)
+    return Attempt(
+      outcome = Err(fault),
+      kind = classifyResponse(status, if Str.startsWith(fault.code, "HTTP_") { "" } else { fault.code }),
+      retryAfterMs = retryAfterMsOf(
+        match HttpResponse.header(resp, "Retry-After") { case Some(v) -> v; case None -> "" },
+        match HttpResponse.header(resp, "x-amz-retry-after") { case Some(v) -> v; case None -> "" }
+      )
+    )
   }
   match parseDocument(responseText) {
-    case Ok(doc) -> Ok(doc)
-    case Err(message) -> Err(SqsError(code = "MALFORMED_RESPONSE", message = action + ": " + message, status = status))
+    case Ok(doc) -> Attempt(outcome = Ok(doc), kind = FailureKind.NotRetryable, retryAfterMs = -1)
+    case Err(message) -> failedAttempt(
+      SqsError(code = "MALFORMED_RESPONSE", message = action + ": " + message, status = status),
+      FailureKind.NotRetryable
+    )
   }
+}
+
+/// True for the SQS actions that may be sent again after a failure that
+/// leaves their outcome unknown, because a second execution changes nothing
+/// the first did not: `DeleteMessage`, `DeleteMessageBatch`,
+/// `ChangeMessageVisibility`, `ChangeMessageVisibilityBatch`, `CreateQueue`,
+/// `GetQueueUrl`, `GetQueueAttributes`, `SetQueueAttributes`, `ListQueues`,
+/// `ListQueueTags`, `ListDeadLetterSourceQueues`, `TagQueue`, `UntagQueue`.
+///
+/// Not among them: `SendMessage` and `SendMessageBatch` (a standard queue
+/// would hold the message twice), `ReceiveMessage` (the messages of the lost
+/// response stay hidden until their visibility timeout), `PurgeQueue` and
+/// `DeleteQueue` (the repeat fails with `PurgeQueueInProgress` or
+/// `QueueDoesNotExist` although the first succeeded), and any action this
+/// client does not know.
+@pure
+pub func isIdempotentAction(action: in String): Bool {
+  action == "DeleteMessage" or action == "DeleteMessageBatch" or action == "ChangeMessageVisibility" or
+    action == "ChangeMessageVisibilityBatch" or
+    action == "CreateQueue" or
+    action == "GetQueueUrl" or
+    action == "GetQueueAttributes" or
+    action == "SetQueueAttributes" or
+    action == "ListQueues" or
+    action == "ListQueueTags" or
+    action == "ListDeadLetterSourceQueues" or
+    action == "TagQueue" or
+    action == "UntagQueue"
+}
+
+/// True when `queueUrl` names a FIFO queue (`.fifo`). A send to one is
+/// idempotent within SQS's five-minute deduplication window: the request
+/// carries a deduplication id, or the queue deduplicates by content, and a
+/// repeat is accepted without storing the message again.
+@pure
+pub func isFifoQueueUrl(queueUrl: in String): Bool {
+  Str.endsWith(queueUrl, ".fifo")
+}
+
+/// Sign and send one action and return the response document, sending it
+/// again as the client's retry policy says. `idempotent` says whether the
+/// action may be repeated after a failure that leaves its outcome unknown.
+///
+/// `action` is the SQS action name (`SendMessage`), `body` the JSON request
+/// (`Mq.Sqs.Wire`), and `extraWaitMs` what the server may legitimately spend
+/// before it answers (the wait of a long poll), added to the request
+/// deadline. The error of the last attempt is returned.
+pub func SqsClient.callWith(
+  client: in SqsClient,
+  action: in String,
+  body: in String,
+  extraWaitMs: in Int,
+  idempotent: in Bool,
+): Result[JsonValue, SqsError]
+  requires: extraWaitMs >= 0
+{
+  val bytes = Enc.encodeUtf8(body)
+  var number = 1
+  while true {
+    // Asked again for every attempt: a retry is signed with the credentials
+    // and the date of its own moment.
+    val creds = match client.currentCredentials() { case Ok(c) -> c; case Err(e) -> return Err(e) }
+    val made = attempt(client, creds, action, bytes, extraWaitMs)
+    match client.retry.decide(number, made.kind, idempotent, made.retryAfterMs) {
+      case GiveUp -> return made.outcome
+      case RetryAfter(delayMs) -> client.retry.pause(delayMs)
+    }
+    number = number + 1
+  }
+  Err(invalidArgument("unreachable"))
+}
+
+/// `callWith` with `idempotent = isIdempotentAction(action)`.
+pub func SqsClient.call(
+  client: in SqsClient, action: in String, body: in String, extraWaitMs: in Int
+): Result[JsonValue, SqsError]
+  requires: extraWaitMs >= 0
+{
+  client.callWith(action, body, extraWaitMs, isIdempotentAction(action))
 }
 
 func malformed(action: in String, message: in String): SqsError {
@@ -568,7 +780,7 @@ func malformed(action: in String, message: in String): SqsError {
 pub func SqsClient.sendMessage(
   client: in SqsClient, queueUrl: in String, outgoing: in Outgoing, send: in SendFields
 ): Result[String, SqsError] {
-  match client.call("SendMessage", sendMessageRequest(queueUrl, outgoing, send), 0) {
+  match client.callWith("SendMessage", sendMessageRequest(queueUrl, outgoing, send), 0, isFifoQueueUrl(queueUrl)) {
     case Err(e) -> Err(e)
     case Ok(doc) -> match getString(doc, "MessageId") {
       case Some(id) -> Ok(id)
@@ -584,7 +796,8 @@ pub func SqsClient.sendMessageBatch(
 ): Result[BatchOutcome, SqsError]
   requires: entries.count >= 1 and entries.count <= 10
 {
-  match client.call("SendMessageBatch", sendMessageBatchRequest(queueUrl, entries), 0) {
+  val body = sendMessageBatchRequest(queueUrl, entries)
+  match client.callWith("SendMessageBatch", body, 0, isFifoQueueUrl(queueUrl)) {
     case Err(e) -> Err(e)
     case Ok(doc) -> match parseBatchResponse(doc) {
       case Ok(outcome) -> Ok(outcome)

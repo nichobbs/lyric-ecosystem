@@ -12,7 +12,7 @@ package, so the same code runs on both targets and there is no `_kernel_<target>
 | Targets | `dotnet`, `jvm` |
 | Stability | `experimental` (0.1.0) |
 | Interface | `Storage.StorageBucket` from `Lyric.Storage`, re-exported with `pub use Storage` |
-| Dependencies | `Lyric.Aws.SigV4` (`aws-sigv4/` in this repository, the signing shared with the other AWS backends), a `{ workspace = true }` dependency. No SDK and no native dependency |
+| Dependencies | `Lyric.Aws.SigV4` (`aws-sigv4/`, the signing) and `Lyric.Aws.Credentials` (`aws-credentials/`, credential providers and the retry policy), both shared with the other AWS backends of this repository, as `{ workspace = true }` dependencies. No SDK and no native dependency |
 | Protocol | S3 REST API, 2006-03-01; AWS Signature Version 4 (`AWS4-HMAC-SHA256`) |
 
 ## Usage
@@ -61,6 +61,26 @@ Variations:
 
   func compatibleServer(keyId: in String, secret: in String): Result[StorageBucket, StorageError] {
     connect(endpointConfig("https://minio.example.com:9000", "data", "us-east-1", keyId, secret))
+  }
+  ```
+
+- **A credential provider and a retry policy** (`Aws.Credentials`, `Aws.Retry`, from
+  `aws-credentials/`): credentials that are refreshed before they expire, and five attempts instead
+  of three. Compiled by `tests/readme_tests.l`.
+
+  ```lyric
+  import Aws.Credentials.Chain
+  import Aws.Retry
+
+  func withDefaultChain(bucket: in String, region: in String): Result[StorageBucket, StorageError] {
+    val cfg = awsConfig(bucket, region, "", "")
+      .withCredentialProvider(defaultProvider())
+      .withRetry(standardRetry().withMaxAttempts(5))
+    connect(cfg)
+  }
+
+  func sentOnce(keyId: in String, secret: in String): Result[StorageBucket, StorageError] {
+    connect(awsConfig("my-bucket", "eu-west-1", keyId, secret).withoutRetries())
   }
   ```
 
@@ -146,17 +166,20 @@ credentials from the application's `config { }` block or the environment, never 
 |---|---|
 | `awsConfig(bucket, region, accessKeyId, secretAccessKey)` | AWS, virtual-hosted: `https://<bucket>.s3.<region>.amazonaws.com/<key>` |
 | `endpointConfig(endpoint, bucket, region, accessKeyId, secretAccessKey)` | a custom endpoint, path-style: `<endpoint>/<bucket>/<key>` |
-| `configFromEnv(bucket)` / `connectFromEnv(bucket)` | from the environment, see below |
+| `configFromEnv(bucket)` / `connectFromEnv(bucket)` | from the environment and the AWS shared files, see below |
+| `configFromEnvironment(bucket, lookup)` | the same, reading variables through `lookup` (`Aws.Credentials.environmentOf(map)`) instead of the process environment |
 
 | `S3Config` field | Set with | Default | Meaning |
 |---|---|---|---|
 | `bucket` | constructor | (required) | 3 to 63 characters of lowercase letters, digits, `-` and `.`, starting and ending with a letter or digit, no `..` |
 | `region` | constructor | (required) | The region to sign for: lowercase letters, digits and `-` (`us-east-1` for a default MinIO, `auto` for R2) |
-| `accessKeyId`, `secretAccessKey` | constructor | (required) | Not empty |
+| `accessKeyId`, `secretAccessKey` | constructor | (required unless `credentialProvider` is set) | Not empty; ignored when there is a credential provider |
 | `sessionToken` | `.withSessionToken(token)` | `""` | The token of temporary credentials |
 | `endpoint` | `endpointConfig` | `""` (AWS) | `http(s)://host[:port]`, nothing after the authority but an optional `/`. `https://` unless the host is `localhost`, `127.0.0.1` or `[::1]` |
 | `pathStyle` | `.withPathStyle(flag)` | false for `awsConfig`, true for `endpointConfig` and for an endpoint from the environment | Put the bucket in the path instead of the host name |
-| `requestTimeoutMs` | `.withRequestTimeout(ms)` | 30000 | Deadline of each request; must be positive |
+| `requestTimeoutMs` | `.withRequestTimeout(ms)` | 30000 | Deadline of each attempt; must be positive |
+| `credentialProvider` | `.withCredentialProvider(provider)` | `None` | An `Aws.Credentials.CredentialProvider` asked for the credentials of every attempt, instead of the three fields above. Wrap a provider that calls a service or reads a file in `Aws.Credentials.cached` |
+| `retry` | `.withRetry(policy)`, `.withoutRetries()` | `Aws.Retry.standardRetry()`: 3 attempts, waits of up to 100 ms and 200 ms | When a failed request is sent again; `maxAttempts` must be at least 1 |
 | `additionalCaCertificatePem` | `.withCaCertificate(pem)`, `.withCaCertificateFile(path)` | `""` | A certificate authority (PEM text, one certificate) trusted in addition to the system trust store |
 | `caCertificatePem` | `.withExclusiveCaCertificate(pem)`, `.withExclusiveCaCertificateFile(path)` | `""` | The only certificate authority the server certificate may chain to; the system trust store is not consulted. Wins over `additionalCaCertificatePem` |
 
@@ -175,21 +198,34 @@ val cfg = match base.withCaCertificateFile("/etc/ssl/private-ca.pem") { case Ok(
 val bucket = connect(cfg)?
 ```
 
-`configFromEnv` and `connectFromEnv` read the standard variables (through `Aws.SigV4.Env`):
+`configFromEnv` and `connectFromEnv` configure the bucket the way the AWS SDKs would find it
+(`Aws.Credentials`, from `aws-credentials/`; its README has the details of every provider):
 
-| Variable | |
+| What | From, in this order |
 |---|---|
-| `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` | Required |
-| `AWS_SESSION_TOKEN` | Optional |
-| `AWS_REGION`, else `AWS_DEFAULT_REGION` | Required |
-| `AWS_ENDPOINT_URL_S3`, else `AWS_ENDPOINT_URL` | Optional; path-style when set |
+| Credentials | the default chain: `AWS_ACCESS_KEY_ID` + `AWS_SECRET_ACCESS_KEY` (+ `AWS_SESSION_TOKEN`); web identity (`AWS_WEB_IDENTITY_TOKEN_FILE` + `AWS_ROLE_ARN`); the profile `AWS_PROFILE` (else `default`) of `AWS_CONFIG_FILE` / `AWS_SHARED_CREDENTIALS_FILE` (else `~/.aws/config`, `~/.aws/credentials`), static keys or `credential_process`; the container endpoint (`AWS_CONTAINER_CREDENTIALS_RELATIVE_URI`, `AWS_CONTAINER_CREDENTIALS_FULL_URI`); the EC2 instance metadata service (IMDSv2; `AWS_EC2_METADATA_DISABLED=true` skips it) |
+| Region (required) | `AWS_REGION`, `AWS_DEFAULT_REGION`, the profile's `region` |
+| Endpoint (optional; path-style when set) | `AWS_ENDPOINT_URL_S3`, `AWS_ENDPOINT_URL`, the profile's `endpoint_url`; none of them when `AWS_IGNORE_CONFIGURED_ENDPOINT_URLS=true` |
+| CA certificate (optional, additive) | `AWS_CA_BUNDLE`, the profile's `ca_bundle`: a PEM file, as `withCaCertificateFile` |
 
-A missing required variable is `INVALID_CONFIG` naming it. Nothing else is read from the environment:
-no profile, no shared credentials file, no instance or container metadata.
+The chain is asked once, in `configFromEnv`, so missing credentials are `INVALID_CONFIG` there, with
+the reason of every provider. Credentials from the environment variables become the static fields
+of the `S3Config`, exactly as before this package had providers. Credentials from any other source
+are not copied into the configuration: it carries the cached chain as its `credentialProvider`, and
+temporary credentials are refreshed five minutes before they expire.
+
+**Changed from earlier versions of this package**, which read the three credential variables and
+the region and endpoint variables only: (1) when the credential variables are unset, the shared
+files, the container endpoint and the instance metadata service are now consulted, where
+`configFromEnv` used to fail at once; off EC2 that costs up to a second for the metadata service
+unless `AWS_EC2_METADATA_DISABLED=true`; (2) the error text for missing credentials is the chain's,
+not `AWS_ACCESS_KEY_ID is not set`; (3) the region, the endpoint and a CA bundle are also taken
+from the profile, and `AWS_CA_BUNDLE` is honoured; (4) only one of the two credential variables set
+is `INVALID_CONFIG` naming both, and the chain does not go on to another source.
 
 `openClient` (and so `connect`) validates the configuration before any request and answers
-`INVALID_CONFIG` for a bucket or region name that could alter the host name, empty credentials, a
-malformed endpoint, a non-positive timeout, a CA certificate that is not a PEM certificate, or an
+`INVALID_CONFIG` for a bucket or region name that could alter the host name, empty credentials
+when there is no credential provider, a malformed endpoint, a non-positive timeout, a CA certificate that is not a PEM certificate, or an
 `http://` endpoint whose host is not loopback. Plain
 HTTP would expose the access key id, object keys, metadata and payloads, and let anyone on the path
 replay a request for the 15 minutes its signature is valid.
@@ -203,6 +239,7 @@ replay a request for the 15 minutes its signature is valid.
 | any other S3 code, verbatim (`AccessDenied`, `NoSuchBucket`, `SignatureDoesNotMatch`, `InvalidAccessKeyId`, `PermanentRedirect`, `SlowDown`, ...) | the `<Code>` of S3's `Error` document |
 | `HTTP_<status>` | a response without an S3 error document (a HEAD, or a proxy's error page) |
 | `CONNECTION_FAILED` | no response: connection refused, TLS failure, timeout |
+| `CREDENTIALS_UNAVAILABLE` | the credential provider had no credentials; nothing was sent |
 | `LIST_ERROR` | a listing that is not a valid `ListBucketResult` |
 
 ## Surprises
@@ -283,9 +320,28 @@ Errors:
   the backend, which answers `Err(INVALID_ARGUMENT)` for the two ranges and does not check the
   content type.
   Validate before calling.
-- **Requests are not retried, and a timeout does not undo the request.** `SlowDown`, 5xx answers and
-  timeouts reach the caller as errors. A `put` that is `CONNECTION_FAILED` after `requestTimeoutMs` may
-  still have been stored.
+- **Failed requests are sent again, up to three attempts.** Throttling (`SlowDown`,
+  `RequestLimitExceeded`, HTTP 429 and 503), server failures (HTTP 500, 502, 504, `InternalError`,
+  `RequestTimeout`), a refused or cut connection and a timeout are retried; every other answer
+  (`AccessDenied`, `NoSuchKey`, a 301) is returned at once. Put, get, head, delete and list are
+  idempotent, so repeating one after an unknown outcome changes nothing. The error returned is the
+  last attempt's. Each attempt has its own `requestTimeoutMs`, is signed again with the current
+  date and the current credentials, and is preceded by a wait: up to 100 ms, then up to 200 ms
+  (full jitter, doubling, 20 s at most), or what `Retry-After` / `x-amz-retry-after` asks for when
+  that is longer. The worst case of one call is therefore three timeouts plus the waits.
+  `withRetry` changes the policy and `withoutRetries()` restores one attempt.
+- **`createBucket` is the exception**: a second CreateBucket would report "already owned" for the
+  bucket the first one created, so it is sent again only after throttling or a connection that
+  could not be opened, never after a 5xx, a cut connection or a timeout (`S3Client.sendUnrepeatable`).
+- **A timeout does not undo the request.** A `put` that is `CONNECTION_FAILED` after its attempts
+  timed out may still have been stored.
+- **Clock skew is not corrected.** `RequestTimeTooSkewed` is returned, not retried.
+- **A credential provider is asked before every attempt**, on the calling thread. An uncached
+  provider that calls a service makes every request pay for that call; `Aws.Credentials.cached`
+  avoids it. When the provider has nothing, the operation is `CREDENTIALS_UNAVAILABLE` and no
+  request is made.
+- **A request is not retried because its credentials expired.** `ExpiredToken` is returned; the
+  cache replaces credentials by the clock, five minutes ahead of their expiry.
 
 Presigned URLs:
 
@@ -295,7 +351,10 @@ Presigned URLs:
 - **It is signed with the local clock**, as every request is; a clock more than 15 minutes off is
   `RequestTimeTooSkewed`.
 - **With temporary credentials the session token is part of the URL**, and the URL stops working when
-  those credentials expire, whatever `expiresInSeconds` says.
+  those credentials expire, whatever `expiresInSeconds` says. With a credential provider the URL is
+  signed with the credentials current at that moment.
+- **`S3Client.presign` returns a `Result`** (it was a plain `String`): resolving the credentials can
+  fail (`CREDENTIALS_UNAVAILABLE`).
 - **Only the host is signed.** A presigned PUT accepts any content type and any size.
 
 Memory and transport:
@@ -325,7 +384,8 @@ Memory and transport:
 The other packages are public for an operation this package does not wrap:
 
 - `Storage.S3.Client`: `S3Config`, `S3Client` and its methods (`putObject`, `getObject`, `headObject`,
-  `deleteObject`, `listObjects`, `presign`), the signed-request primitive `S3Client.send`, `faultOf`,
+  `deleteObject`, `listObjects`, `presign`, `currentCredentials`), the signed-request primitives
+  `S3Client.send` (retried as an idempotent request) and `S3Client.sendUnrepeatable`, `faultOf`,
   and the validators (`isValidBucketName`, `isValidRegion`, `isLoopbackAuthority`, `userMetaProblem`).
   These methods do not validate keys.
 - `Storage.S3.SigV4`: re-exports `Aws.SigV4` (`Pair`, `Credentials`, `signRequest`, `presignQuery`,
@@ -359,6 +419,17 @@ The default run is hermetic and needs no network:
   CA, gets `CONNECTION_FAILED` and never reaches the server. The certificates and the key in the
   file are labelled test fixtures. It listens on the loopback ports 19471 to 19477, which must be
   free.
+  Retries and credentials (ports 19531 to 19533): keys that answer `SlowDown` twice and then
+  succeed, once with `Retry-After`, a 500 once, `SlowDown` always, `AccessDenied`; the server counts
+  the attempts, and the policy's sleep and random source are injected, so the waits are asserted
+  exactly (100 ms, 200 ms; 1000 ms for `Retry-After: 1`) and nothing sleeps. CreateBucket is shown
+  not to be repeated after a 500 and to be repeated after throttling. A provider whose credentials
+  change when an injected clock reaches the refresh window: the server accepts a second, temporary
+  key and reports which key signed the last request, so the test sees the request after the
+  refresh signed with the new key and its session token. `configFromEnvironment` with an
+  environment made of a map: environment keys, a profile's keys, region, endpoint and CA bundle,
+  an SSO profile refused; and a bucket configured from a profile storing and reading an object.
+- `tests/readme_tests.l`: the credential provider and retry examples of this README.
 
 Integration tests run against a real S3-compatible server and are compiled only with
 `--features integration`:
@@ -392,7 +463,7 @@ fetched by a client without credentials, and S3's own error codes, on both targe
 | | |
 |---|---|
 | SDK / native libraries | none |
-| `Lyric.Aws.SigV4` | the version in this repository (`aws-sigv4/`) |
+| `Lyric.Aws.SigV4`, `Lyric.Aws.Credentials` | the versions in this repository (`aws-sigv4/`, `aws-credentials/`) |
 | `Lyric.Storage`, `Lyric.Testing`, standard library | the `lyric-lang` commit in `.lyric-lang-rev`, through the root `[workspace.overrides]`. The package needs `Std.Http.withBytesBody`, `HttpResponse.headerNames` and (for the tests) `Std.HttpServer.requestBodyBytes`, added in nichobbs/lyric-lang#9047 and not in a release yet |
 | MinIO (integration suite) | `github.com/minio/minio@v0.0.0-20260212201848-7aac2a2c5b7c`, single node, built from that module version by `scripts/ci/start-minio.sh` |
 
@@ -401,7 +472,7 @@ local emulator, in the `aws-emulator` CI job (all four integration tests, both t
 
 ```sh
 set -a; eval "$(bash scripts/ci/start-aws-emulator.sh)"; set +a
-bash scripts/ci/test-aws-emulator.sh dotnet     # or jvm; runs mq-sqs and storage-s3
+bash scripts/ci/test-aws-emulator.sh dotnet     # or jvm; runs aws-credentials, mq-sqs and storage-s3
 ```
 
 It verifies signatures against a key generated at start, takes the bucket in the path only, and
@@ -421,9 +492,12 @@ hand.
   upload, no streaming, no range reads. `Std.Http` buffers bodies too.
 - No server-side encryption headers, object tagging, versioning, ACLs, or batch delete. `list` has no
   delimiter.
-- Credentials are static: there is no IMDS, ECS, SSO or `~/.aws/credentials` provider chain and no
-  refresh of temporary credentials. Build a new client when a session token is renewed.
-- Requests are not retried. S3's `SlowDown` and 5xx answers reach the caller as errors.
+- No IAM Identity Center (SSO) credentials and no `role_arn` profiles; see the Known gaps of
+  `aws-credentials/README.md`. The container, instance metadata and web identity providers have
+  been run against in-process fakes only, not on ECS, EKS or EC2.
+- Retries have no retry quota and no clock-skew correction, and a request refused with
+  `ExpiredToken` is not sent again with fresh credentials.
+- A `ca_bundle` / `AWS_CA_BUNDLE` file holding more than one certificate is untested.
 - A presigned URL is signed with the local clock, as every request is; a clock more than 15
   minutes off is `RequestTimeTooSkewed`.
 - The interface's `requires:` clauses are enforced on `jvm` and not on `dotnet` for this backend (see
