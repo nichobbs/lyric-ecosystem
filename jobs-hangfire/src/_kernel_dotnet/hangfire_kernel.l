@@ -4,7 +4,7 @@
 //! Every binding is an `extern type` plus auto-FFI against the Hangfire
 //! assemblies restored from NuGet; there is no host shim.  The kernel owns:
 //!
-//!   - the job storages (`Hangfire.InMemory`, `Hangfire.Storage.SQLite`),
+//!   - the job storages (`Hangfire.InMemory`, `Hangfire.PostgreSql`),
 //!   - job creation.  Hangfire normally takes a C# expression tree; here a
 //!     job is built from `Hangfire.Storage.InvocationData`, the same four
 //!     strings Hangfire stores for every job (type, method, parameter types,
@@ -191,19 +191,47 @@ pub func inMemoryStorage(): Result[NStorage, String] {
   }
 }
 
-extern type NSqlite = "Hangfire.Storage.SQLite.SQLiteStorage"
+extern type NPostgres = "Hangfire.PostgreSql.PostgreSqlStorage"
 
-extern type NSqliteOptions = "Hangfire.Storage.SQLite.SQLiteStorageOptions"
+extern type NPostgresOptions = "Hangfire.PostgreSql.PostgreSqlStorageOptions"
 
-/// A storage in the SQLite database file `path`, created when missing.
-pub func sqliteStorage(path: in String, queuePollIntervalMs: in Int): Result[NStorage, String]
-  requires: path.length > 0
-  requires: queuePollIntervalMs >= 1
+extern type NPostgresFactory = "Hangfire.PostgreSql.Factories.NpgsqlConnectionFactory"
+
+extern type NConnectionFactory = "Hangfire.PostgreSql.IConnectionFactory"
+
+/// A storage in the PostgreSQL database `connectionString` (an Npgsql
+/// connection string) names, in the schema `schemaName`.  With
+/// `prepareSchema` the schema and its tables are created or upgraded now;
+/// without, they must exist.  The database is read once before returning.
+/// Workers look for new jobs every `queuePollIntervalMs`.  The `Err` text
+/// is the driver's message and is not screened for secrets here; the caller
+/// does that.
+pub func postgresStorage(
+  connectionString: in String,
+  schemaName: in String,
+  queuePollIntervalMs: in Int,
+  prepareSchema: in Bool,
+): Result[NStorage, String]
+  requires: connectionString.length > 0
+  requires: schemaName.length > 0
+  requires: queuePollIntervalMs >= 50
 {
   try {
-    val options = NSqliteOptions.new()
+    val options = NPostgresOptions.new()
+    options.SchemaName = schemaName
     options.QueuePollInterval = NTimeSpan.FromMilliseconds(queuePollIntervalMs.toDouble())
-    val s: NStorage = NSqlite.new(path, options)
+    options.PrepareSchemaIfNecessary = prepareSchema
+    // The storage's default is to retry a failed start five times with a
+    // growing delay and then to carry on without a database; a caller here
+    // is told at once instead.
+    options.StartupConnectionMaxRetries = 0
+    val factory: NConnectionFactory = NPostgresFactory.new(connectionString, options)
+    val s: NStorage = NPostgres.new(factory, options)
+    // One read, so that a database that cannot be reached, or a schema that
+    // is not there, is an `Err` now and not at the first job.
+    val c = s.GetConnection()
+    val _ = jobDataOf(c, "0")
+    closeConnection(c)
     Ok(s)
   } catch Bug as b {
     Err(describe(b.typeName, b.message))
@@ -545,13 +573,12 @@ pub func deleteJob(storage: in NStorage, jobId: in String, expectedState: in Str
 /// The name of the state job `jobId` is in; `None` for a job the storage
 /// does not have, "" for a job that is being created and has no state yet.
 ///
-/// This is the state in the job's own record (`GetJobData`), not the latest
-/// entry of its state history (`GetStateData`).  When a filter replaces the
-/// state Hangfire was about to apply, as `Elector` does to retry a failed
-/// attempt, Hangfire still writes the replaced state to the history, and a
-/// storage may answer `GetStateData` from the history: Hangfire.Storage.SQLite
-/// does, and writes the two in separate statements, so that a job being
-/// retried reads as `Failed` for a moment there.
+/// This is the state in the job's own record (`GetJobData`), not what
+/// `GetStateData` answers.  When a filter replaces the state Hangfire was
+/// about to apply, as `Elector` does to retry a failed attempt, Hangfire
+/// still writes the replaced state to the job's state history, and a storage
+/// may answer `GetStateData` from the history (Hangfire.Storage.SQLite does),
+/// so that a job being retried reads as `Failed` for a moment there.
 pub func jobState(storage: in NStorage, jobId: in String): Result[Option[String], String] {
   try {
     val c = storage.GetConnection()

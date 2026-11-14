@@ -77,6 +77,13 @@ func hangfireOnly(sched: in Hangfire.HangfireJobScheduler): Result[Unit, String]
   Ok(())
 }
 
+// Compiled here, run by the integration suites: it needs a PostgreSQL.
+func persistent(connectionString: in String): Result[Hangfire.HangfireJobScheduler, String] {
+  val options = Hangfire.defaultPostgresOptions().copy(schemaName = "billing_jobs", queuePollIntervalMs = 500)
+  val storage = Hangfire.postgresStorage(connectionString, options)?
+  Hangfire.create(Hangfire.defaultConfig(), storage)
+}
+
 func statusName(st: in Jobs.JobStatus): String {
   match st {
     case Jobs.JobStatus.Pending -> "Pending"
@@ -84,6 +91,16 @@ func statusName(st: in Jobs.JobStatus): String {
     case Jobs.JobStatus.Succeeded -> "Succeeded"
     case Jobs.JobStatus.Failed -> "Failed"
     case Jobs.JobStatus.Cancelled -> "Cancelled"
+  }
+}
+
+test "the PostgreSQL example reports a server that is not there" {
+  match persistent("Host=127.0.0.1;Port=1;Database=app;Username=jobs;Password=example-only;Timeout=3") {
+    case Ok(_) -> panic("nothing listens on port 1")
+    case Err(e) -> {
+      assertTrue(e.length > 0, "an Err")
+      assertFalse(e.contains("example-only"), "without the password")
+    }
   }
 }
 

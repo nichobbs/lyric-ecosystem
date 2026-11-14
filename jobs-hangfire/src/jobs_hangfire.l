@@ -45,11 +45,11 @@ import Jobs.Hangfire.Kernel.Dotnet as Kernel
 
 // ─── Storage ──────────────────────────────────────────────────────────────────
 /// A Hangfire job storage.  Build one with `inMemoryStorage` or
-/// `sqliteStorage`; several schedulers, in one process or in several, may
+/// `postgresStorage`; several schedulers, in one process or in several, may
 /// share one.
 pub record HangfireStorage {
   native: Kernel.NStorage
-  /// "in-memory" or "sqlite".
+  /// "in-memory" or "postgresql".
   kind: String
 }
 
@@ -62,17 +62,84 @@ pub func inMemoryStorage(): Result[HangfireStorage, String] {
   }
 }
 
-/// A storage in the SQLite database file `path` (`Hangfire.Storage.SQLite`),
-/// created when missing.  Jobs survive the process.  Workers look for new
-/// jobs every `queuePollIntervalMs`.  Needs the native library `e_sqlite3`
-/// on the library search path; see the README.
-pub func sqliteStorage(path: in String, queuePollIntervalMs: in Int): Result[HangfireStorage, String]
-  requires: path.length > 0
-  requires: queuePollIntervalMs >= 1
+/// Settings of a PostgreSQL storage.
+pub record PostgresOptions {
+  /// The schema that holds Hangfire's tables: a lowercase letter or `_`,
+  /// then lowercase letters, digits and `_`.  Applications that use
+  /// different schemas can share a database without seeing each other's
+  /// jobs.
+  schemaName: String
+  /// How often an idle worker looks for a new job.
+  queuePollIntervalMs: Int
+  /// Create the schema and its tables when they are missing, and upgrade
+  /// them when they are older than the storage expects.  Without it the
+  /// schema must exist already.
+  prepareSchema: Bool
+  invariant: queuePollIntervalMs >= 50
+}
+
+/// Schema `hangfire`, a look at the queue every second, and the schema
+/// created when missing.
+pub func defaultPostgresOptions(): PostgresOptions {
+  PostgresOptions(schemaName = "hangfire", queuePollIntervalMs = 1000, prepareSchema = true)
+}
+
+func validSchemaName(name: in String): Bool {
+  if name.length == 0 or name.length > 63 {
+    return false
+  }
+  var i = 0
+  while i < name.length {
+    val c = Str.codeUnitAt(name, i)
+    val lower = c >= 97 and c <= 122
+    val digit = c >= 48 and c <= 57
+    if not lower and c != 95 and not (digit and i > 0) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+// `message` without anything that came from `connectionString`: the string
+// itself, and the value of every `key=value` part of it.  A driver message
+// may quote either, and the string holds the password.
+func withoutSecrets(message: in String, connectionString: in String): String {
+  var clean = Str.replace(message, connectionString, "<connection string>")
+  for part in Str.split(connectionString, ";") {
+    match Str.indexOf(part, "=") {
+      case None -> ()
+      case Some(at) -> {
+        val key = Str.toLower(Str.trim(Str.substring(part, 0, at)))
+        val value = Str.trim(Str.substring(part, at + 1))
+        if (key == "password" or key == "pwd") and value.length > 0 {
+          clean = Str.replace(clean, value, "<password>")
+        }
+      }
+    }
+  }
+  clean
+}
+
+/// A storage in a PostgreSQL database (`Hangfire.PostgreSql`).  Jobs survive
+/// the process and are shared by every process that opens the same database
+/// and schema.  `connectionString` is an Npgsql connection string
+/// (`Host=...;Port=...;Database=...;Username=...;Password=...`); it is never
+/// part of an `Err`.  The database is contacted at once: `Err` when it
+/// cannot be reached, the login is refused, or the schema is missing and
+/// `options.prepareSchema` is false.
+pub func postgresStorage(connectionString: in String, options: in PostgresOptions): Result[HangfireStorage, String]
+  requires: connectionString.length > 0
 {
-  match Kernel.sqliteStorage(path, queuePollIntervalMs) {
-    case Ok(native) -> Ok(HangfireStorage(native = native, kind = "sqlite"))
-    case Err(e) -> Err("hangfire: cannot open the SQLite storage '" + path + "': " + e)
+  if not validSchemaName(options.schemaName) {
+    return Err(
+      "hangfire: invalid schema name '" + options.schemaName +
+        "': use a lowercase letter or '_', then lowercase letters, digits and '_'"
+    )
+  }
+  match Kernel.postgresStorage(connectionString, options.schemaName, options.queuePollIntervalMs, options.prepareSchema) {
+    case Ok(native) -> Ok(HangfireStorage(native = native, kind = "postgresql"))
+    case Err(e) -> Err("hangfire: cannot open the PostgreSQL storage: " + withoutSecrets(e, connectionString))
   }
 }
 

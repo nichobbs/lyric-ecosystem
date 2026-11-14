@@ -14,7 +14,7 @@ share a storage, and with a persistent storage jobs outlive the process.
 | Targets | `dotnet` only (`[package] targets = ["dotnet"]`; `--target jvm` fails with `F0054`) |
 | Stability | `experimental`, 0.1.0 |
 | Interface | `Lyric.Jobs` (`Jobs.JobScheduler`, `Jobs.JobHandler`), re-exported with `pub use Jobs` |
-| Storages | In memory (`Hangfire.InMemory`); SQLite file (`Hangfire.Storage.SQLite`), which needs a native library on the search path, see [SQLite storage](#sqlite-storage) |
+| Storages | In memory (`Hangfire.InMemory`); PostgreSQL (`Hangfire.PostgreSql`), see [PostgreSQL storage](#postgresql-storage) |
 | Lyric packages | `Jobs.Hangfire` (`src/jobs_hangfire.l`): storages, the scheduler, handlers, lifecycle. `Jobs.Hangfire.Native` (`src/native.l`): Hangfire-only features. `Jobs.Hangfire.Store` (`src/store.l`): what is kept in the storage and how statuses are read from it. `Jobs.Hangfire.Kernel.Dotnet` (`src/_kernel_dotnet/hangfire_kernel.l`): every .NET extern |
 
 ## Usage
@@ -144,7 +144,7 @@ Storage, passed to `create`:
 | Function | |
 |---|---|
 | `Hangfire.inMemoryStorage()` | A new, empty storage in process memory. Jobs are lost when the process exits |
-| `Hangfire.sqliteStorage(path, queuePollIntervalMs)` | The SQLite database file `path`, created when missing. Workers look for new jobs every `queuePollIntervalMs` (at least 1; Hangfire.Storage.SQLite's own default is 15000). See [SQLite storage](#sqlite-storage) |
+| `Hangfire.postgresStorage(connectionString, options)` | A PostgreSQL database, named by an Npgsql connection string. Jobs survive the process and are shared by every process on the same database and schema. See [PostgreSQL storage](#postgresql-storage) |
 | `Hangfire.keepFinishedJobsFor(storage, ms)` | How long the storage keeps a job after it succeeded or was cancelled (Hangfire's default: one day). Applies to jobs that finish afterwards, in this process |
 
 `HangfireConfig`; start from `Hangfire.defaultConfig()` and `.copy(...)`:
@@ -166,20 +166,32 @@ Hangfire logs through its own `LogProvider`. The package configures no logger, s
 output is discarded. Hangfire's process-wide settings (`GlobalConfiguration`, `JobStorage.Current`,
 `GlobalJobFilters`) are neither read nor changed.
 
-### SQLite storage
+### PostgreSQL storage
 
-`Hangfire.Storage.SQLite` calls the native library `e_sqlite3` (NuGet package
-`SQLitePCLRaw.lib.e_sqlite3`). `lyric restore` downloads it, but `lyric build`, `lyric run` and
-`lyric test` do not copy native NuGet assets next to the program, so the library has to be put on the
-operating system's library search path by hand. On Linux x64:
-
-```sh
-export LD_LIBRARY_PATH="$HOME/.nuget/packages/sqlitepclraw.lib.e_sqlite3/2.1.14/runtimes/linux-x64/native:$LD_LIBRARY_PATH"
+```lyric
+func persistent(connectionString: in String): Result[Hangfire.HangfireJobScheduler, String] {
+  val options = Hangfire.defaultPostgresOptions().copy(schemaName = "billing_jobs", queuePollIntervalMs = 500)
+  val storage = Hangfire.postgresStorage(connectionString, options)?
+  Hangfire.create(Hangfire.defaultConfig(), storage)
+}
 ```
 
-Without it `sqliteStorage` is an `Err` (`TypeInitializationException: The type initializer for
-'SQLite.SQLiteConnection' threw an exception`). The in-memory storage needs nothing of the kind. This
-has been run on Linux x64 only.
+`connectionString` is an [Npgsql connection string](https://www.npgsql.org/doc/connection-string-parameters.html),
+for example `Host=db.internal;Port=5432;Database=app;Username=jobs;Password=...`. It holds the
+password: take it from a `config { }` block or the environment, never from source. It is never part of
+an `Err`; a driver message that quotes it is cleaned first.
+
+`PostgresOptions`; start from `Hangfire.defaultPostgresOptions()` and `.copy(...)`:
+
+| Field | Default | Meaning |
+|---|---|---|
+| `schemaName` | `hangfire` | The schema that holds Hangfire's tables: a lowercase letter or `_`, then lowercase letters, digits and `_`, at most 63 characters; anything else is an `Err`. Applications with different schemas share a database without seeing each other's jobs |
+| `queuePollIntervalMs` | 1000 | How often an idle worker looks for a new job (at least 50; Hangfire.PostgreSql's own default is 15000) |
+| `prepareSchema` | true | Create the schema and its tables when missing, and upgrade them when older than the storage expects. With false the schema must exist, and the database user needs no right to create one |
+
+`postgresStorage` contacts the database before it returns: a server that cannot be reached, a refused
+login and a missing schema with `prepareSchema = false` are an `Err` at once. (Hangfire.PostgreSql's
+own default is to retry five times and then carry on without a database; that is switched off.)
 
 ## Surprises
 
@@ -187,23 +199,30 @@ Where the jobs are:
 
 - **Everything is in the storage.** `status`, `results` and `cancel` are storage reads and writes. Any
   scheduler on the same storage can report or cancel any job, whichever scheduler submitted it.
-- **A job id is Hangfire's own id, and only unique within a storage.** With the in-memory and SQLite
-  storages ids are `1`, `2`, `3`, ...; two storages hand out the same ids.
+- **A job id is Hangfire's own id, and only unique within a storage.** Ids are `1`, `2`, `3`, ...; two
+  in-memory storages, or two PostgreSQL schemas, hand out the same ids.
+- **PostgreSQL: twelve tables in the schema.** With `prepareSchema` the storage creates the schema and
+  the tables `aggregatedcounter`, `counter`, `hash`, `job`, `jobparameter`, `jobqueue`, `list`, `lock`,
+  `schema`, `server`, `set` and `state` (schema version 23 with Hangfire.PostgreSql 1.21.1), and
+  upgrades an older layout in place. This package adds no tables of its own: what it keeps (job
+  parameters `lyric.*`, sets `lyric:*`) lives in those. Nothing drops the schema.
+- **PostgreSQL: a hand-over can take up to a second.** When a worker fetches a job whose lock another
+  Hangfire thread still holds (a delayed job that just came due, a retry, a continuation), it tries
+  again every second at most. Measured on two cores under CPU load: 1440 delayed jobs with a
+  continuation each, in batches of four, the slowest batch done 3.0 s after it was submitted (the
+  delay itself is between 1 and 2 s).
 - **Hangfire forgets finished jobs.** A job that succeeded or was cancelled is removed by Hangfire one
   day later (`keepFinishedJobsFor` changes that); from then on `status` and `results` answer
   `Err("job not found: <id>")`. A `Failed` job is kept. `Hangfire.InMemory` has an upper limit of its
-  own for the retention (three hours by default, its `MaxExpirationTime`; from its source, not
-  exercised by the tests).
+  own for the retention (three hours by default, its `MaxExpirationTime`). On PostgreSQL an expired
+  job stays readable until a server's clean-up pass deletes it, which runs once an hour and only while
+  a server runs. (Both from the storages' source, not exercised by the tests.)
 - **The status is Hangfire's state.** `Enqueued`, `Scheduled` and `Awaiting` are `Pending`,
   `Processing` is `Running`, `Deleted` is `Cancelled`. A job that waits for its next attempt is
   `Pending` again; it is never reported `Failed` between attempts.
-- **Hangfire's own tools can show a retried job as `Failed` for a moment on SQLite.** The status is
-  read from the job's record. Hangfire also keeps a state history, and when an attempt fails and is
-  retried, the `Failed` state Hangfire was about to apply is written to that history before the job
-  goes back to its queue. `Hangfire.Storage.SQLite` answers Hangfire's `GetStateData` from the history
-  and writes the two in separate statements, so code that asks Hangfire directly (not through this
-  package) can see `Failed` for an instant. The history of a job that was retried shows a `Failed`
-  entry per failed attempt on every storage.
+- **Hangfire's state history shows a `Failed` entry per failed attempt.** When an attempt fails and
+  is retried, Hangfire writes the `Failed` state it was about to apply to the job's history before the
+  job goes back to its queue. The status is read from the job's own record, so it does not show that.
 - **A newly enqueued job is not reliably `Pending`** on a started scheduler: a worker may take it
   before `enqueue` returns. It is `Pending` for certain only while no server runs on its queue or
   every worker is busy.
@@ -319,7 +338,7 @@ Lifecycle:
 | | Quartz packages | `lyric-jobs-hangfire` |
 |---|---|---|
 | Where jobs, statuses and results live | In the scheduler object | In the Hangfire storage, shared by every scheduler on it |
-| Persistence | None | With `sqliteStorage` |
+| Persistence | None | With `postgresStorage` |
 | Before `start` | Standby: jobs accepted, nothing fires | Client: the same, and another scheduler's server may run the jobs |
 | After `shutdown` | Final; submissions are an `Err` | Client again; `start` may be called again |
 | Retries | Inside one firing, on the same worker | The job goes back to the queue (or to `Scheduled`) between attempts |
@@ -384,24 +403,34 @@ and a half.
   jobs, continuations, queues across schedulers that share a storage, counts.
 - `tests/readme_examples_tests.l`: the examples of this file.
 
-The integration suite runs the backend on a SQLite storage, including jobs, schedules and results
-that survive closing and reopening the database file, and the same continuous status read through
-sixteen attempts. It is compiled only with `--features
-integration` and needs:
+The integration suites run the backend on a real PostgreSQL. They are compiled only with `--features
+integration` and need:
 
 | Variable | |
 |---|---|
-| `LYRIC_HANGFIRE_SQLITE_DIR` | A writable directory for database files; each test creates one named after a fresh UUID. Unset, the suite fails with a message naming the variable |
-| `LD_LIBRARY_PATH` | Must include the directory of `libe_sqlite3.so` (see [SQLite storage](#sqlite-storage)) |
+| `LYRIC_HANGFIRE_POSTGRES` | An Npgsql connection string for a database the suites may create schemas in. Unset, they fail with a message naming the variable |
 
 ```sh
-eval "$(scripts/ci/start-hangfire-sqlite.sh)"
+eval "$(scripts/ci/start-hangfire-postgres.sh)"
 lyric test --manifest jobs-hangfire/lyric.toml --target dotnet --features integration
 ```
 
-`scripts/ci/start-hangfire-sqlite.sh` starts no server: it copies the native library for the runner's
-architecture out of the NuGet cache, creates a temporary database directory, and exports the two
-variables (through `$GITHUB_ENV` under GitHub Actions).
+`scripts/ci/start-hangfire-postgres.sh` starts a disposable PostgreSQL on `127.0.0.1:19485` (override:
+`LYRIC_HANGFIRE_POSTGRES_PORT`) with a fresh data directory and a generated password, creates the
+database `hangfire_it`, and exports the variable (through `$GITHUB_ENV`, password masked, under
+GitHub Actions). It uses the installed server binaries, installing the `postgresql` package when there
+are none, and runs the server as the `postgres` user when the script is root. Use a disposable
+database: every test creates a schema `lyric_it_<uuid>` and leaves it there.
+
+- `tests/integration/postgres_integration_tests.l`: the conformance suite; jobs that run, retry, fail
+  and are cancelled; a delayed job and its continuation; the status read continuously through sixteen
+  attempts; a recurring job; jobs, schedules and results that survive closing and reopening the
+  storage; two schemas side by side; what `postgresStorage` refuses, and that no error carries the
+  password.
+- `tests/integration/postgres_handover_write_tests.l` and `postgres_handover_read_tests.l`:
+  persistence across processes. `lyric test` runs each test module as a program of its own, in
+  manifest order. The first submits jobs to the schema `lyric_it_handover` without starting a server
+  and exits; the second, a new process, finds them still pending, runs them and reads their results.
 
 `lyric build --manifest jobs-hangfire/lyric.toml --target jvm` fails with `F0054`, as intended.
 
@@ -411,18 +440,22 @@ variables (through `$GITHUB_ENV` under GitHub Actions).
 |---|---|
 | Hangfire | NuGet `Hangfire.Core` 1.8.25 |
 | In-memory storage | NuGet `Hangfire.InMemory` 1.0.0 |
-| SQLite storage | NuGet `Hangfire.Storage.SQLite` 0.4.3 |
-| Native SQLite | NuGet `SQLitePCLRaw.lib.e_sqlite3` 2.1.14, pinned above the 2.1.11 that `Hangfire.Storage.SQLite` asks for, which NuGet reports as vulnerable (GHSA-2m69-gcr7-jv3q) |
-| Resolved transitively | `Newtonsoft.Json` 13.0.4, `SQLitePCLRaw.bundle_green`, `.core` and `.provider.e_sqlite3` 2.1.11, `sqlite-net-pcl` 1.9.172 |
+| PostgreSQL storage | NuGet `Hangfire.PostgreSql` 1.21.1 |
+| JSON | NuGet `Newtonsoft.Json` 13.0.4, pinned above the 11.0.1 that `Hangfire.Core` asks for, which NuGet reports as vulnerable (GHSA-5crp-9r3c-p9vr) |
+| Resolved transitively | `Npgsql` 6.0.11, `Dapper` 2.0.123, `Dapper.AOT` 1.0.48 |
+| PostgreSQL server | Tested against 16.15 |
 | .NET | `net10.0` |
 | Interface and conformance suite | `Lyric.Jobs` and `Lyric.Testing` at the `lyric-lang` commit in `.lyric-lang-rev`, through the root `[workspace.overrides]` |
 
 ## Known gaps
 
-- Storages: in memory and SQLite only. Hangfire's SQL Server, PostgreSQL and Redis storages are not
-  exposed.
-- The SQLite storage needs its native library put on the search path by hand, because the toolchain
-  does not deploy native NuGet assets (below); it has been run on Linux x64 only.
+- Storages: in memory and PostgreSQL only. Hangfire's SQL Server and Redis storages are not exposed.
+- SQLite is not offered. `Hangfire.Storage.SQLite` 0.4.3 was tried and removed: its distributed lock
+  (`SQLiteDistributedLock.Acquire`) can lose the wake-up of a waiting thread, which holds a job back
+  for 90 s, and its `GetStateData` reports a retried job as `Failed` for a moment.
+- PostgreSQL: the storage's other settings (invisibility timeout, lock timeout, clean-up interval) are
+  left at Hangfire.PostgreSql's defaults, and connections are made from the connection string only
+  (no data source, no client certificates beyond what the string can say).
 - A running handler cannot be stopped on timeout or cancel (see Surprises); `Jobs.JobHandler` would
   need a cancellation token for that.
 - Recurring jobs are evaluated in UTC; there is no time zone setting. Hangfire's misfire handling is
@@ -456,6 +489,7 @@ variables (through `$GITHUB_ENV` under GitHub Actions).
     annotated with the interface.
   - `lyric build`/`run`/`test` do not copy the native runtime assets of a NuGet package
     (`runtimes/<rid>/native/`), and `lyric restore` accepts such a package without the `B0031` that
-    `docs/21-nuget-linking.md` describes. This is why the SQLite storage needs `LD_LIBRARY_PATH`.
+    `docs/21-nuget-linking.md` describes (met with the SQLite storage; nothing in the package needs
+    a native library now).
   - `{ workspace = true }` dependencies resolve for `lyric test` only when it is run from the workspace
     root (lyric-lang#9040).

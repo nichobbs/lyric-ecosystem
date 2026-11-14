@@ -23,12 +23,15 @@ output_assembly = "Jobs.Hangfire.dll"
 "Jobs.Hangfire.ExecutionTests"   = "tests/execution_tests.l"
 "Jobs.Hangfire.NativeTests"      = "tests/native_tests.l"
 "Jobs.Hangfire.ReadmeExamplesTests" = "tests/readme_examples_tests.l"
-# Needs the native SQLite library and a database directory: file-level
-# `@cfg(feature = "integration")`, so a plain `lyric test` skips it.
-"Jobs.Hangfire.SqliteIntegrationTests" = "tests/integration/sqlite_integration_tests.l"
+# Need a real PostgreSQL: file-level `@cfg(feature = "integration")`, so a
+# plain `lyric test` skips them.  The last two run in this order, each in a
+# process of its own: the second reads what the first left in the database.
+"Jobs.Hangfire.PostgresIntegrationTests" = "tests/integration/postgres_integration_tests.l"
+"Jobs.Hangfire.PostgresHandoverWriteTests" = "tests/integration/postgres_handover_write_tests.l"
+"Jobs.Hangfire.PostgresHandoverReadTests" = "tests/integration/postgres_handover_read_tests.l"
 
 [features]
-integration = []   # run tests/integration on a SQLite storage in LYRIC_HANGFIRE_SQLITE_DIR
+integration = []   # run tests/integration against the PostgreSQL named by LYRIC_HANGFIRE_POSTGRES
 
 [dependencies]
 # The interface and its conformance suite, resolved through the root
@@ -40,5 +43,8 @@ integration = []   # run tests/integration on a SQLite storage in LYRIC_HANGFIRE
 # Hangfire server, client and state machine; the in-memory job storage.
 "Hangfire.Core"     = "1.8.25"
 "Hangfire.InMemory" = "1.0.0"
-"Hangfire.Storage.SQLite" = "0.4.3"
-"SQLitePCLRaw.lib.e_sqlite3" = "2.1.14"
+# Hangfire.Core asks for Newtonsoft.Json 11.0.1 or later, which NuGet reports
+# as vulnerable (GHSA-5crp-9r3c-p9vr).
+"Newtonsoft.Json" = "13.0.4"
+# The PostgreSQL job storage (Npgsql underneath; managed code only).
+"Hangfire.PostgreSql" = "1.21.1"

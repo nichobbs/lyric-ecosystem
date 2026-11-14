@@ -17,7 +17,7 @@ interface's conformance suite on every target it claims.
 | `Lyric.Aws.Credentials` | `aws-credentials/` | (shared credential providers and retry policy) | environment, shared config and credentials files, `credential_process`, container endpoint, IMDSv2, web identity (STS); default chain with a refreshing cache | dotnet, jvm | pure Lyric; used by `Lyric.Storage.S3` and `Lyric.Mq.Sqs` |
 | `Lyric.Jobs.Quartz` | `jobs-quartz/` | `Jobs.JobScheduler` | Quartz | jvm | Quartz via Maven |
 | `Lyric.Jobs.QuartzNet` | `jobs-quartznet/` | `Jobs.JobScheduler` | Quartz.NET | dotnet | Quartz.NET via NuGet |
-| `Lyric.Jobs.Hangfire` | `jobs-hangfire/` | `Jobs.JobScheduler` | Hangfire (in-memory and SQLite storage) | dotnet | Hangfire via NuGet |
+| `Lyric.Jobs.Hangfire` | `jobs-hangfire/` | `Jobs.JobScheduler` | Hangfire (in-memory and PostgreSQL storage) | dotnet | Hangfire via NuGet |
 | `Lyric.Net` | `net/` | (shared TCP and TLS client connections, TLS options, URL authority parsing) | host sockets and TLS | dotnet, jvm, native | pure Lyric over one per-target socket kernel; used by `Lyric.Redis`, `Lyric.Mq.RabbitMq` and `Lyric.Mq.ActiveMq` |
 | `Lyric.Redis` | `redis/` | (client) | Redis | dotnet, jvm, native | pure Lyric (RESP over TCP) |
 | `Lyric.Cache.Redis` | `cache-redis/` | `Cache.CacheStore` | Redis | dotnet, jvm | on `Lyric.Redis` |
