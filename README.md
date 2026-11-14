@@ -16,6 +16,7 @@ interface's conformance suite on every target it claims.
 | `Lyric.Aws.SigV4` | `aws-sigv4/` | (shared signing) | AWS Signature V4 | dotnet, jvm, native | pure Lyric |
 | `Lyric.Jobs.Quartz` | `jobs-quartz/` | `Jobs.JobScheduler` | Quartz | jvm | Quartz via Maven |
 | `Lyric.Jobs.QuartzNet` | `jobs-quartznet/` | `Jobs.JobScheduler` | Quartz.NET | dotnet | Quartz.NET via NuGet |
+| `Lyric.Jobs.Hangfire` | `jobs-hangfire/` | `Jobs.JobScheduler` | Hangfire (in-memory and SQLite storage) | dotnet | Hangfire via NuGet |
 | `Lyric.Net` | `net/` | (shared TCP and TLS client connections, TLS options, URL authority parsing) | host sockets and TLS | dotnet, jvm, native | pure Lyric over one per-target socket kernel; used by `Lyric.Redis`, `Lyric.Mq.RabbitMq` and `Lyric.Mq.ActiveMq` |
 | `Lyric.Redis` | `redis/` | (client) | Redis | dotnet, jvm, native | pure Lyric (RESP over TCP) |
 | `Lyric.Cache.Redis` | `cache-redis/` | `Cache.CacheStore` | Redis | dotnet, jvm | on `Lyric.Redis` |

@@ -131,6 +131,14 @@ jobs:
         working-directory: lyric-ecosystem
         run: bash scripts/ci/start-memcached.sh
 
+      # SQLite is a library, not a server: this puts the native e_sqlite3 from
+      # the NuGet cache on the library path (lyric-lang#9095) and makes a
+      # database directory.
+      - name: Prepare SQLite for jobs-hangfire
+        if: matrix.target == 'dotnet'
+        working-directory: lyric-ecosystem
+        run: bash scripts/ci/start-hangfire-sqlite.sh
+
       - name: Test packages against the services
         working-directory: lyric-ecosystem
         run: bash scripts/ci/test-packages.sh ${{ matrix.target }} --integration
