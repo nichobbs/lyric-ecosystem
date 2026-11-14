@@ -415,7 +415,7 @@ development, the runner's clang and OpenSSL 3 in CI.
   the failure text (see "How the kernels do TLS").
 - On `native` a program in which any package declares a record with the name of a union case that
   has fields, declared in any other package of the build, fails to compile (`N0007`, "missing
-  field"; not yet filed). The cases of this package with fields are `Data` (`Net.Tcp`), and in
+  field"; nichobbs/lyric-lang#9088). The cases of this package with fields are `Data` (`Net.Tcp`), and in
   `Net.Tcp.Kernel` `LockHeld`, `CarryBytes`, `CarryFailed`, `WireGot`, `WireBroken`.
 - Standard library and compiler issues behind the design, in `nichobbs/lyric-lang`:
   - [#9042](https://github.com/nichobbs/lyric-lang/issues/9042): `Std.TcpHost` has no JVM kernel and
