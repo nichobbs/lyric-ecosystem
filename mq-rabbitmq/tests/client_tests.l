@@ -16,7 +16,7 @@
 //!   virtual host `missing`        connection.close 530 NOT_ALLOWED
 //!   routing key `fail.drop`       a publish makes the broker close the socket
 //!   routing key `fail.silent`     a publish is accepted but never confirmed
-//!   routing key `fail.stall`      at basic.publish nothing is read for 8 s, then the socket closes
+//!   routing key `fail.stall`      at basic.publish nothing is read for 30 s, then the socket closes
 //!   routing key `fail.nack`       a publish is answered with basic.nack
 //!   routing key `fail.blocked`    a publish is answered with connection.blocked
 //!   queue `fail.dropconsume`      basic.consume is answered, then the socket closes
@@ -28,7 +28,14 @@
 //!
 //! and `FakeBroker.mode` changes the handshake: `mismatch` answers the
 //! protocol header with a protocol header, `old-version` announces AMQP 8-0,
-//! `no-plain` offers only EXTERNAL, `mute` never sends a heartbeat.
+//! `no-plain` offers only EXTERNAL, `mute` never sends a heartbeat, `down`
+//! closes every new connection at once, `hang` accepts a connection and says
+//! nothing, `deny` refuses every login with 403.
+//!
+//! `kickBroker` ends the broker's open connections, by closing their sockets
+//! or with a `connection.close` carrying a reply code, and the broker counts
+//! what it sees (connections, declarations, consumers, acknowledgements), so
+//! the tests of heartbeats and of recovery can say what went over the wire.
 //!
 //! The broker is started on plain TCP, behind TLS, and behind TLS with a
 //! required client certificate. The TLS ones use the TEST-ONLY certificates
@@ -59,7 +66,7 @@ import Mq.RabbitMq.Amqp as Amqp
 
 // ─── The fake broker ─────────────────────────────────────────────────────────
 // How long a broker stalled by `fail.stall` reads nothing.
-val STALL_MS: Int = 8000
+val STALL_MS: Int = 30000
 
 record Stored {
   properties: Amqp.Properties
@@ -106,6 +113,22 @@ ref record FakeBroker {
   var connectionName: String
   var cleanCloses: Int
   var largestFrame: Int
+  // Raised to end the open connections: with `kickCode` 0 their sockets are
+  // closed, otherwise they get a connection.close with that reply code.
+  var kick: Int
+  var kickCode: Int
+  var connectionsSeen: Int
+  var confirmSelectsSeen: Int
+  var queueDeclaresSeen: Int
+  var exchangeDeclaresSeen: Int
+  var bindsSeen: Int
+  var consumesSeen: Int
+  var lastPrefetch: Int
+  var publishesSeen: Int
+  var deliveriesSent: Int
+  var settlementsSeen: Int
+  // How many `fail.stall` pauses have run to their end.
+  var stallsEnded: Int
 }
 
 record Unacked {
@@ -116,6 +139,7 @@ record Unacked {
 ref record Session {
   broker: FakeBroker
   sock: K.Sock
+  var kick: Int
   var frameMax: Int
   var heartbeatMs: Long
   var lastBeat: Long
@@ -236,6 +260,7 @@ func pump(s: in Session): Unit {
         routingKey = q.name
       )
       sendContent(s, deliver, properties, stored.body)
+      b.deliveriesSent = b.deliveriesSent + 1
     }
   }
   K.lockExit(b.lock)
@@ -367,6 +392,7 @@ func finishPublish(s: in Session): Bool {
   if s.confirming {
     s.publishSeq = s.publishSeq + 1i64
   }
+  b.publishesSeen = b.publishesSeen + 1
   if key == "fail.drop" {
     return false
   }
@@ -505,7 +531,7 @@ func handleMethod(s: in Session, channel: in Int, m: in Amqp.Method): Bool {
       if user == "legacy" {
         return false
       }
-      if password == "wrong" {
+      if password == "wrong" or b.mode == "deny" {
         s.closing = true
         send(
           s,
@@ -568,11 +594,15 @@ func handleMethod(s: in Session, channel: in Int, m: in Amqp.Method): Bool {
       true
     }
     case ConfirmSelect -> {
+      b.confirmSelectsSeen = b.confirmSelectsSeen + 1
       s.confirming = true
       send(s, 1, Amqp.ConfirmSelectOk)
       true
     }
     case QueueDeclare(name, passive, durable, _, _, arguments) -> {
+      if not passive {
+        b.queueDeclaresSeen = b.queueDeclaresSeen + 1
+      }
       declareFakeQueue(s, name, passive, durable, arguments)
       true
     }
@@ -603,6 +633,7 @@ func handleMethod(s: in Session, channel: in Int, m: in Amqp.Method): Bool {
       true
     }
     case ExchangeDeclare(name, kind, _, _, _, _, _) -> {
+      b.exchangeDeclaresSeen = b.exchangeDeclaresSeen + 1
       K.lockEnter(b.lock)
       val clash = b.exchanges.containsKey(name) and b.exchanges[name] != kind
       if not clash {
@@ -624,6 +655,7 @@ func handleMethod(s: in Session, channel: in Int, m: in Amqp.Method): Bool {
       true
     }
     case QueueBind(queue, exchange, key, _) -> {
+      b.bindsSeen = b.bindsSeen + 1
       K.lockEnter(b.lock)
       val known = b.exchanges.containsKey(exchange) and b.queues.containsKey(queue)
       if known {
@@ -638,6 +670,7 @@ func handleMethod(s: in Session, channel: in Int, m: in Amqp.Method): Bool {
       true
     }
     case BasicQos(_, count, _) -> {
+      b.lastPrefetch = count
       s.prefetch = count
       send(s, 1, Amqp.BasicQosOk)
       true
@@ -651,6 +684,7 @@ func handleMethod(s: in Session, channel: in Int, m: in Amqp.Method): Bool {
         return true
       }
       val tag = "fake-ctag-" + queue
+      b.consumesSeen = b.consumesSeen + 1
       send(s, 1, Amqp.BasicConsumeOk(consumerTag = tag))
       if queue == "fail.dropconsume" {
         return false
@@ -683,6 +717,7 @@ func handleMethod(s: in Session, channel: in Int, m: in Amqp.Method): Bool {
     case BasicPublish(exchange, key, mandatory, _) -> {
       if key == "fail.stall" {
         K.sleepMs(STALL_MS)
+        b.stallsEnded = b.stallsEnded + 1
         return false
       }
       s.pubActive = true
@@ -692,10 +727,12 @@ func handleMethod(s: in Session, channel: in Int, m: in Amqp.Method): Bool {
       true
     }
     case BasicAck(tag, _) -> {
+      b.settlementsSeen = b.settlementsSeen + 1
       settleFake(s, tag, true, false)
       true
     }
     case BasicNack(tag, _, requeue) -> {
+      b.settlementsSeen = b.settlementsSeen + 1
       settleFake(s, tag, false, requeue)
       true
     }
@@ -782,6 +819,7 @@ func serve(b: in FakeBroker, sock: in K.Sock): Unit {
   val s = Session(
     broker = b,
     sock = sock,
+    kick = b.kick,
     frameMax = 4096,
     heartbeatMs = 0i64,
     lastBeat = K.monotonicMillis(),
@@ -831,30 +869,50 @@ func serve(b: in FakeBroker, sock: in K.Sock): Unit {
   )
   var open = true
   while open {
-    match Amqp.nextFrame(decoder) {
-      case Err(_) -> {
+    if s.kick != b.kick {
+      s.kick = b.kick
+      if b.kickCode == 0 {
         open = false
+      } else if not s.closing {
+        s.closing = true
+        send(
+          s,
+          0,
+          Amqp.ConnectionClose(
+            replyCode = b.kickCode,
+            replyText = RabbitMq.replyCodeName(b.kickCode) + " - closed by the test",
+            classId = 0,
+            methodId = 0
+          )
+        )
       }
-      case Ok(Some(frame)) -> {
-        open = handleFrame(s, frame)
-        if open and not s.closing {
-          pump(s)
+    }
+    if open {
+      match Amqp.nextFrame(decoder) {
+        case Err(_) -> {
+          open = false
         }
-      }
-      case Ok(None) -> match K.sockRead(sock, 65536, 50) {
-        case Ok(Data(bytes)) -> Amqp.feed(decoder, bytes)
-        case Ok(TimedOut) -> {
-          val now = K.monotonicMillis()
-          if s.heartbeatMs > 0i64 and b.mode != "mute" and now - s.lastBeat >= s.heartbeatMs / 2i64 {
-            val _ = K.sockWrite(sock, Amqp.heartbeatFrame())
-            s.lastBeat = now
-          }
-          if not s.closing {
+        case Ok(Some(frame)) -> {
+          open = handleFrame(s, frame)
+          if open and not s.closing {
             pump(s)
           }
         }
-        case _ -> {
-          open = false
+        case Ok(None) -> match K.sockRead(sock, 65536, 50) {
+          case Ok(Data(bytes)) -> Amqp.feed(decoder, bytes)
+          case Ok(TimedOut) -> {
+            val now = K.monotonicMillis()
+            if s.heartbeatMs > 0i64 and b.mode != "mute" and now - s.lastBeat >= s.heartbeatMs / 2i64 {
+              val _ = K.sockWrite(sock, Amqp.heartbeatFrame())
+              s.lastBeat = now
+            }
+            if not s.closing {
+              pump(s)
+            }
+          }
+          case _ -> {
+            open = false
+          }
         }
       }
     }
@@ -865,6 +923,18 @@ func serve(b: in FakeBroker, sock: in K.Sock): Unit {
 
 // A connection whose handshake fails is dropped; the broker keeps listening.
 func serveAccepted(b: in FakeBroker, accepted: in K.Sock): Unit {
+  b.connectionsSeen = b.connectionsSeen + 1
+  if b.mode == "down" {
+    K.sockClose(accepted)
+    return
+  }
+  if b.mode == "hang" {
+    while b.mode == "hang" {
+      K.sleepMs(20)
+    }
+    K.sockClose(accepted)
+    return
+  }
   if not b.secured {
     serve(b, accepted)
     return
@@ -912,7 +982,20 @@ func startBrokerWith(secured: in Bool, tls: in KT.ServerTls): FakeBroker {
     clientProduct = "",
     connectionName = "",
     cleanCloses = 0,
-    largestFrame = 0
+    largestFrame = 0,
+    kick = 0,
+    kickCode = 0,
+    connectionsSeen = 0,
+    confirmSelectsSeen = 0,
+    queueDeclaresSeen = 0,
+    exchangeDeclaresSeen = 0,
+    bindsSeen = 0,
+    consumesSeen = 0,
+    lastPrefetch = -1,
+    publishesSeen = 0,
+    deliveriesSent = 0,
+    settlementsSeen = 0,
+    stallsEnded = 0
   )
   val _ = KT.startBackground({ -> acceptLoop(b) })
   b
@@ -977,8 +1060,20 @@ func freshName(): String {
   "test." + slot.names.toString()
 }
 
+// The connection without a thread of its own: no heartbeat and no recovery.
+// Most tests below are about one operation and what the broker answers, and
+// say so exactly with nothing happening in the background. The heartbeat and
+// recovery tests, and one conformance run, use `backgroundOn`.
 func optionsOn(port: in Int, queue: in String): RabbitMq.ConnectOptions {
-  RabbitMq.defaultOptions("127.0.0.1", port, queue).copy(user = "lyric", password = "secret", requestTimeoutMs = 3000)
+  RabbitMq.defaultOptions("127.0.0.1", port, queue).copy(user = "lyric", password = "secret", requestTimeoutMs = 20000, heartbeatSeconds = 0).withoutRecovery()
+}
+
+// The defaults (a 60 s heartbeat, recovery on), with waits between recovery
+// attempts short enough for a test.
+func backgroundOn(port: in Int, queue: in String): RabbitMq.ConnectOptions {
+  RabbitMq.defaultOptions("127.0.0.1", port, queue).copy(user = "lyric", password = "secret", requestTimeoutMs = 20000).withRecovery(
+    RabbitMq.RecoveryOptions(enabled = true, initialDelayMs = 40, maxDelayMs = 200, maxAttempts = 0)
+  )
 }
 
 func optionsFor(queue: in String): RabbitMq.ConnectOptions {
@@ -1189,12 +1284,19 @@ test "the frame size is the smaller of the two limits, and 0 from the broker mea
   KT.serverClose(wide.server)
 }
 
-test "the heartbeat is off unless asked for, then the smaller of the two intervals" {
-  val b = knobBroker("", 131072, 60)
+test "the heartbeat is 60 s unless set, 0 turns it off, otherwise the smaller of the two intervals" {
+  val b = knobBroker("", 131072, 90)
   val port = KT.serverPort(b.server)
+  val standard = open(RabbitMq.defaultOptions("127.0.0.1", port, "q").copy(user = "lyric", password = "secret"))
+  assertEqualInt(RabbitMq.heartbeatSeconds(standard), 60, "60 s by default")
+  assertEqualInt(b.tunedHeartbeat, 60, "tune-ok says 60")
+  assertTrue(RabbitMq.backgroundRunning(standard), "the defaults run a background thread")
+  standard.close()
+  b.heartbeat = 60
   val off = open(optionsOn(port, "q"))
-  assertEqualInt(RabbitMq.heartbeatSeconds(off), 0, "off by default")
+  assertEqualInt(RabbitMq.heartbeatSeconds(off), 0, "0 turns it off whatever the broker proposes")
   assertEqualInt(b.tunedHeartbeat, 0, "tune-ok says 0")
+  assertTrue(not RabbitMq.backgroundRunning(off), "no heartbeat and no recovery: no background thread")
   off.close()
   val shorter = open(optionsOn(port, "q").copy(heartbeatSeconds = 30))
   assertEqualInt(RabbitMq.heartbeatSeconds(shorter), 30, "the client's interval is shorter")
@@ -1284,6 +1386,24 @@ test "invalid options are rejected before any connection is made" {
     "a malformed argument table"
   )
   assertTrue(isOk(RabbitMq.validateOptions(good)), "validateOptions accepts the defaults")
+  val recovery = RabbitMq.defaultRecovery()
+  expectContains(
+    errorOfConnect(good.withRecovery(recovery.copy(initialDelayMs = 0))),
+    "recovery.initialDelayMs must be at least 1",
+    "no delay"
+  )
+  expectContains(
+    errorOfConnect(good.withRecovery(recovery.copy(initialDelayMs = 500, maxDelayMs = 100))),
+    "recovery.maxDelayMs must not be smaller",
+    "a cap below the first delay"
+  )
+  expectContains(
+    errorOfConnect(good.withRecovery(recovery.copy(maxAttempts = -1))),
+    "recovery.maxAttempts must not be negative",
+    "negative attempts"
+  )
+  assertTrue(not good.withoutRecovery().recovery.enabled, "withoutRecovery")
+  assertTrue(not RabbitMq.noRecovery().enabled, "noRecovery")
   assertTrue(isErr(RabbitMq.validateOptions(good.copy(host = ""))), "and refuses what connectWith refuses")
 }
 
@@ -1296,6 +1416,7 @@ test "connectUrl takes the host, credentials, virtual host and parameters from t
       assertEqual(RabbitMq.queueName(q), name, "queue")
       assertEqual(q.options.virtualHost, "/", "the decoded virtual host")
       assertEqualInt(RabbitMq.heartbeatSeconds(q), 7, "the heartbeat parameter")
+      assertTrue(RabbitMq.backgroundRunning(q), "which a background thread keeps")
       mustPublish(q, message("u-1", "via url"))
       assertEqual(mustTake(q).body, "via url", "round trip")
       q.close()
@@ -1308,7 +1429,8 @@ test "connectUrl takes the host, credentials, virtual host and parameters from t
       assertEqual(o.user, "guest", "the default user")
       assertEqual(o.virtualHost, "/", "the default virtual host")
       assertTrue(not o.tls.enabled, "amqp:// is plain TCP")
-      assertEqualInt(o.heartbeatSeconds, 0, "no heartbeat unless asked for")
+      assertEqualInt(o.heartbeatSeconds, 60, "the default heartbeat without the parameter")
+      assertTrue(o.recovery.enabled, "recovery on")
     }
   }
   match RabbitMq.optionsFromUrl("amqp://h/prod?connection_timeout=1500&frame_max=8192", "orders") {
@@ -1336,7 +1458,7 @@ func errorOfConnectUrl(url: in String, queue: in String): String {
 
 test "connectFromEnv reads the URL, queue name, ack mode and prefetch" {
   val prefix = "LYRIC_CONFIG_MQ_RABBITMQ_"
-  for field in ["URL", "QUEUENAME", "ACKMODE", "PREFETCHCOUNT"] {
+  for field in ["URL", "QUEUENAME", "ACKMODE", "PREFETCHCOUNT", "RECOVERY"] {
     Env.setVar(prefix + field, "")
   }
   match RabbitMq.connectFromEnv() {
@@ -1363,8 +1485,22 @@ test "connectFromEnv reads the URL, queue name, ack mode and prefetch" {
   Env.setVar(prefix + "PREFETCHCOUNT", "3")
   match RabbitMq.optionsFromEnv() {
     case Err(e) -> assertTrue(false, e)
-    case Ok(o) -> assertEqualInt(o.prefetchCount, 3, "prefetch from the environment")
+    case Ok(o) -> {
+      assertEqualInt(o.prefetchCount, 3, "prefetch from the environment")
+      assertTrue(o.recovery.enabled, "recovery is on unless RECOVERY says otherwise")
+    }
   }
+  Env.setVar(prefix + "RECOVERY", "perhaps")
+  match RabbitMq.optionsFromEnv() {
+    case Ok(_) -> assertTrue(false, "a RECOVERY that is neither true nor false")
+    case Err(e) -> expectContains(e, "RECOVERY must be true or false", "bad recovery")
+  }
+  Env.setVar(prefix + "RECOVERY", "false")
+  match RabbitMq.optionsFromEnv() {
+    case Err(e) -> assertTrue(false, e)
+    case Ok(o) -> assertTrue(not o.recovery.enabled, "RECOVERY=false turns recovery off")
+  }
+  Env.setVar(prefix + "RECOVERY", "")
   match RabbitMq.connectFromEnv() {
     case Err(e) -> assertTrue(false, e)
     case Ok(q) -> {
@@ -1437,14 +1573,15 @@ test "a publish to a broker that stops reading ends with the request timeout" {
   while body.length < 33554432 {
     body = body + body
   }
-  val started = K.monotonicMillis()
+  val ended = broker().stallsEnded
   val e = errorOf(
     Extras.publishWith(q, message("huge", body), Extras.toExchange(q, "", "fail.stall")),
     "a publish nobody reads"
   )
-  val elapsed = K.monotonicMillis() - started
   expectContains(e, "rabbitmq: connection lost: the write timed out", "a write that cannot finish loses the connection")
-  assertTrue(elapsed < 6000i64, "the publish returned after " + elapsed.toString() + " ms")
+  // The request timeout ended it, not the broker closing its socket when the
+  // 30 s pause is over.
+  assertEqualInt(broker().stallsEnded, ended, "the publish returned while the broker was still reading nothing")
   assertTrue(not RabbitMq.isOpen(q), "the connection is unusable afterwards")
   q.close()
 }
@@ -1490,6 +1627,7 @@ test "a broker that never confirms a publish times the publish out" {
   val q = open(optionsFor(freshName()).copy(requestTimeoutMs = 300))
   val e = errorOf(Extras.publishWith(q, message("s", "x"), Extras.toExchange(q, "", "fail.silent")), "no confirm")
   expectContains(e, "the broker did not confirm the publish within 300 ms", "a missed confirm")
+  assertTrue(RabbitMq.isOutcomeUnknown(e), "and says the outcome is unknown: " + e)
   assertTrue(not RabbitMq.isOpen(q), "its fate is unknown, so the connection is given up")
   q.close()
 }
@@ -2327,10 +2465,10 @@ test "with a heartbeat a silent broker is given up on after two intervals" {
   val b = knobBroker("mute", 131072, 1)
   val q = open(optionsOn(KT.serverPort(b.server), "q").copy(heartbeatSeconds = 1))
   val started = K.monotonicMillis()
-  val e = errorOf(q.consume(8000, { m -> Ok(()) }), "a silent broker")
+  val e = errorOf(q.consume(60000, { m -> Ok(()) }), "a silent broker")
   val elapsed = K.monotonicMillis() - started
   expectContains(e, "rabbitmq: connection lost: no frame from the broker for", "heartbeat timeout")
-  assertTrue(elapsed < 6000i64, "well before the consume timeout: " + elapsed.toString() + " ms")
+  assertTrue(elapsed < 45000i64, "well before the consume timeout: " + elapsed.toString() + " ms")
   assertTrue(not RabbitMq.isOpen(q), "lost")
   q.close()
   KT.serverClose(b.server)
@@ -2344,6 +2482,449 @@ test "without a heartbeat nothing is sent while waiting, and keepAlive is a live
   assertTrue(isOk(RabbitMq.keepAlive(q)), "keepAlive on a live connection")
   K.sleepMs(150)
   assertEqualInt(b.heartbeatsSeen, 1, "keepAlive always sends one")
+  q.close()
+  KT.serverClose(b.server)
+}
+
+// ─── The background thread: heartbeats without an operation ──────────────────
+// Wait, at most `limitMs`, for `condition` to hold. The limit is generous on
+// purpose: it is only reached when the thing waited for never happens.
+func waitUntil(label: in String, limitMs: in Int, condition: () -> Bool): Unit {
+  val deadline = K.monotonicMillis() + limitMs.toLong()
+  while not condition() {
+    if K.monotonicMillis() >= deadline {
+      assertTrue(false, label + ": not within " + limitMs.toString() + " ms")
+      return
+    }
+    K.sleepMs(10)
+  }
+}
+
+func stateOf(q: in RabbitMq.RabbitMqQueue): String {
+  match RabbitMq.connectionState(q) {
+    case Connected -> "connected"
+    case Reconnecting(_) -> "reconnecting"
+    case Lost(reason) -> "lost: " + reason
+    case Closed -> "closed"
+  }
+}
+
+func failedAttemptsOf(q: in RabbitMq.RabbitMqQueue): Int {
+  match RabbitMq.connectionState(q) {
+    case Reconnecting(n) -> n
+    case _ -> -1
+  }
+}
+
+func isLost(q: in RabbitMq.RabbitMqQueue): Bool {
+  Str.startsWith(stateOf(q), "lost: ")
+}
+
+// End the open connections of `b`: `code` 0 closes their sockets, any other
+// value sends a connection.close with that reply code.
+func kickBroker(b: in FakeBroker, code: in Int): Unit {
+  b.kickCode = code
+  b.kick = b.kick + 1
+}
+
+func readyOn(b: in FakeBroker, queue: in String): Int {
+  K.lockEnter(b.lock)
+  val count = if b.queues.containsKey(queue) { b.queues[queue].ready.count } else { -1 }
+  K.lockExit(b.lock)
+  count
+}
+
+test "heartbeats are negotiated, and an idle connection sends them without any operation" {
+  val b = knobBroker("", 131072, 2)
+  val q = open(backgroundOn(KT.serverPort(b.server), "q").copy(heartbeatSeconds = 5))
+  assertEqualInt(RabbitMq.heartbeatSeconds(q), 2, "the smaller of the client's 5 s and the broker's 2 s")
+  assertEqualInt(b.tunedHeartbeat, 2, "tune-ok carries it")
+  assertTrue(RabbitMq.backgroundRunning(q), "the background thread runs")
+  // No operation from here on: only the background thread can be sending.
+  // Three frames at one per half interval take about 3 s.
+  waitUntil("three heartbeat frames from an idle client", 30000, { -> b.heartbeatsSeen >= 3 })
+  assertEqual(stateOf(q), "connected", "the broker's heartbeats keep the idle connection up")
+  assertEqualInt(RabbitMq.recoveryCount(q), 0, "and it was never lost")
+  mustPublish(q, message("after-idle", "x"))
+  assertEqual(mustTake(q).id, "after-idle", "usable after the idle time")
+  q.close()
+  waitUntil("the background thread ends with close", 30000, { -> not RabbitMq.backgroundRunning(q) })
+  KT.serverClose(b.server)
+}
+
+test "an idle connection gives a silent broker up after two intervals, without any operation" {
+  val b = knobBroker("mute", 131072, 1)
+  // Taken before connecting: the broker's last frame cannot be older.
+  val started = K.monotonicMillis()
+  val q = open(optionsOn(KT.serverPort(b.server), "q").copy(heartbeatSeconds = 1))
+  assertTrue(RabbitMq.backgroundRunning(q), "a heartbeat alone runs the background thread")
+  waitUntil("the silent broker is noticed", 30000, { -> isLost(q) })
+  val elapsed = K.monotonicMillis() - started
+  assertTrue(elapsed >= 2000i64, "not before two intervals of silence: " + elapsed.toString() + " ms")
+  expectContains(stateOf(q), "no frame from the broker for", "the reason")
+  assertTrue(not RabbitMq.isOpen(q), "lost")
+  expectContains(
+    errorOf(q.publish(message("m", "x")), "publish after the loss"),
+    "rabbitmq: connection lost: no frame from the broker for",
+    "operations say why"
+  )
+  waitUntil("without recovery the background thread ends", 30000, { -> not RabbitMq.backgroundRunning(q) })
+  q.close()
+  KT.serverClose(b.server)
+}
+
+// ─── Recovery ────────────────────────────────────────────────────────────────
+test "the backend conforms with the default heartbeat and recovery" {
+  val b = knobBroker("", 131072, 60)
+  val port = KT.serverPort(b.server)
+  requireConformance(
+    conformance(
+      { ->
+        val q = open(backgroundOn(port, freshName()))
+        opened.queues.add(q)
+        val publisher: Mq.MessageQueue = q
+        val consumer: Mq.QueueConsumer = q
+        MqConformance.QueueEnds(publisher = publisher, consumer = consumer)
+      }
+    )
+  )
+  KT.serverClose(b.server)
+}
+
+test "a dropped connection is re-established with its channel, queue, exchanges, bindings, prefetch and consumer" {
+  val b = knobBroker("", 131072, 60)
+  val name = "recover.main"
+  val q = open(backgroundOn(KT.serverPort(b.server), name).copy(prefetchCount = 3))
+  assertTrue(isOk(Extras.declareExchange(q, "recover.events", "direct", Extras.defaultExchangeOptions())), "exchange")
+  assertTrue(isOk(Extras.declareQueue(q, "recover.side", Extras.defaultQueueOptions())), "another queue")
+  assertTrue(isOk(Extras.bindQueue(q, "recover.events", "k")), "binding")
+  assertTrue(isOk(Extras.declareExchange(q, "recover.gone", "fanout", Extras.defaultExchangeOptions())), "exchange 2")
+  assertTrue(isOk(Extras.deleteExchange(q, "recover.gone", false)), "deleted again")
+  assertTrue(isOk(Extras.inspectQueue(q, "recover.side")), "a passive declaration is a check, not topology")
+  mustPublish(q, message("first", "1"))
+  assertEqual(mustTake(q).id, "first", "delivered and left unsettled")
+  assertEqualInt(b.connectionsSeen, 1, "one connection so far")
+  assertEqualInt(b.consumesSeen, 1, "one consumer so far")
+  val queueDeclares = b.queueDeclaresSeen
+  val exchangeDeclares = b.exchangeDeclaresSeen
+  // The broker comes back empty, as one without durable entities would.
+  K.lockEnter(b.lock)
+  b.queues = newMap()
+  b.exchanges = newMap()
+  b.bindings = newList()
+  K.lockExit(b.lock)
+  kickBroker(b, 0)
+  waitUntil("the connection is re-established", 30000, { -> RabbitMq.recoveryCount(q) == 1 })
+  assertEqual(stateOf(q), "connected", "connected again")
+  assertTrue(RabbitMq.isOpen(q), "open again")
+  assertEqualInt(b.connectionsSeen, 2, "over a second connection")
+  assertEqualInt(b.confirmSelectsSeen, 2, "the new channel is in confirm mode")
+  assertEqualInt(b.queueDeclaresSeen, queueDeclares + 2, "the connection's queue and the other one are declared again")
+  assertEqualInt(b.exchangeDeclaresSeen, exchangeDeclares + 1, "the exchange that was not deleted is declared again")
+  assertEqualInt(b.bindsSeen, 2, "the binding is made again")
+  assertEqualInt(b.lastPrefetch, 3, "the prefetch window is set again")
+  assertEqualInt(b.consumesSeen, 2, "the consumer is started again")
+  K.lockEnter(b.lock)
+  val restored = b.queues.containsKey(name) and b.queues.containsKey("recover.side") and
+    b.exchanges.containsKey("recover.events") and
+    not b.exchanges.containsKey("recover.gone")
+  K.lockExit(b.lock)
+  assertTrue(restored, "the broker has the queues and the exchange again, and not the deleted exchange")
+  assertTrue(
+    isOk(Extras.publishWith(q, message("second", "2"), Extras.toExchange(q, "recover.events", "k"))),
+    "a publish through the restored exchange and binding is confirmed"
+  )
+  val second = mustTake(q)
+  assertEqual(second.id, "second", "and delivered by the restored consumer")
+  assertTrue(isOk(q.ack(second.id)), "ack on the new channel")
+  expectContains(
+    errorOf(q.ack("first"), "ack of the delivery from before the drop"),
+    RabbitMq.STALE_DELIVERY,
+    "the old delivery cannot be settled"
+  )
+  q.close()
+  KT.serverClose(b.server)
+}
+
+// Drop the connections of `b` in a moment, from another thread.
+func dropSoon(b: in FakeBroker): Unit {
+  K.sleepMs(300)
+  kickBroker(b, 0)
+}
+
+test "a consume waiting across a drop gets the unsettled delivery again, redelivered, and messages published afterwards" {
+  val b = knobBroker("", 131072, 60)
+  val q = open(backgroundOn(KT.serverPort(b.server), "recover.wait"))
+  mustPublish(q, message("held", "h"))
+  val held = mustTake(q)
+  assertEqualInt(held.deliveryCount, 0, "a first delivery")
+  val dropper = KT.startBackground({ -> dropSoon(b) })
+  val got = Got(messages = newList())
+  // Nothing is ready: this waits, the connection drops under it, and it goes
+  // on waiting on the new connection, where the broker redelivers.
+  match q.consume(30000, { m -> keep(got, m) }) {
+    case Err(e) -> assertTrue(false, "the consume did not survive the drop: " + e)
+    case Ok(_) -> {
+      assertEqual(got.messages[0].id, "held", "the unsettled delivery came back")
+      assertEqualInt(got.messages[0].deliveryCount, 1, "flagged redelivered")
+    }
+  }
+  KT.waitBackground(dropper)
+  assertEqualInt(RabbitMq.recoveryCount(q), 1, "one recovery")
+  assertEqualInt(RabbitMq.unsettledCount(q), 1, "only the new delivery is unsettled")
+  assertTrue(isOk(q.ack("held")), "the redelivery is acknowledged on the new channel")
+  mustPublish(q, message("after", "a"))
+  val after = mustTake(q)
+  assertEqual(after.id, "after", "published and delivered after the recovery")
+  assertEqualInt(after.deliveryCount, 0, "a first delivery")
+  assertTrue(isOk(q.ack(after.id)), "ack")
+  assertEqualInt(readyOn(b, "recover.wait"), 0, "nothing is left in the queue")
+  q.close()
+  KT.serverClose(b.server)
+}
+
+test "a broker that closes the connection with 320 is reconnected to; with a refusal such as 530 it is not" {
+  val b = knobBroker("", 131072, 60)
+  val q = open(backgroundOn(KT.serverPort(b.server), "recover.forced"))
+  kickBroker(b, 320)
+  waitUntil("recovery after CONNECTION_FORCED", 30000, { -> RabbitMq.recoveryCount(q) == 1 })
+  assertEqualInt(RabbitMq.lastReplyCode(q), 320, "the reply code of the close")
+  mustPublish(q, message("m", "x"))
+  assertEqual(mustTake(q).id, "m", "usable")
+  kickBroker(b, 530)
+  waitUntil("the refusal is final", 30000, { -> isLost(q) })
+  expectContains(stateOf(q), "530 NOT_ALLOWED", "the broker's reason")
+  expectContains(stateOf(q), "not reconnecting, the broker's refusal is permanent", "and what the client does about it")
+  val e = errorOf(q.publish(message("n", "x")), "publish after a permanent refusal")
+  expectContains(e, "rabbitmq: connection lost: the broker closed the connection: 530", "operations carry the reason")
+  assertTrue(not RabbitMq.isReconnecting(e), "it does not claim to be reconnecting")
+  waitUntil("the background thread ends", 30000, { -> not RabbitMq.backgroundRunning(q) })
+  assertEqualInt(b.connectionsSeen, 2, "no connection was attempted after the refusal")
+  q.close()
+  KT.serverClose(b.server)
+}
+
+// Drop the connections of `b` once it has received `publishes` publishes.
+func dropAfterPublish(b: in FakeBroker, publishes: in Int): Unit {
+  waitUntil("the broker received the publish", 60000, { -> b.publishesSeen >= publishes })
+  kickBroker(b, 0)
+}
+
+test "a publish the connection drops under reports an unknown outcome and is not sent again" {
+  val b = knobBroker("", 131072, 60)
+  val port = KT.serverPort(b.server)
+  val name = "recover.unknown"
+  val q = open(backgroundOn(port, name))
+  val e = errorOf(Extras.publishWith(q, message("u", "x"), Extras.toExchange(q, "", "fail.drop")), "dropped")
+  expectContains(e, "rabbitmq: connection lost: the broker closed the connection", "the loss")
+  assertTrue(RabbitMq.isOutcomeUnknown(e), "the outcome is unknown: " + e)
+  expectContains(e, "it was not sent again", "and says the client does not resend")
+  assertTrue(not RabbitMq.isNotAttempted(e), "it does not claim nothing was sent")
+  waitUntil("recovery", 30000, { -> RabbitMq.recoveryCount(q) == 1 })
+  assertEqualInt(b.publishesSeen, 1, "the broker received the publish once")
+  mustPublish(q, message("next", "y"))
+  assertEqualInt(b.publishesSeen, 2, "only the application's next publish followed")
+  assertEqualInt(readyOn(b, name), 1, "and only that one is in the queue")
+  // A publish the broker has taken but not confirmed when the connection goes.
+  val seen = b.publishesSeen
+  val dropper = KT.startBackground({ -> dropAfterPublish(b, seen + 1) })
+  val held = errorOf(Extras.publishWith(q, message("s", "x"), Extras.toExchange(q, "", "fail.silent")), "no confirm")
+  KT.waitBackground(dropper)
+  expectContains(held, "rabbitmq: connection lost: ", "the loss while the confirm was outstanding")
+  assertTrue(RabbitMq.isOutcomeUnknown(held), "also unknown: " + held)
+  q.close()
+  // A batch: every publish to a queue of this name makes the broker drop.
+  val batch = open(backgroundOn(port, "fail.drop"))
+  val be = errorOf(batch.publishBatch([message("b-1", "1"), message("b-2", "2")]), "a dropped batch")
+  assertTrue(RabbitMq.isOutcomeUnknown(be), "a batch says so too: " + be)
+  expectContains(be, "none, some or all of the messages", "for all its unconfirmed messages")
+  batch.close()
+  KT.serverClose(b.server)
+}
+
+test "while disconnected operations fail at once, consume waits; an ack from before the reconnect never reaches the new channel" {
+  val b = knobBroker("", 131072, 60)
+  val name = "recover.stale"
+  val q = open(backgroundOn(KT.serverPort(b.server), name).copy(prefetchCount = 1))
+  mustPublish(q, message("A", "a"))
+  assertEqual(mustTake(q).id, "A", "delivered as tag 1 of the first channel, left unsettled")
+  b.mode = "down"
+  kickBroker(b, 0)
+  waitUntil("the loss is noticed and an attempt has failed", 30000, { -> failedAttemptsOf(q) >= 1 })
+  assertTrue(not RabbitMq.isOpen(q), "not open")
+  val pe = errorOf(q.publish(message("p", "x")), "publish while disconnected")
+  expectContains(pe, "rabbitmq: connection lost: ", "names the loss")
+  assertTrue(RabbitMq.isReconnecting(pe), "says the client is reconnecting: " + pe)
+  assertTrue(RabbitMq.isNotAttempted(pe), "and that nothing was sent: " + pe)
+  assertTrue(not RabbitMq.isOutcomeUnknown(pe), "so its outcome is known")
+  assertTrue(RabbitMq.isNotAttempted(errorOf(q.ack("A"), "ack while disconnected")), "ack fails at once")
+  assertTrue(RabbitMq.isNotAttempted(errorOf(q.nack("A", true), "nack while disconnected")), "nack fails at once")
+  assertTrue(RabbitMq.isNotAttempted(errorOf(RabbitMq.keepAlive(q), "keepAlive while disconnected")), "keepAlive too")
+  assertTrue(isErr(Extras.purgeQueue(q, name)), "and a request")
+  assertTrue(
+    RabbitMq.isReconnecting(errorOf(q.consume(0, { m -> Ok(()) }), "consume(0) while disconnected")),
+    "consume(0) does not wait"
+  )
+  val started = K.monotonicMillis()
+  val ce = errorOf(q.consume(400, { m -> Ok(()) }), "consume while disconnected")
+  val waited = K.monotonicMillis() - started
+  assertTrue(RabbitMq.isReconnecting(ce), "a consume that runs out of time says why, not `timeout`: " + ce)
+  assertTrue(waited >= 350i64, "after waiting its timeout for the connection: " + waited.toString() + " ms")
+  expectContains(
+    errorOf(RabbitMq.awaitConnected(q, 50), "awaitConnected while the broker is down"),
+    RabbitMq.RECONNECTING,
+    "awaitConnected gives up after its timeout"
+  )
+  // The broker requeued A when the connection went. Another message gets in
+  // front of it, so that tag 1 of the next channel is not A.
+  waitUntil("the broker requeued A", 30000, { -> readyOn(b, name) == 1 })
+  K.lockEnter(b.lock)
+  pushFront(
+    b.queues[name],
+    Stored(
+      properties = Amqp.noProperties().copy(messageId = "Z"),
+      body = encodeUtf8("z"),
+      redelivered = false,
+      requeues = 0
+    )
+  )
+  K.lockExit(b.lock)
+  val sent = b.deliveriesSent
+  b.mode = ""
+  assertTrue(isOk(RabbitMq.awaitConnected(q, 30000)), "awaitConnected returns when the connection is back")
+  assertEqualInt(RabbitMq.recoveryCount(q), 1, "one recovery")
+  waitUntil("the restored consumer was sent tag 1 of the new channel", 30000, { -> b.deliveriesSent == sent + 1 })
+  val settlements = b.settlementsSeen
+  val stale = errorOf(q.ack("A"), "ack of A's delivery on the lost connection")
+  expectContains(stale, "rabbitmq: no unsettled delivery has message id 'A'", "refused by the client")
+  expectContains(stale, RabbitMq.STALE_DELIVERY, "with the reason")
+  expectContains(
+    errorOf(q.nack("A", false), "a second settlement"),
+    "no unsettled delivery has message id 'A'",
+    "nack likewise"
+  )
+  // A confirmed publish is behind everything written before it, so by now the
+  // broker would have seen an acknowledgement, had one been written.
+  mustPublish(q, message("R", "r"))
+  assertEqualInt(b.settlementsSeen, settlements, "nothing was acknowledged on the new channel")
+  val z = mustTake(q)
+  assertEqual(z.id, "Z", "the message that holds tag 1 on the new channel is still there to be handled")
+  assertEqualInt(z.deliveryCount, 0, "as a first delivery")
+  assertTrue(isOk(q.ack(z.id)), "ack Z")
+  val again = mustTake(q)
+  assertEqual(again.id, "A", "A is delivered again")
+  assertEqualInt(again.deliveryCount, 1, "flagged redelivered")
+  assertTrue(isOk(q.ack(again.id)), "and this delivery can be acknowledged")
+  assertEqual(mustTake(q).id, "R", "then the message published after the recovery")
+  assertTrue(isOk(q.ack("R")), "ack R")
+  q.close()
+  KT.serverClose(b.server)
+}
+
+test "recovery gives up after maxAttempts failed attempts, with an error that says so" {
+  val b = knobBroker("", 131072, 60)
+  val limited = RabbitMq.RecoveryOptions(enabled = true, initialDelayMs = 20, maxDelayMs = 60, maxAttempts = 3)
+  val q = open(backgroundOn(KT.serverPort(b.server), "recover.bounded").withRecovery(limited))
+  // Nobody listens any more: every attempt is refused.
+  KT.serverClose(b.server)
+  kickBroker(b, 0)
+  waitUntil("recovery is given up", 60000, { -> isLost(q) })
+  expectContains(stateOf(q), "reconnecting was given up after 3 failed attempts", "the count")
+  expectContains(stateOf(q), "cannot connect to 127.0.0.1:", "and the last failure")
+  val e = errorOf(q.publish(message("m", "x")), "publish after giving up")
+  expectContains(e, "rabbitmq: connection lost: ", "still a lost connection")
+  expectContains(e, "reconnecting was given up after 3 failed attempts", "with the reason it stays lost")
+  assertTrue(not RabbitMq.isReconnecting(e), "no longer reconnecting")
+  val started = K.monotonicMillis()
+  expectContains(
+    errorOf(q.consume(20000, { m -> Ok(()) }), "consume after giving up"),
+    "reconnecting was given up",
+    "consume does not wait for a connection that will not come"
+  )
+  assertTrue(K.monotonicMillis() - started < 15000i64, "it returned without waiting its timeout")
+  expectContains(
+    errorOf(RabbitMq.awaitConnected(q, 20000), "awaitConnected after giving up"),
+    "reconnecting was given up",
+    "nor does awaitConnected"
+  )
+  waitUntil("the background thread ends", 30000, { -> not RabbitMq.backgroundRunning(q) })
+  q.close()
+  assertEqual(stateOf(q), "closed", "closed")
+}
+
+test "a refusal on reconnect is final: bad credentials, or a queue that now differs" {
+  val denied = knobBroker("", 131072, 60)
+  val q = open(backgroundOn(KT.serverPort(denied.server), "recover.denied"))
+  denied.mode = "deny"
+  kickBroker(denied, 0)
+  waitUntil("403 ends recovery", 30000, { -> isLost(q) })
+  expectContains(stateOf(q), "reconnecting was given up, the failure is permanent", "permanent")
+  expectContains(stateOf(q), "403 ACCESS_REFUSED", "the broker's reason")
+  assertEqualInt(RabbitMq.lastReplyCode(q), 403, "lastReplyCode")
+  waitUntil("the background thread ends", 30000, { -> not RabbitMq.backgroundRunning(q) })
+  assertEqualInt(denied.connectionsSeen, 2, "one attempt, not a loop")
+  q.close()
+  KT.serverClose(denied.server)
+  val changed = knobBroker("", 131072, 60)
+  val name = "recover.changed"
+  val r = open(backgroundOn(KT.serverPort(changed.server), name))
+  // Somebody deletes the queue and declares it again as a transient one.
+  K.lockEnter(changed.lock)
+  changed.queues[name] = FakeQueue(name = name, durable = false, arguments = Amqp.emptyTable(), ready = newList())
+  K.lockExit(changed.lock)
+  kickBroker(changed, 0)
+  waitUntil("406 ends recovery", 30000, { -> isLost(r) })
+  expectContains(stateOf(r), "reconnecting was given up, the failure is permanent", "permanent")
+  expectContains(stateOf(r), "406 PRECONDITION_FAILED", "the broker's reason")
+  waitUntil("the background thread ends", 30000, { -> not RabbitMq.backgroundRunning(r) })
+  assertEqualInt(changed.connectionsSeen, 2, "one attempt, not a loop")
+  r.close()
+  KT.serverClose(changed.server)
+}
+
+test "close ends a wait between attempts and an attempt in progress at once, and the background thread with them" {
+  // A long wait before the first attempt.
+  val b = knobBroker("", 131072, 60)
+  val patient = RabbitMq.RecoveryOptions(enabled = true, initialDelayMs = 120000, maxDelayMs = 120000, maxAttempts = 0)
+  val q = open(backgroundOn(KT.serverPort(b.server), "recover.close").withRecovery(patient))
+  kickBroker(b, 0)
+  waitUntil("the loss is noticed", 30000, { -> stateOf(q) == "reconnecting" })
+  val started = K.monotonicMillis()
+  q.close()
+  val closing = K.monotonicMillis() - started
+  assertTrue(closing < 10000i64, "close does not wait for the attempt: " + closing.toString() + " ms")
+  waitUntil("the background thread ends", 30000, { -> not RabbitMq.backgroundRunning(q) })
+  assertEqual(stateOf(q), "closed", "closed")
+  assertEqualInt(b.connectionsSeen, 1, "no attempt was made")
+  KT.serverClose(b.server)
+  // An attempt whose handshake the broker never answers; it would run into
+  // the request timeout of two minutes.
+  val mute = knobBroker("", 131072, 60)
+  val r = open(backgroundOn(KT.serverPort(mute.server), "recover.close").copy(requestTimeoutMs = 120000))
+  mute.mode = "hang"
+  kickBroker(mute, 0)
+  waitUntil("an attempt is in progress", 30000, { -> mute.connectionsSeen == 2 })
+  val closeStarted = K.monotonicMillis()
+  r.close()
+  val closed = K.monotonicMillis() - closeStarted
+  assertTrue(closed < 10000i64, "close does not wait for the handshake: " + closed.toString() + " ms")
+  waitUntil("the attempt ends with its socket, and the thread with it", 60000, { -> not RabbitMq.backgroundRunning(r) })
+  assertEqualInt(RabbitMq.recoveryCount(r), 0, "nothing was recovered")
+  mute.mode = ""
+  KT.serverClose(mute.server)
+}
+
+test "abortTransport fails the socket under the client, which recovers" {
+  val b = knobBroker("", 131072, 60)
+  val q = open(backgroundOn(KT.serverPort(b.server), "recover.abort"))
+  mustPublish(q, message("m", "x"))
+  assertEqual(mustTake(q).id, "m", "unsettled")
+  RabbitMq.abortTransport(q)
+  waitUntil("recovery", 30000, { -> RabbitMq.recoveryCount(q) == 1 })
+  val again = mustTake(q)
+  assertEqual(again.id, "m", "the broker requeued the unsettled delivery")
+  assertEqualInt(again.deliveryCount, 1, "redelivered")
+  assertTrue(isOk(q.ack(again.id)), "ack")
   q.close()
   KT.serverClose(b.server)
 }

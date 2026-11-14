@@ -3,17 +3,17 @@
 # the mq-rabbitmq integration suite, as plain processes with their data in a
 # fresh temporary directory, one user and one virtual host:
 #
-#   node A   127.0.0.1:35672  AMQP over plain TCP
-#            127.0.0.1:35671  AMQP over TLS; a client certificate is verified
+#   node A   127.0.0.1:25672  AMQP over plain TCP
+#            127.0.0.1:25671  AMQP over TLS; a client certificate is verified
 #                             when one is presented but not required
-#   node B   127.0.0.1:35673  AMQP over TLS; a client certificate signed by
+#   node B   127.0.0.1:25673  AMQP over TLS; a client certificate signed by
 #                             the test CA is required (fail_if_no_peer_cert)
 #
 # A RabbitMQ node has one set of TLS options for all its listeners, hence the
 # second node. Override the ports with LYRIC_RABBITMQ_PORT,
 # LYRIC_RABBITMQ_TLS_PORT and LYRIC_RABBITMQ_MTLS_PORT. The nodes also use
 # three loopback ports for Erlang distribution (LYRIC_RABBITMQ_EPMD_PORT,
-# default 35690, and the two after it).
+# default 25690, and the two after it).
 #
 # The CA, the server certificate (SAN: localhost, 127.0.0.1) and the client
 # certificate are generated with openssl on every run; nothing is reused and
@@ -24,9 +24,9 @@
 # (password masked); otherwise they are printed as `export NAME=value` lines,
 # so a shell can `eval "$(scripts/ci/start-rabbitmq.sh)"`:
 #
-#   LYRIC_RABBITMQ_URL        amqp://lyric:PASSWORD@127.0.0.1:35672/lyric-test
-#   LYRIC_RABBITMQ_TLS_URL    amqps://lyric:PASSWORD@localhost:35671/lyric-test
-#   LYRIC_RABBITMQ_MTLS_URL   amqps://lyric:PASSWORD@localhost:35673/lyric-test
+#   LYRIC_RABBITMQ_URL        amqp://lyric:PASSWORD@127.0.0.1:25672/lyric-test
+#   LYRIC_RABBITMQ_TLS_URL    amqps://lyric:PASSWORD@localhost:25671/lyric-test
+#   LYRIC_RABBITMQ_MTLS_URL   amqps://lyric:PASSWORD@localhost:25673/lyric-test
 #   LYRIC_RABBITMQ_TLS_CA     the CA certificate (PEM file)
 #   LYRIC_RABBITMQ_TLS_CERT   the client certificate (PEM file)
 #   LYRIC_RABBITMQ_TLS_KEY    the client private key (PEM file, PKCS#8)
@@ -35,10 +35,10 @@
 # work directory is printed as LYRIC_RABBITMQ_WORK.
 set -euo pipefail
 
-port="${LYRIC_RABBITMQ_PORT:-35672}"
-tls_port="${LYRIC_RABBITMQ_TLS_PORT:-35671}"
-mtls_port="${LYRIC_RABBITMQ_MTLS_PORT:-35673}"
-epmd_port="${LYRIC_RABBITMQ_EPMD_PORT:-35690}"
+port="${LYRIC_RABBITMQ_PORT:-25672}"
+tls_port="${LYRIC_RABBITMQ_TLS_PORT:-25671}"
+mtls_port="${LYRIC_RABBITMQ_MTLS_PORT:-25673}"
+epmd_port="${LYRIC_RABBITMQ_EPMD_PORT:-25690}"
 vhost=lyric-test
 user=lyric
 

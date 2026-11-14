@@ -19,7 +19,7 @@ It holds three things:
 
 | | |
 |---|---|
-| Lyric packages | `Net.Tcp`, `Net.Tls`, `Net.Url`; `Net.Tcp.Testing` (test support); `Net.Tcp.Kernel` (the externs, not an API) |
+| Lyric packages | `Net.Tcp`, `Net.Tls`, `Net.Url`, `Net.Threads`; `Net.Tcp.Testing` (test support); `Net.Tcp.Kernel` (the externs, not an API) |
 | Targets | `dotnet`, `jvm`, `native` (POSIX; run on Linux x86-64) |
 | Stability | experimental (0.1.0) |
 | Third-party libraries | none (`[nuget]` and `[maven]` are empty) |
@@ -167,6 +167,13 @@ A `Sock` is read by one thread at a time and written by one thread at a time; th
 
 The path and the query of a URL are the client's own: cut them off before `splitUserInfo`.
 
+### `Net.Threads`
+
+`start(work): Thread` runs `work` on a dedicated operating-system thread (never the runtime's shared
+pool) and `join(thread)` waits for it. It is what a client's heart-beat and reconnect loop runs on.
+There is no cancellation: the work returns when its client tells it to, usually through a flag that
+`close()` sets.
+
 ### `Net.Tcp.Testing` (test support)
 
 `serverListen(host, port)`, `serverPort`, `serverAccept` (a `Net.Tcp.Sock`), `serverClose`,
@@ -312,6 +319,7 @@ Differences between the targets, collected:
 | File | Package | Content |
 |---|---|---|
 | `src/tcp.l` | `Net.Tcp` | the connection API |
+| `src/threads.l` | `Net.Threads` | a dedicated thread for a client's background work |
 | `src/tcp_testing.l` | `Net.Tcp.Testing` | listener, server-side TLS and background threads for tests |
 | `src/tls.l` | `Net.Tls` | `TlsOptions`, validation, the insecure policy, the environment reader |
 | `src/url.l` | `Net.Url` | schemes, percent-decoding, user information, host and port |
