@@ -259,7 +259,16 @@ test "invalidate makes the next resolve ask the provider" {
 // ─── The cache under concurrent use ──────────────────────────────────────────
 protected type Tally {
   var calls: Int = 0
+  var arrived: Int = 0
   var results: List[String] = newList()
+  entry arrive() {
+    arrived = arrived + 1
+  }
+  // Blocks until all four callers are on their way into the cache.
+  entry awaitFourArrivals()
+    when: arrived >= 4
+  {
+  }
   entry called(): Int {
     calls = calls + 1
     calls
@@ -279,7 +288,10 @@ protected type Tally {
   }
 }
 
-// A provider that takes half a second, so that callers overlap.
+// A provider that does not answer before all four callers have started, and
+// then takes half a second more, so that the callers overlap however late
+// the runtime starts a thread (the .NET thread pool can hold a task back for
+// longer than any fixed pause).
 record Slow {
   tally: Tally
   fails: Bool
@@ -288,6 +300,7 @@ record Slow {
 impl CredentialProvider for Slow {
   func resolve(): Result[ResolvedCredentials, CredentialError] {
     val n = self.tally.called()
+    self.tally.awaitFourArrivals()
     Time.sleepMillis(500)
     if self.fails {
       failure("REQUEST_FAILED", "slow", "attempt " + n.toString() + " failed")
@@ -322,6 +335,7 @@ protected type Shared {
 
 func resolveInto(shared: in Shared, tally: in Tally): Unit {
   val cache = shared.get()
+  tally.arrive()
   tally.record(describe(cache.resolve()))
 }
 
