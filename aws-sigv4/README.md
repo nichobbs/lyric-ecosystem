@@ -1,6 +1,6 @@
 # lyric-aws-sigv4
 
-AWS Signature Version 4 in pure Lyric, for `dotnet` and `jvm`, `experimental` (0.1.0). It is the
+AWS Signature Version 4 in pure Lyric, for `dotnet`, `jvm` and `native`, `experimental` (0.1.0). It is the
 signing code the AWS backends of this repository share (`storage-s3`, `mq-sqs`); it implements no
 library interface of its own. It depends on the standard library only: SHA-256 and HMAC-SHA256 come
 from `Std.Hash`, and there is no AWS SDK and no extern declaration.
@@ -9,7 +9,7 @@ from `Std.Hash`, and there is no AWS SDK and no extern declaration.
 |---|---|
 | Package | `Lyric.Aws.SigV4` (Lyric packages `Aws.SigV4`, `Aws.SigV4.Env`) |
 | Interface | none: a shared building block |
-| Targets | `dotnet`, `jvm` |
+| Targets | `dotnet`, `jvm`, `native` |
 | Stability | `experimental` (0.1.0) |
 | Algorithm | `AWS4-HMAC-SHA256`, header signing and query-string presigning |
 | Dependencies | the standard library. No SDK, no `[nuget]`, no `[maven]`, no native dependency |
@@ -113,7 +113,7 @@ reads are the ones in the table above; a variable that is set to the empty strin
 
 ## Supported targets
 
-`dotnet` and `jvm`. Both run the same code; there is no per-target kernel.
+`dotnet`, `jvm` and `native`. All three run the same code; there is no per-target kernel.
 
 ## Surprises
 
@@ -146,6 +146,11 @@ There is no difference between the targets.
 lyric test --manifest aws-sigv4/lyric.toml --target dotnet
 lyric test --manifest aws-sigv4/lyric.toml --target jvm
 ```
+
+`lyric test --manifest` does not run on `--target native` yet (nichobbs/lyric-lang#6815): there the
+same three test modules are built as executables, each with the package's own packages
+(`lyric build --manifest ... --target native`), and run, by `bash scripts/ci/test-native.sh` here and
+in the `native` CI job; all 25 tests pass that way.
 
 Everything is hermetic; there is no integration suite, because nothing here talks to a service
 (the packages that use it sign real requests: `storage-s3` and `mq-sqs` each run an in-process

@@ -210,18 +210,36 @@ then `.copy(...)` or the `with...` functions):
 | `deduplication` | `Deduplication.ById` | FIFO: `ById`, `Unique` or `ContentBased` (`withDeduplication`) |
 | `deadLetterQueueUrl` | `""` | where `nack(id, false)` copies a message before deleting it (`withDeadLetterQueue`) |
 | `maxBatchBytes` | 262144 | the largest `SendMessageBatch` request |
+| `additionalCaCertificatePem` | `""` | a certificate authority (PEM text, one certificate) trusted in addition to the system trust store (`withCaCertificate(pem)`, `withCaCertificateFile(path)`) |
+| `caCertificatePem` | `""` | the only certificate authority the server certificate may chain to; the system trust store is not consulted, and it wins over `additionalCaCertificatePem` (`withExclusiveCaCertificate(pem)`, `withExclusiveCaCertificateFile(path)`) |
 
 `connectWith` and `openClient` make no request; they return `Err` (`INVALID_CONFIG` for
 `openClient`) for empty credentials, a malformed queue URL or endpoint, a missing or malformed
 region, a non-positive timeout, a visibility timeout outside 1 to 43200, a receive batch outside 1
-to 10, a non-positive `maxBatchBytes`, a malformed dead-letter queue URL, and, for a FIFO queue, a
-message group id SQS would refuse.
+to 10, a non-positive `maxBatchBytes`, a malformed dead-letter queue URL, a CA certificate that is
+not a PEM certificate, and, for a FIFO queue, a message group id SQS would refuse.
 
 Both the queue URL and the endpoint must be `https://` unless the host is `localhost`, `127.0.0.1`
 or `[::1]`: a signature does not hide the access key id, the queue or the messages, and a request
 sent in the clear can be replayed for the 15 minutes its signature is valid. They must be
 `scheme://host[:port]` (plus the queue path for a queue URL), with no credentials, query or
 fragment.
+
+TLS: the server certificate of an `https://` URL is verified against the system trust store and must
+carry the host name. For an SQS-compatible server whose certificate comes from a private authority,
+or is self-signed, give the authority's certificate (or the self-signed certificate itself) to
+`withCaCertificate`, which adds it to the system trust store, or to `withExclusiveCaCertificate`,
+which trusts nothing else. These are `Std.Http`'s options of the same names, and the names and
+meaning are those of `Lyric.Redis`. The `...File` forms read a PEM file and return a
+`Result[SqsConfig, SqsError]`: a file that is missing or empty is `INVALID_CONFIG`. A CA certificate
+does not relax the rule above (plain HTTP stays loopback-only), and there is no option to skip
+certificate verification.
+
+```lyric
+val base = Sqs.endpointConfig("https://sqs.internal.example:9324", queueUrl, "us-east-1", keyId, secret)
+val cfg = match base.withCaCertificateFile("/etc/ssl/private-ca.pem") { case Ok(c) -> c; case Err(e) -> return Err(e.text()) }
+val queue = Sqs.connectWith(cfg)?
+```
 
 Environment variables:
 
@@ -237,7 +255,9 @@ Environment variables:
 | `LYRIC_CONFIG_MQ_SQS_RECEIVEBATCH` | `connectFromEnv` | 1 to 10, default 1 |
 | `LYRIC_CONFIG_MQ_SQS_MESSAGEGROUP` | `connectFromEnv` | FIFO message group, default `default` |
 | `LYRIC_CONFIG_MQ_SQS_DEADLETTERQUEUEURL` | `connectFromEnv` | dead-letter queue URL, default none |
+| `LYRIC_CONFIG_MQ_SQS_CACERTIFICATEFILE` | `connectFromEnv` | a PEM file with a certificate authority to trust in addition to the system trust store (`withCaCertificateFile`), default none |
 | `LYRIC_SQS_ENDPOINT`, `LYRIC_SQS_REGION` | the integration suite only | where the test server is |
+| `LYRIC_SQS_CA_FILE` | the integration suite only | optional: a PEM file with a certificate authority, passed to `withCaCertificateFile` |
 
 `Mq`'s own `LYRIC_CONFIG_MQ_CONNECTION_*` variables are for `Mq.connect()` and are not read. A
 variable set to the empty string counts as unset. Credentials are never read from a file and never
@@ -347,6 +367,18 @@ Waiting and failures:
   transport failure; `publishBatch` treats it as unknown too, because a connection can also break
   after the request was sent. A slow `ReceiveMessage` is never reported as the interface's
   `"timeout"`, which only means the queue had nothing.
+- **Only the first certificate of the PEM text is read.** `withCaCertificate` and
+  `withExclusiveCaCertificate` take one certificate authority, not a bundle: in a file with several
+  certificates the others are ignored, on both targets. Pass the authority that signed the server
+  certificate (for a self-signed server, its own certificate).
+- **An untrusted server certificate is `CONNECTION_FAILED`, and the message differs by target.** On
+  the JVM it names the cause (`PKIX path building failed: ... unable to find valid certification path
+  to requested target`); on dotnet it is only `The SSL connection could not be established, see inner
+  exception`. The code is the same, and so are the CA options: both targets accept the same PEM and
+  behave the same in the hermetic and integration suites.
+- **A CA certificate is for the endpoint and for every queue URL the client is used with**: there is
+  one HTTP client per `SqsClient`. On an `http://` (loopback) endpoint the option is validated and
+  then has nothing to verify.
 - **Nothing is retried.** Throttling (`RequestThrottled`, `ThrottlingException`), 5xx responses and
   transport errors are returned as they are.
 - **Redirects are not followed**: a redirect would send a signed request to a host the signature
@@ -400,7 +432,7 @@ lyric test --manifest mq-sqs/lyric.toml --target jvm
   `connectFromEnv` accept, derive and refuse. They set and restore the `AWS_*` and
   `LYRIC_CONFIG_MQ_SQS_*` variables.
 - `tests/reexport_tests.l` (1 test), `tests/readme_tests.l` (1 test).
-- `tests/fake_sqs_tests.l` (14 tests): the client over real HTTP against an SQS server written in
+- `tests/fake_sqs_tests.l` (17 tests): the client over real HTTP against an SQS server written in
   the test on `Std.HttpServer`. The server verifies the SigV4 signature of every request (and the
   session token of temporary credentials), implements visibility timeouts, receive counts, receipt
   handles, long polling, FIFO group blocking and deduplication, redrive policies and SQS's limits.
@@ -409,8 +441,13 @@ lyric test --manifest mq-sqs/lyric.toml --target jvm
   splits, partial failures), timeouts, visibility expiry, dead letters, FIFO, `Auto` mode, `close`,
   signature and error mapping, queue management, messages from other producers, and timeouts (a
   listener that accepts and never answers, 40 short deadlines in a row, every call path) against
-  refused connections (port 1). It listens on
-  127.0.0.1 ports 19801 to 19813. The whole hermetic run takes about half a minute on dotnet and a
+  refused connections (port 1). The same server is also started over HTTPS
+  (`Std.HttpServer.startListenerTls`, both targets) with a fixture certificate from a private CA: a
+  client given that CA with `withCaCertificate` or `withExclusiveCaCertificate` creates a queue,
+  publishes, consumes and acknowledges, and a client without it, or with another CA, gets
+  `CONNECTION_FAILED` and never reaches the server. The certificates and the key in the file are
+  labelled test fixtures. It listens on
+  127.0.0.1 ports 19801 to 19814. The whole hermetic run takes about half a minute on dotnet and a
   minute and a half on jvm.
 
 The run reports the integration module as gated (`0 test(s), module gated by inactive @cfg`).
@@ -432,6 +469,21 @@ visibility expiry and extension, both kinds of dead-lettering, FIFO order, group
 deduplication, `Auto` mode, queue management and `close`. It takes one to three minutes.
 `start-elasticmq.sh` resolves ElasticMQ with Maven and needs a JDK; it accepts `ELASTICMQ_PORT`.
 
+The same suite runs against [AWS Emulator](https://github.com/aws/aws-emulator), AWS's own local
+emulator, in the `aws-emulator` CI job and by hand:
+
+```sh
+set -a; eval "$(bash scripts/ci/start-aws-emulator.sh)"; set +a   # downloads, verifies and installs the pinned package
+bash scripts/ci/test-aws-emulator.sh dotnet                        # or jvm; runs mq-sqs and storage-s3
+```
+
+The emulator checks every SigV4 signature against a key it generates at start (a wrong secret is
+`SignatureDoesNotMatch`, HTTP 403), which ElasticMQ does not. It serves HTTPS with a certificate
+made at start, from its own CA. `test-aws-emulator.sh` passes that CA as `LYRIC_SQS_CA_FILE`, so the
+suite trusts it through `withCaCertificateFile` and nothing process-wide is changed (no
+`SSL_CERT_FILE`, no JVM trust store): this run is the check of the CA option against a real HTTPS
+server with a private certificate, on both targets.
+
 The integration suite also runs against Amazon SQS itself (set `LYRIC_SQS_ENDPOINT` to
 `https://sqs.<region>.amazonaws.com` and real credentials), but that has not been done; see "Known
 gaps".
@@ -446,14 +498,17 @@ There is no third-party library (`[nuget]` and `[maven]` are empty). What the su
 | Signing | `Lyric.Aws.SigV4` 0.1.0, the version in this repository (`aws-sigv4/`) |
 | SQS API | the JSON 1.0 protocol of the 2012-11-05 API |
 | ElasticMQ (CI and development) | `org.elasticmq:elasticmq-server_2.13` 1.6.11 from Maven Central, `sqs-limits = strict`, started by `scripts/ci/start-elasticmq.sh` |
+| AWS Emulator (CI) | 1.0.341, the signed Debian package, started by `scripts/ci/start-aws-emulator.sh`; all 14 integration tests pass on both targets |
 | Runtimes | .NET 10; OpenJDK 21 in development |
 
 ## Known gaps
 
-- **Not run against Amazon SQS.** The integration suite has only been run against ElasticMQ, which
-  accepts any credentials and does not verify signatures. Signing is verified by the hermetic fake
-  server and by the published examples in `aws-sigv4`, not by AWS. Behaviour that only AWS has
-  (short-poll sampling, the 120000 in-flight limit, KMS, IAM errors) is untested. No issue filed.
+- **Not run against Amazon SQS.** The integration suite runs against ElasticMQ and against AWS
+  Emulator. The emulator is AWS's own and verifies signatures, so signing is now checked by an AWS
+  implementation as well as by the hermetic fake server and the published examples in `aws-sigv4`,
+  but it is an emulator, in memory and in one region: behaviour that only the service has
+  (short-poll sampling across servers, the 120000 in-flight limit, KMS, IAM policy errors,
+  throttling) is untested. No issue filed.
 - No retries, backoff or throttling handling; no issue filed.
 - Credentials from the environment or explicit values only (no profiles, IMDS, ECS, SSO, STS).
 - `MD5OfMessageBody` and `MD5OfMessageAttributes` are not verified: `Std.Hash` has no MD5. No issue

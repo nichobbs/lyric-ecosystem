@@ -11,6 +11,10 @@
 //!   AWS_ACCESS_KEY_ID       credentials allowed to create and use the bucket
 //!   AWS_SECRET_ACCESS_KEY
 //!   AWS_SESSION_TOKEN       optional, for temporary credentials
+//!   LYRIC_S3_CA_FILE        optional: a PEM file with a certificate authority
+//!                           to trust in addition to the system trust store
+//!                           (`withCaCertificateFile`), for a server whose
+//!                           certificate is private (AWS Emulator in CI)
 //!
 //!   LYRIC_S3_ENDPOINT=http://127.0.0.1:9000 LYRIC_S3_BUCKET=lyric-it \
 //!   LYRIC_S3_REGION=us-east-1 AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=... \
@@ -30,6 +34,7 @@ import Std.Errors
 import Std.Http
 import Std.String as Str
 import Std.Testing
+import Std.Tls as Tls
 import Testing.Conformance
 import Testing.Conformance.Storage as StorageConformance
 import Storage.S3
@@ -57,7 +62,15 @@ func liveConfig(): S3Config {
   } else {
     endpointConfig(endpoint, bucket, region, keyId, secret)
   }
-  base.withSessionToken(Env.getVarOrDefault("AWS_SESSION_TOKEN", ""))
+  val withToken = base.withSessionToken(Env.getVarOrDefault("AWS_SESSION_TOKEN", ""))
+  val caFile = Env.getVarOrDefault("LYRIC_S3_CA_FILE", "")
+  if caFile.length == 0 {
+    return withToken
+  }
+  match withToken.withCaCertificateFile(caFile) {
+    case Ok(cfg) -> cfg
+    case Err(e) -> panic("LYRIC_S3_CA_FILE: " + e.code + " " + e.message)
+  }
 }
 
 func liveClient(): S3Client {
@@ -192,8 +205,21 @@ test "binary objects, encoded keys, metadata and HEAD against a real S3 server" 
   }
 }
 
+// A client without credentials, as whoever is handed a presigned URL has. It
+// trusts LYRIC_S3_CA_FILE when that is set, as the backend under test does.
+func plainClient(): HttpClient {
+  val caFile = Env.getVarOrDefault("LYRIC_S3_CA_FILE", "")
+  if caFile.length == 0 {
+    return defaultClient()
+  }
+  match Tls.Certificate.fromPemFile(caFile) {
+    case Ok(ca) -> HttpClientBuilder.new().withCaCertificate(ca).build()
+    case Err(e) -> panic("LYRIC_S3_CA_FILE: " + Tls.TlsError.message(e))
+  }
+}
+
 func fetchText(url: in String): String {
-  match await defaultClient().get(url) {
+  match await plainClient().get(url) {
     case Err(e) -> "transport " + HttpError.message(e)
     case Ok(resp) -> {
       val body = match await HttpResponse.bodyText(resp) { case Ok(t) -> t; case Err(_) -> "(unreadable)" }
@@ -236,7 +262,7 @@ test "presigned GET and PUT URLs against a real S3 server" {
     case Ok(r) -> r
     case Err(e) -> panic(HttpError.message(e))
   }
-  match await sendAsync(upload) {
+  match await plainClient().send(upload) {
     case Err(e) -> panic("the presigned PUT failed: " + HttpError.message(e))
     case Ok(resp) -> assertEqualInt(HttpResponse.statusCode(resp), 200, "the presigned PUT is accepted")
   }
@@ -254,16 +280,7 @@ test "errors from a real S3 server carry its codes" {
     case Err(e) -> assertEqual(e.code, "NOT_FOUND", "NoSuchKey is NOT_FOUND")
   }
   val cfg = liveConfig()
-  val wrongSecret = S3Config(
-    bucket = cfg.bucket,
-    region = cfg.region,
-    accessKeyId = cfg.accessKeyId,
-    secretAccessKey = cfg.secretAccessKey + "x",
-    sessionToken = cfg.sessionToken,
-    endpoint = cfg.endpoint,
-    pathStyle = cfg.pathStyle,
-    requestTimeoutMs = cfg.requestTimeoutMs
-  )
+  val wrongSecret = cfg.copy(secretAccessKey = cfg.secretAccessKey + "x")
   match connect(wrongSecret) {
     case Err(e) -> panic("connect failed: " + e.message)
     case Ok(b) -> match b.get("k") {
@@ -271,16 +288,7 @@ test "errors from a real S3 server carry its codes" {
       case Err(e) -> assertEqual(e.code, "SignatureDoesNotMatch", "a wrong secret: " + e.message)
     }
   }
-  val otherBucket = S3Config(
-    bucket = cfg.bucket + "-absent-" + cfg.region,
-    region = cfg.region,
-    accessKeyId = cfg.accessKeyId,
-    secretAccessKey = cfg.secretAccessKey,
-    sessionToken = cfg.sessionToken,
-    endpoint = cfg.endpoint,
-    pathStyle = cfg.pathStyle,
-    requestTimeoutMs = cfg.requestTimeoutMs
-  )
+  val otherBucket = cfg.copy(bucket = cfg.bucket + "-absent-" + cfg.region)
   match connect(otherBucket) {
     case Err(e) -> panic("connect failed: " + e.message)
     case Ok(b) -> match b.list("", "", 10) {
@@ -289,7 +297,12 @@ test "errors from a real S3 server carry its codes" {
     }
   }
   match createBucket(client) {
-    case Ok(created) -> assertFalse(created, "creating the bucket again reports it as already owned")
+    // Amazon S3 (and AWS Emulator) answer 200 for this in us-east-1; MinIO
+    // and every other region answer BucketAlreadyOwnedByYou.
+    case Ok(created) -> assertTrue(
+      not created or cfg.region == "us-east-1",
+      "creating the bucket again reports it as already owned"
+    )
     case Err(e) -> panic("createBucket of an existing bucket failed: " + e.code + " " + e.message)
   }
 }

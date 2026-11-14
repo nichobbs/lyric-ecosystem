@@ -1,6 +1,6 @@
 # Lyric.Redis
 
-A Redis client written in Lyric, for `dotnet` and `jvm`, `experimental` (0.1.0). It implements no
+A Redis client written in Lyric, for `dotnet`, `jvm` and `native`, `experimental` (0.1.0). It implements no
 `lyric-lang` interface: it is the client that `Lyric.Cache.Redis` (`Cache.CacheStore`) and
 `Lyric.Session.Redis` (`Session.SessionStore`) in this repository are built on, and it can be used
 directly. The protocol (RESP2 and RESP3 encoder, incremental decoder), the URL parser and the client
@@ -12,11 +12,11 @@ third-party SDK.
 |---|---|
 | Lyric packages | `Redis` (client), `Redis.Resp` (protocol), `Redis.Url` (URL parser) |
 | Depends on | `Lyric.Net` (`net/`): TCP and TLS connection, TLS option checks, URL authority parsing |
-| Targets | `dotnet`, `jvm` |
+| Targets | `dotnet`, `jvm`, `native` (POSIX; run on Linux x86-64) |
 | Stability | experimental (0.1.0) |
 | Third-party libraries | none |
 | Server requirement | Redis 6.0 or later for ACL users (`AUTH user password`), RESP3 and TLS; older servers work with RESP2 and a `requirepass` password |
-| TLS | `rediss://`, TLS 1.2 and 1.3, through the platform's own stack (`SslStream` on dotnet, JSSE on jvm) |
+| TLS | `rediss://`, TLS 1.2 and 1.3, through the platform's own stack (`SslStream` on dotnet, JSSE on jvm, OpenSSL 3 on native) |
 
 ## Usage
 
@@ -247,7 +247,7 @@ Reconnects, retries and timeouts:
 - **The I/O timeout is per read, not per command.** A large reply that keeps arriving does not time
   out, however long it takes in total.
 - **On `jvm` the I/O timeout bounds reads only**: `SO_TIMEOUT` does not bound a blocked write. On
-  `dotnet` it bounds reads and writes.
+  `dotnet` and `native` it bounds reads and writes.
 - **An error reply does not break the connection.** `ServerError` leaves the connection in use; only
   `ConnectionLost` and `ProtocolViolation` drop it.
 
@@ -355,6 +355,13 @@ lyric test --manifest redis/lyric.toml --target dotnet --features integration
 lyric test --manifest redis/lyric.toml --target jvm --features integration
 ```
 
+`lyric test --manifest` does not run on `--target native` yet (nichobbs/lyric-lang#6815). There the
+same test modules are built as executables, each together with the packages of `redis` and `net`
+(`lyric build --manifest ... --target native [--features integration]`), and run: the 78 hermetic
+and the 40 integration tests pass that way on Linux x86-64 (clang 18.1.3, OpenSSL 3.0.13, Redis
+with and without TLS). `bash scripts/ci/test-native.sh [--integration]` does this, here and in the
+`native` CI job.
+
 Run from the repository root. The hermetic TLS suite (`tests/tls_tests.l`) runs real handshakes on both
 targets against a fake server built on `Net.Tcp.Testing`. Its certificates and keys are test
 fixtures embedded in the file (a throwaway CA, a server certificate for `localhost` / `127.0.0.1`, a
@@ -398,7 +405,9 @@ There is no third-party library. The servers and runtimes the suites run against
   control.
 - The connect timeout has no automated test: it needs an address that drops packets, which the
   hermetic suite cannot create portably.
-- The gaps of `Lyric.Net` apply (lyric-lang#9042, lyric-lang#9064); see its README.
+- The gaps of `Lyric.Net` apply (lyric-lang#9042, lyric-lang#9064); see its README, also for what
+  `native` needs (POSIX, OpenSSL 3 at run time for TLS) and how a TLS connection is shared between
+  threads there.
 - **One connection per client**: no pool, no multiplexing, no pub/sub API, no `MULTI`/`EXEC` helper (use
   `eval` or a pipeline), no Cluster or Sentinel support.
 - `EVAL` sends the script text each time; there is no `EVALSHA` cache.

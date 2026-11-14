@@ -9,6 +9,10 @@
 //!
 //! `scripts/ci/start-elasticmq.sh` starts the server and prints them.
 //!
+//! `LYRIC_SQS_CA_FILE` is optional: a PEM file with a certificate authority to
+//! trust in addition to the system trust store (`withCaCertificateFile`), for
+//! a server whose certificate is private (AWS Emulator in CI).
+//!
 //! Every test creates its own queues (`lyric-it-<run>-<n>`) and deletes them
 //! again. The conformance suite runs on FIFO queues: two of its cases assert
 //! publish order, which a standard queue does not promise (README, "The
@@ -39,9 +43,17 @@ func required(name: in String, example: in String): String {
 }
 
 func baseConfig(queueUrl: in String): SqsConfig {
-  endpointConfig(required("LYRIC_SQS_ENDPOINT", "http://127.0.0.1:9324"), queueUrl, required("LYRIC_SQS_REGION", "elasticmq"), required("AWS_ACCESS_KEY_ID", "x"), required("AWS_SECRET_ACCESS_KEY", "x")).withRequestTimeout(
+  val cfg = endpointConfig(required("LYRIC_SQS_ENDPOINT", "http://127.0.0.1:9324"), queueUrl, required("LYRIC_SQS_REGION", "elasticmq"), required("AWS_ACCESS_KEY_ID", "x"), required("AWS_SECRET_ACCESS_KEY", "x")).withRequestTimeout(
     15000
   )
+  val caFile = Env.getVarOrDefault("LYRIC_SQS_CA_FILE", "")
+  if caFile.length == 0 {
+    return cfg
+  }
+  match cfg.withCaCertificateFile(caFile) {
+    case Ok(trusting) -> trusting
+    case Err(e) -> panic("LYRIC_SQS_CA_FILE: " + e.text())
+  }
 }
 
 func admin(): SqsClient {

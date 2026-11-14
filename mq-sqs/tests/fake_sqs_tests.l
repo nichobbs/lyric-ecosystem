@@ -45,13 +45,16 @@ package Mq.Sqs.FakeSqsTests
 import Std.Core
 import Std.Collections
 import Std.Encoding as Enc
+import Std.Environment as Env
 import Std.Errors
+import Std.File as File
 import Std.Http
 import Std.HttpServer
 import Std.JsonValue
 import Std.String as Str
 import Std.Testing
 import Std.Time as Time
+import Std.Tls as Tls
 import Testing.Conformance
 import Testing.Conformance.Mq as MqConformance
 import Aws.SigV4
@@ -100,6 +103,8 @@ ref record FakeQueue {
 }
 
 ref record FakeSqs {
+  // `http` or `https`: the scheme of the queue URLs the server hands out.
+  scheme: String
   port: Int
   var queues: Map[String, FakeQueue]
   var requestCount: Int
@@ -107,8 +112,8 @@ ref record FakeSqs {
   var log: List[String]
 }
 
-func newFakeSqs(port: in Int): FakeSqs {
-  FakeSqs(port = port, queues = newMap(), requestCount = 0, counter = 0, log = newList())
+func newFakeSqs(scheme: in String, port: in Int): FakeSqs {
+  FakeSqs(scheme = scheme, port = port, queues = newMap(), requestCount = 0, counter = 0, log = newList())
 }
 
 func nextId(sqs: in FakeSqs, prefix: in String): String {
@@ -540,7 +545,7 @@ func store(sqs: in FakeSqs, queue: in FakeQueue, wanted: in Wanted): String {
 
 // ─── Actions ─────────────────────────────────────────────────────────────────
 func queueUrlOf(sqs: in FakeSqs, name: in String): String {
-  "http://127.0.0.1:" + sqs.port.toString() + "/" + ACCOUNT + "/" + name
+  sqs.scheme + "://127.0.0.1:" + sqs.port.toString() + "/" + ACCOUNT + "/" + name
 }
 
 func queueArnOf(name: in String): String {
@@ -1138,8 +1143,8 @@ func handle(sqs: in FakeSqs, ctx: in HttpContext): Unit {
   }
 }
 
-func serveUntilStopped(l: in HttpListener, port: in Int): Unit {
-  val sqs = newFakeSqs(port)
+func serveUntilStopped(l: in HttpListener, scheme: in String, port: in Int): Unit {
+  val sqs = newFakeSqs(scheme, port)
   var running = true
   while running {
     val ctx = nextContext(l)
@@ -1182,7 +1187,7 @@ func endpointOf(port: in Int): String {
 @cfg(target = "dotnet")
 func withFakeSqs(port: in Int, scenario: in (String) -> String): String {
   val l = startListener(endpointOf(port) + "/")
-  val server = taskRun({ -> serveUntilStopped(l, port) })
+  val server = taskRun({ -> serveUntilStopped(l, "http", port) })
   val transcript = scenario(endpointOf(port))
   taskWait(server)
   stopListener(l)
@@ -1194,7 +1199,7 @@ func withFakeSqs(port: in Int, scenario: in (String) -> String): String {
   val l = startListener(endpointOf(port) + "/")
   var transcript = ""
   scope {
-    val server = spawn serveUntilStopped(l, port)
+    val server = spawn serveUntilStopped(l, "http", port)
     transcript = scenario(endpointOf(port))
     await server
   }
@@ -2444,5 +2449,209 @@ test "a request that is not answered in time is a TIMEOUT on every attempt; a re
       "sqs: publishBatch: request 1 of 1: SendMessageBatch got no response from http://127.0.0.1:1: "
     ),
     "a refused batch: " + batch
+  )
+}
+
+// ─── TLS ─────────────────────────────────────────────────────────────────────
+// TEST FIXTURES, NOT SECRETS. The certificates and the private key below exist
+// only for the hermetic TLS tests of the AWS backends in this repository (the
+// same four are in storage-s3/tests/fake_s3_tests.l): a throwaway CA, a server
+// certificate for `localhost` / `127.0.0.1` signed by it, and a second CA that
+// signed nothing. They protect nothing and are valid until 2126. Made with:
+//
+//   openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out X.key
+//   openssl req -x509 -new -key ca.key -sha256 -days 36500 \
+//     -subj "/O=Lyric AWS backends test fixture/CN=test fixture CA (not a secret)" \
+//     -addext "basicConstraints=critical,CA:TRUE" -addext "keyUsage=critical,keyCertSign,cRLSign" -out ca.crt
+//   openssl req -new -key server.key -subj "/O=Lyric AWS backends test fixture/CN=localhost" -out server.csr
+//   openssl x509 -req -in server.csr -CA ca.crt -CAkey ca.key -CAcreateserial -sha256 -days 36500 \
+//     -extfile server.ext -out server.crt      (subjectAltName=DNS:localhost,IP:127.0.0.1)
+val FIXTURE_CA_PEM: String = "-----BEGIN CERTIFICATE-----\nMIICDjCCAbOgAwIBAgIUehV33rhTgQ0MIpdI/2vALz16WHIwCgYIKoZIzj0EAwIw\nUzEoMCYGA1UECgwfTHlyaWMgQVdTIGJhY2tlbmRzIHRlc3QgZml4dHVyZTEnMCUG\nA1UEAwwedGVzdCBmaXh0dXJlIENBIChub3QgYSBzZWNyZXQpMCAXDTI2MTExMzA3\nNDkzNFoYDzIxMjYxMDIwMDc0OTM0WjBTMSgwJgYDVQQKDB9MeXJpYyBBV1MgYmFj\na2VuZHMgdGVzdCBmaXh0dXJlMScwJQYDVQQDDB50ZXN0IGZpeHR1cmUgQ0EgKG5v\ndCBhIHNlY3JldCkwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAASlTjPdK05iaHbC\nP8/DRkaOkAbSHlo/5usXvOpQK4ebMwgH+6+sjVY+4srGM/5gY1Ad27A2BJVQ4IrQ\njFAm9zMYo2MwYTAdBgNVHQ4EFgQUJhRJqHEzNL474DOA1wtcBP8LM94wHwYDVR0j\nBBgwFoAUJhRJqHEzNL474DOA1wtcBP8LM94wDwYDVR0TAQH/BAUwAwEB/zAOBgNV\nHQ8BAf8EBAMCAQYwCgYIKoZIzj0EAwIDSQAwRgIhAKru9e/hbUoMCQ9/Nz11sj+1\nWfzr4m0/s1z1FMKPKGB7AiEA+lt6MMiDNToff6ngfv7m8ztBYUsHlQoF5Kq7izgn\nOdg=\n-----END CERTIFICATE-----\n"
+
+val FIXTURE_SERVER_CERT_PEM: String = "-----BEGIN CERTIFICATE-----\nMIICJTCCAcugAwIBAgIUby5WyizAQTgdThfE+RT04AjHDyMwCgYIKoZIzj0EAwIw\nUzEoMCYGA1UECgwfTHlyaWMgQVdTIGJhY2tlbmRzIHRlc3QgZml4dHVyZTEnMCUG\nA1UEAwwedGVzdCBmaXh0dXJlIENBIChub3QgYSBzZWNyZXQpMCAXDTI2MTExMzA3\nNDkzNFoYDzIxMjYxMDIwMDc0OTM0WjA+MSgwJgYDVQQKDB9MeXJpYyBBV1MgYmFj\na2VuZHMgdGVzdCBmaXh0dXJlMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjO\nPQIBBggqhkjOPQMBBwNCAASqrA4/CynXzAIAQGdvnp7GPHGthl3P6qJ2qZfxM/2p\nHzQlu8UAdbIRSPdi6tD0454iL9e5ldRxVJ3e1Pig3W1Vo4GPMIGMMAkGA1UdEwQC\nMAAwDgYDVR0PAQH/BAQDAgeAMBMGA1UdJQQMMAoGCCsGAQUFBwMBMBoGA1UdEQQT\nMBGCCWxvY2FsaG9zdIcEfwAAATAdBgNVHQ4EFgQU/je8BKSYH9HeLVMBa18JsP8y\nhLAwHwYDVR0jBBgwFoAUJhRJqHEzNL474DOA1wtcBP8LM94wCgYIKoZIzj0EAwID\nSAAwRQIhAM5g73n49syQr/I2s+6Vsfs0Ojw2kwxAnv8zsswLxIw+AiAcN2KJd/i/\nxMz8T83NmZfFivdfE10h/SkK51VsHIttfg==\n-----END CERTIFICATE-----\n"
+
+val FIXTURE_SERVER_KEY_PEM: String = "-----BEGIN PRIVATE KEY-----\nMIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgtKwkAL49aCgKU8Be\nefwIxJ9fk9Vp3UQnXex9b9hiCwyhRANCAASqrA4/CynXzAIAQGdvnp7GPHGthl3P\n6qJ2qZfxM/2pHzQlu8UAdbIRSPdi6tD0454iL9e5ldRxVJ3e1Pig3W1V\n-----END PRIVATE KEY-----\n"
+
+// A CA that did not sign the server certificate.
+val FIXTURE_OTHER_CA_PEM: String = "-----BEGIN CERTIFICATE-----\nMIICHTCCAcOgAwIBAgIUARJtxHD1seTCMo8Yy05/b8YDT2EwCgYIKoZIzj0EAwIw\nWzEoMCYGA1UECgwfTHlyaWMgQVdTIGJhY2tlbmRzIHRlc3QgZml4dHVyZTEvMC0G\nA1UEAwwmYW5vdGhlciB0ZXN0IGZpeHR1cmUgQ0EgKG5vdCBhIHNlY3JldCkwIBcN\nMjYxMTEzMDc0OTM0WhgPMjEyNjEwMjAwNzQ5MzRaMFsxKDAmBgNVBAoMH0x5cmlj\nIEFXUyBiYWNrZW5kcyB0ZXN0IGZpeHR1cmUxLzAtBgNVBAMMJmFub3RoZXIgdGVz\ndCBmaXh0dXJlIENBIChub3QgYSBzZWNyZXQpMFkwEwYHKoZIzj0CAQYIKoZIzj0D\nAQcDQgAEj31puhUVhDm9h62ooQv3xD+A+VxMIWBBPMjPG2QLQXiPCf9hSPIVAxV8\nq4VC09dnHKzwuYtonrrvVnsr52vOm6NjMGEwHQYDVR0OBBYEFJmzXefGlc3B9qWW\nae54NCLQy6LHMB8GA1UdIwQYMBaAFJmzXefGlc3B9qWWae54NCLQy6LHMA8GA1Ud\nEwEB/wQFMAMBAf8wDgYDVR0PAQH/BAQDAgEGMAoGCCqGSM49BAMCA0gAMEUCIQDU\nauGTenHbZvZ5bCf8/JkpOShiIvdCuqhdF6seQWKltQIgGdUI0OPFU9Y599Q3sX0Y\nS4bDv5i7emOh6NvklppE0fo=\n-----END CERTIFICATE-----\n"
+
+func tlsEndpointOf(port: in Int): String {
+  "https://127.0.0.1:" + port.toString()
+}
+
+func startFakeTls(port: in Int): HttpListener {
+  val identity = match Tls.Identity.fromPem(FIXTURE_SERVER_CERT_PEM, FIXTURE_SERVER_KEY_PEM) {
+    case Ok(i) -> i
+    case Err(e) -> panic("fixture identity: " + Tls.TlsError.message(e))
+  }
+  match startListenerTls("127.0.0.1", port, Tls.TlsServerConfig(identity = identity)) {
+    case Ok(l) -> l
+    case Err(_) -> panic("cannot start the HTTPS fake on port " + port.toString())
+  }
+}
+
+@cfg(target = "dotnet")
+func withFakeSqsTls(port: in Int, scenario: in (String) -> String): String {
+  val l = startFakeTls(port)
+  val server = taskRun({ -> serveUntilStopped(l, "https", port) })
+  val transcript = scenario(tlsEndpointOf(port))
+  taskWait(server)
+  stopListener(l)
+  transcript
+}
+
+@cfg(target = "jvm")
+func withFakeSqsTls(port: in Int, scenario: in (String) -> String): String {
+  val l = startFakeTls(port)
+  var transcript = ""
+  scope {
+    val server = spawn serveUntilStopped(l, "https", port)
+    transcript = scenario(tlsEndpointOf(port))
+    await server
+  }
+  stopListener(l)
+  transcript
+}
+
+// `stopFake` for the HTTPS fake: a plain client that trusts the fixture CA.
+func stopFakeTls(endpoint: in String): String {
+  val ca = match Tls.Certificate.fromPem(FIXTURE_CA_PEM) {
+    case Ok(c) -> c
+    case Err(e) -> return "stop failed: " + Tls.TlsError.message(e)
+  }
+  match await HttpClientBuilder.new().withCaCertificate(ca).build().get(endpoint + STOP_PATH) {
+    case Err(e) -> "stop failed: " + HttpError.message(e)
+    case Ok(resp) -> match await HttpResponse.bodyText(resp) { case Ok(text) -> text; case Err(_) -> "stop unreadable" }
+  }
+}
+
+// Creates the queue `name` through `cfg`, publishes one message, consumes it
+// and acknowledges it: `ok`, or the first error.
+func tlsRoundTrip(cfg: in SqsConfig, name: in String): String {
+  val admin = match openClient(cfg) { case Ok(c) -> c; case Err(e) -> return e.code + " " + e.message }
+  val url = match createQueue(admin, name, standardQueue()) {
+    case Ok(u) -> u
+    case Err(e) -> return e.code + " " + e.message
+  }
+  val q = match connectWith(cfg.copy(queueUrl = url)) { case Ok(q) -> q; case Err(e) -> return e }
+  match q.publish(message("m-" + name, "over TLS")) {
+    case Err(e) -> return e
+    case Ok(_) -> ()
+  }
+  val got = take(q, 1000)
+  val acked = outcome(q.ack("m-" + name))
+  q.close()
+  if got == "m-" + name + "/over TLS/0" and acked == "ok" {
+    "ok " + url
+  } else {
+    got + " " + acked
+  }
+}
+
+func tlsScenario(endpoint: in String): String {
+  val base = configFor(endpoint, "")
+  var text = "additive=" + tlsRoundTrip(base.withCaCertificate(FIXTURE_CA_PEM), "a")
+  text = text + "\nexclusive=" + tlsRoundTrip(base.withExclusiveCaCertificate(FIXTURE_CA_PEM), "b")
+  text = text + "\nexclusiveWins=" +
+    tlsRoundTrip(base.withCaCertificate(FIXTURE_OTHER_CA_PEM).withExclusiveCaCertificate(FIXTURE_CA_PEM), "c")
+  text = text + "\nsystemOnly=" + tlsRoundTrip(base, "d")
+  text = text + "\notherAdditive=" + tlsRoundTrip(base.withCaCertificate(FIXTURE_OTHER_CA_PEM), "e")
+  text = text + "\notherExclusive=" + tlsRoundTrip(base.withExclusiveCaCertificate(FIXTURE_OTHER_CA_PEM), "f")
+  // The refused handshakes did not break the server or reach it.
+  text = text + "\nafter=" + tlsRoundTrip(base.withCaCertificate(FIXTURE_CA_PEM), "g")
+  text + "\n" + stopFakeTls(endpoint)
+}
+
+test "an HTTPS server with a private CA is reachable with withCaCertificate, and refused without it" {
+  val lines = Str.split(withFakeSqsTls(19814, tlsScenario), "\n")
+  assertEqualInt(lines.length, 8, "eight lines: " + Str.join(" | ", lines))
+  val prefix = "https://127.0.0.1:19814/" + ACCOUNT + "/"
+  assertEqual(lines[0], "additive=ok " + prefix + "a", "the CA added to the system trust store")
+  assertEqual(lines[1], "exclusive=ok " + prefix + "b", "the CA as the only trusted authority")
+  assertEqual(lines[2], "exclusiveWins=ok " + prefix + "c", "withExclusiveCaCertificate wins over withCaCertificate")
+  assertTrue(lines[3].startsWith("systemOnly=CONNECTION_FAILED "), "the system trust store alone: " + lines[3])
+  assertTrue(lines[4].startsWith("otherAdditive=CONNECTION_FAILED "), "a CA that did not sign it: " + lines[4])
+  assertTrue(lines[5].startsWith("otherExclusive=CONNECTION_FAILED "), "only a CA that did not sign it: " + lines[5])
+  assertEqual(lines[6], "after=ok " + prefix + "g", "the server still serves after refused handshakes")
+  // Four round trips of four signed requests each (CreateQueue, SendMessage,
+  // ReceiveMessage, DeleteMessage); nothing else got through.
+  assertEqual(lines[7], "served 16", "only the trusted clients' requests reached the server")
+}
+
+func openText(cfg: in SqsConfig): String {
+  match openClient(cfg) {
+    case Ok(_) -> "ok"
+    case Err(e) -> e.code + ": " + e.message
+  }
+}
+
+test "a CA certificate that is not a PEM certificate is INVALID_CONFIG before any request" {
+  val base = configFor("https://127.0.0.1:1", "")
+  val notPem = openText(base.withCaCertificate("not a certificate"))
+  assertTrue(notPem.startsWith("INVALID_CONFIG"), "additive, not PEM: " + notPem)
+  assertTrue(Str.contains(notPem, "withCaCertificate"), "the message names the option: " + notPem)
+  val exclusive = openText(
+    base.withExclusiveCaCertificate("-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n")
+  )
+  assertTrue(exclusive.startsWith("INVALID_CONFIG"), "exclusive, not a certificate: " + exclusive)
+  assertTrue(Str.contains(exclusive, "withExclusiveCaCertificate"), "the message names the option: " + exclusive)
+  assertTrue(
+    openText(base.withCaCertificate(FIXTURE_SERVER_KEY_PEM)).startsWith("INVALID_CONFIG"),
+    "a private key is not a certificate"
+  )
+  assertEqual(openText(base.withCaCertificate(FIXTURE_CA_PEM)), "ok", "a real certificate opens")
+  val queueUrl = "https://127.0.0.1:1/" + ACCOUNT + "/orders"
+  match connectWith(configFor("https://127.0.0.1:1", queueUrl).withCaCertificate("nope")) {
+    case Ok(_) -> panic("an unusable CA certificate was accepted")
+    case Err(e) -> assertTrue(Str.startsWith(e, "sqs: the certificate given to withCaCertificate"), "connectWith: " + e)
+  }
+  // A CA certificate does not make plain HTTP to another host acceptable.
+  val remote = openText(configFor("http://sqs.example.com", "").withCaCertificate(FIXTURE_CA_PEM))
+  assertTrue(remote.startsWith("INVALID_CONFIG"), "http:// stays loopback-only: " + remote)
+  // On a loopback http:// endpoint the option has nothing to verify, but is
+  // still validated.
+  val plain = configFor("http://127.0.0.1:1", "")
+  assertTrue(openText(plain.withCaCertificate("nope")).startsWith("INVALID_CONFIG"), "validated on http:// too")
+  assertEqual(openText(plain.withCaCertificate(FIXTURE_CA_PEM)), "ok", "and accepted there")
+}
+
+func fileText(r: in Result[SqsConfig, SqsError]): String {
+  match r {
+    case Ok(cfg) -> "ok " + cfg.additionalCaCertificatePem.length.toString() + "/" +
+      cfg.caCertificatePem.length.toString()
+    case Err(e) -> e.code + " " + e.message
+  }
+}
+
+test "withCaCertificateFile reads a PEM file, and a missing or empty one is INVALID_CONFIG" {
+  val base = configFor("https://127.0.0.1:1", "")
+  val dir = Env.getVarOrDefault("TMPDIR", "/tmp")
+  val path = dir + "/lyric-sqs-fixture-ca-" + Time.nowEpochMillis().toString() + ".pem"
+  match File.writeText(path, FIXTURE_CA_PEM) {
+    case Ok(_) -> ()
+    case Err(_) -> panic("cannot write " + path)
+  }
+  val n = FIXTURE_CA_PEM.length.toString()
+  assertEqual(fileText(base.withCaCertificateFile(path)), "ok " + n + "/0", "the additive form")
+  assertEqual(fileText(base.withExclusiveCaCertificateFile(path)), "ok 0/" + n, "the exclusive form")
+  match File.writeText(path, "") {
+    case Ok(_) -> ()
+    case Err(_) -> panic("cannot write " + path)
+  }
+  assertEqual(
+    fileText(base.withCaCertificateFile(path)),
+    "INVALID_CONFIG the CA certificate file is empty: " + path,
+    "an empty file"
+  )
+  val _ = File.deleteFile(path)
+  assertEqual(
+    fileText(base.withCaCertificateFile(path)),
+    "INVALID_CONFIG cannot read the CA certificate: " + path,
+    "a missing file"
+  )
+  assertEqual(
+    fileText(base.withExclusiveCaCertificateFile("")),
+    "INVALID_CONFIG the path of the CA certificate is empty",
+    "an empty path"
   )
 }
