@@ -19,7 +19,7 @@
 //! The lookup the providers are given holds only those two files: the
 //! process environment's own `AWS_*` variables are not consulted, so nothing
 //! but the files can supply the credentials.
-@cfg(feature = "integration")
+@cfg(feature = "emulator")
 @test_module
 package Aws.Credentials.IntegrationTests
 

@@ -275,7 +275,7 @@ scripts/ci/test-aws-emulator.sh dotnet    # runs this package, mq-sqs and storag
 `AWS_SHARED_CREDENTIALS_FILE` and `AWS_CONFIG_FILE` in a lookup that holds nothing else, and calls
 STS `GetCallerIdentity` on the emulator, signed with what it read. The emulator verifies SigV4: the
 call returns account `000000000000`, and the same call with another secret is refused with 403.
-Under `--features integration` an unset variable is a failure that names it.
+Under `--features emulator` an unset variable is a failure that names it.
 
 Not covered by an integration test: the container endpoint, the instance metadata service and STS
 `AssumeRoleWithWebIdentity` have only been run against the in-process fakes, never against ECS,

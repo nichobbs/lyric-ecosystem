@@ -33,16 +33,20 @@ failed=()
 # from AWS_ACCESS_KEY_ID: its suite is the shared-files provider against files
 # a real tool wrote.
 for pkg in aws-credentials mq-sqs storage-s3; do
+  # aws-credentials' only service suite is the emulator's, under its own
+  # feature, so that the `integration` job (MinIO, ElasticMQ) does not pick it up.
+  feature=integration
+  [ "$pkg" = aws-credentials ] && feature=emulator
   echo "== $pkg against AWS Emulator (--target $target)"
   "$lyric" restore --manifest "$pkg/lyric.toml"
   case "$target" in
     dotnet)
       LYRIC_SQS_CA_FILE="$AWS_EMULATOR_CA_FILE" LYRIC_S3_CA_FILE="$AWS_EMULATOR_CA_FILE" \
-        "$lyric" test --manifest "$pkg/lyric.toml" --target dotnet --features integration || failed+=("$pkg")
+        "$lyric" test --manifest "$pkg/lyric.toml" --target dotnet --features "$feature" || failed+=("$pkg")
       ;;
     jvm)
       env -u JAVA_TOOL_OPTIONS LYRIC_SQS_CA_FILE="$AWS_EMULATOR_CA_FILE" LYRIC_S3_CA_FILE="$AWS_EMULATOR_CA_FILE" \
-        "$lyric" test --manifest "$pkg/lyric.toml" --target jvm --features integration || failed+=("$pkg")
+        "$lyric" test --manifest "$pkg/lyric.toml" --target jvm --features "$feature" || failed+=("$pkg")
       ;;
     *) echo "error: unknown target $target" >&2; exit 1 ;;
   esac

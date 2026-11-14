@@ -27,13 +27,13 @@ output_assembly = "Aws.Credentials.dll"
 "Aws.Credentials.RemoteTests"   = "tests/remote_tests.l"
 "Aws.Retry.Tests"               = "tests/retry_tests.l"
 "Aws.Credentials.ReadmeTests"   = "tests/readme_tests.l"
-# Needs the AWS Emulator: file-level `@cfg(feature = "integration")`, so a
+# Needs the AWS Emulator: file-level `@cfg(feature = "emulator")`, so a
 # plain `lyric test` reports the module as gated and stays hermetic.
 "Aws.Credentials.IntegrationTests" = "tests/integration/emulator_integration_tests.l"
 
 [features]
 default     = []
-integration = []   # run tests/integration against the emulator named by AWS_EMULATOR_CONFIG_FILE
+emulator = []   # run tests/integration against the emulator named by AWS_EMULATOR_CONFIG_FILE
 
 [dependencies]
 # AWS Signature Version 4 and its `Credentials` record, shared with the AWS
