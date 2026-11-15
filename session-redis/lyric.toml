@@ -29,7 +29,7 @@ integration = []   # run tests/integration against the servers named by LYRIC_RE
 [dependencies]
 # The interface and its conformance suite, resolved through the root
 # [workspace.overrides].
-"Lyric.Testing"  = { workspace = true }
+"Lyric.Conformance" = { workspace = true }
 "Lyric.Session"  = { workspace = true }
 "Lyric.Redis"   = { workspace = true }
 # The tests use its listening sockets and background threads (Net.Tcp.Testing).

@@ -1042,7 +1042,7 @@ There is no third-party library (`[nuget]` and `[maven]` are empty). What the su
 
 | | |
 |---|---|
-| Interface | `Lyric.Mq` 0.1.0 and `Lyric.Testing` from the lyric-lang commit in `.lyric-lang-rev` |
+| Interface | `Lyric.Mq` 0.1.0 and `Lyric.Conformance` from the lyric-lang commit in `.lyric-lang-rev` |
 | ActiveMQ (CI and development) | ActiveMQ Classic 5.17.6, the `activemq` package of the `ubuntu-latest` runner, started by `scripts/ci/start-activemq.sh` |
 | STOMP | 1.2 only; a broker that answers with another version is refused |
 | Runtimes | .NET 10; Temurin 22 in CI, OpenJDK 21 in development |

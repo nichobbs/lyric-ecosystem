@@ -354,7 +354,7 @@ directory; the package's `.gitignore` excludes them.
 |---|---|
 | Quartz.NET | NuGet `Quartz` 3.22.10 (`[nuget]` in `lyric.toml`), with its one dependency `Microsoft.Extensions.Logging.Abstractions` 2.1.1 as NuGet resolves it |
 | .NET | `net10.0` |
-| Interface and conformance suite | `Lyric.Jobs` and `Lyric.Testing` at the `lyric-lang` commit in `.lyric-lang-rev`, through the root `[workspace.overrides]` |
+| Interface and conformance suite | `Lyric.Jobs` and `Lyric.Conformance` at the `lyric-lang` commit in `.lyric-lang-rev`, through the root `[workspace.overrides]` |
 
 Quartz.NET 4.x is not supported: its `IJob.Execute` returns a `ValueTask`.
 

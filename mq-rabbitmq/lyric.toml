@@ -36,7 +36,7 @@ integration = []   # run tests/integration against the broker named by LYRIC_RAB
 [dependencies]
 # The interface and its conformance suite, resolved through the root
 # [workspace.overrides].
-"Lyric.Testing" = { workspace = true }
+"Lyric.Conformance" = { workspace = true }
 "Lyric.Mq"      = { workspace = true }
 # The TCP and TLS connection, the TLS options and URL authority parsing shared
 # with the other protocol clients of this repository.

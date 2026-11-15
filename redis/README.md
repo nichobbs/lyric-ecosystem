@@ -355,12 +355,10 @@ lyric test --manifest redis/lyric.toml --target dotnet --features integration
 lyric test --manifest redis/lyric.toml --target jvm --features integration
 ```
 
-`lyric test --manifest` does not run on `--target native` yet (nichobbs/lyric-lang#6815). There the
-same test modules are built as executables, each together with the packages of `redis` and `net`
-(`lyric build --manifest ... --target native [--features integration]`), and run: the 78 hermetic
-and the 40 integration tests pass that way on Linux x86-64 (clang 18.1.3, OpenSSL 3.0.13, Redis
-with and without TLS). `bash scripts/ci/test-native.sh [--integration]` does this, here and in the
-`native` CI job.
+On `native` the same modules run with `lyric test --manifest redis/lyric.toml --target native
+[--features integration]`: the 78 hermetic and the 40 integration tests pass on Linux x86-64 (clang
+18.1.3, OpenSSL 3.0.13, Redis with and without TLS). `bash scripts/ci/test-native.sh
+[--integration]` does this for every package that claims `native`, here and in the `native` CI job.
 
 Run from the repository root. The hermetic TLS suite (`tests/tls_tests.l`) runs real handshakes on both
 targets against a fake server built on `Net.Tcp.Testing`. Its certificates and keys are test

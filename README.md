@@ -10,11 +10,11 @@ interface's conformance suite on every target it claims.
 
 | Package | Directory | Interface | Backend | Targets | Implementation |
 |---|---|---|---|---|---|
-| `Lyric.Storage.S3` | `storage-s3/` | `Storage.StorageBucket` | Amazon S3 and S3-compatible stores | dotnet, jvm | pure Lyric (SigV4 over `Std.Http`) |
+| `Lyric.Storage.S3` | `storage-s3/` | `Storage.StorageBucket` | Amazon S3 and S3-compatible stores | dotnet, jvm, native | pure Lyric (SigV4 over `Std.Http`) |
 | `Lyric.Storage.Gcs` | `storage-gcs/` | `Storage.StorageBucket` | Google Cloud Storage | dotnet, jvm | pure Lyric (XML API, GOOG4-HMAC-SHA256 over `Std.Http`); not yet verified with a real key |
 | `Lyric.Storage.AzureBlob` | `storage-azure-blob/` | `Storage.StorageBucket` | Azure Blob Storage | dotnet, jvm | pure Lyric (Shared Key over `Std.Http`) |
 | `Lyric.Aws.SigV4` | `aws-sigv4/` | (shared signing) | AWS Signature V4 | dotnet, jvm, native | pure Lyric |
-| `Lyric.Aws.Credentials` | `aws-credentials/` | (shared credential providers and retry policy) | environment, shared config and credentials files, `credential_process`, container endpoint, IMDSv2, web identity (STS); default chain with a refreshing cache | dotnet, jvm | pure Lyric; used by `Lyric.Storage.S3` and `Lyric.Mq.Sqs` |
+| `Lyric.Aws.Credentials` | `aws-credentials/` | (shared credential providers and retry policy) | environment, shared config and credentials files, `credential_process`, container endpoint, IMDSv2, web identity (STS); default chain with a refreshing cache | dotnet, jvm, native | pure Lyric; used by `Lyric.Storage.S3` and `Lyric.Mq.Sqs` |
 | `Lyric.Jobs.Quartz` | `jobs-quartz/` | `Jobs.JobScheduler` | Quartz | jvm | Quartz via Maven |
 | `Lyric.Jobs.QuartzNet` | `jobs-quartznet/` | `Jobs.JobScheduler` | Quartz.NET | dotnet | Quartz.NET via NuGet |
 | `Lyric.Jobs.Hangfire` | `jobs-hangfire/` | `Jobs.JobScheduler` | Hangfire (in-memory and PostgreSQL storage) | dotnet | Hangfire via NuGet |
@@ -25,7 +25,7 @@ interface's conformance suite on every target it claims.
 | `Lyric.Session.Redis` | `session-redis/` | `Session.SessionStore` | Redis | dotnet, jvm | on `Lyric.Redis` |
 | `Lyric.Flags.Flipt` | `flags-flipt/` | `Flags.FlagStore` | Flipt | dotnet, jvm | pure Lyric (Flipt v1 REST over `Std.Http`) |
 | `Lyric.Mq.RabbitMq` | `mq-rabbitmq/` | `Mq.MessageQueue`, `Mq.QueueConsumer` | RabbitMQ | dotnet, jvm | pure Lyric (AMQP 0-9-1 over TCP) |
-| `Lyric.Mq.Sqs` | `mq-sqs/` | `Mq.MessageQueue`, `Mq.QueueConsumer` | Amazon SQS | dotnet, jvm | pure Lyric (JSON 1.0 over `Std.Http`, SigV4) |
+| `Lyric.Mq.Sqs` | `mq-sqs/` | `Mq.MessageQueue`, `Mq.QueueConsumer` | Amazon SQS | dotnet, jvm, native | pure Lyric (JSON 1.0 over `Std.Http`, SigV4) |
 | `Lyric.Mq.ActiveMq` | `mq-activemq/` | `Mq.MessageQueue`, `Mq.QueueConsumer` | Apache ActiveMQ | dotnet, jvm | pure Lyric (STOMP 1.2 over TCP) |
 
 All packages are `0.x` and `experimental`. Each package README lists its configuration, pinned
@@ -56,13 +56,14 @@ and the interface dependencies become registry version ranges.
 Suites that need a real service live in `<package>/tests/integration/` and run with
 `bash scripts/ci/test-packages.sh <target> --integration` once the service is reachable; the
 package README names the environment variables. CI runs them against service containers, and runs
-`mq-sqs` and `storage-s3` a second time against AWS Emulator (`scripts/ci/start-aws-emulator.sh`,
-`scripts/ci/test-aws-emulator.sh`), which verifies their signatures.
+`aws-credentials`, `mq-sqs` and `storage-s3` against AWS Emulator (`scripts/ci/start-aws-emulator.sh`,
+`scripts/ci/test-aws-emulator.sh <target>`), which verifies their signatures.
 
 Packages that claim `native` run with `bash scripts/ci/test-native.sh` (add `--integration` for the
-service suites) after `make -C ../lyric-lang/lyric-rt`; it needs clang. `lyric test --manifest` does
-not take `--target native` yet (nichobbs/lyric-lang#6815), so `scripts/ci/native-tests.py` builds
-each test module into a native executable and runs it.
+service suites) after `make -C ../lyric-lang/lyric-rt`; it needs clang. The script calls
+`lyric test --manifest <package>/lyric.toml --target native`, which compiles the package and its
+workspace dependencies from source into one executable per test module; a failed assertion ends
+that module's process, and the runner reports the test it stopped in.
 
 ## Continuous integration
 

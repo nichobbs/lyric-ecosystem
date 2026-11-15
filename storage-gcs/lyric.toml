@@ -46,7 +46,7 @@ credentials = []   # run tests/integration against the bucket named by LYRIC_GCS
 [dependencies]
 # The interface and its conformance suite, resolved through the root
 # [workspace.overrides].
-"Lyric.Testing" = { workspace = true }
+"Lyric.Conformance" = { workspace = true }
 "Lyric.Storage" = { workspace = true }
 # Canonical requests, percent-encoding and canonical query strings are the
 # same in Google's V4 signing as in AWS Signature Version 4; they are imported

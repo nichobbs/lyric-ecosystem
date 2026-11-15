@@ -37,7 +37,7 @@ integration = []   # run tests/integration against the servers named by LYRIC_ME
 [dependencies]
 # The interface and its conformance suite, resolved through the root
 # [workspace.overrides].
-"Lyric.Testing" = { workspace = true }
+"Lyric.Conformance" = { workspace = true }
 "Lyric.Cache"   = { workspace = true }
 # The TCP and TLS connection, TLS options and URL authority parsing; the
 # tests use its listening sockets and background threads (Net.Tcp.Testing).

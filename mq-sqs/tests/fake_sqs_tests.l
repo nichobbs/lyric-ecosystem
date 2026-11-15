@@ -37,7 +37,7 @@
 //!
 //! The server runs on its own thread: a `Task.Run` worker on `--target dotnet`
 //! (`spawn` is synchronous there), a `spawn` inside a `scope` on `--target
-//! jvm`. No assertion runs while it is waiting for a request: a scenario
+//! jvm`, a `Std.Task` scope thread on `--target native`. No assertion runs while it is waiting for a request: a scenario
 //! returns its findings as lines and ends by asking the server to stop.
 @test_module
 package Mq.Sqs.FakeSqsTests
@@ -52,6 +52,7 @@ import Std.Http
 import Std.HttpServer
 import Std.JsonValue
 import Std.String as Str
+import Std.Task as StdTask
 import Std.Testing
 import Std.Time as Time
 import Std.Tls as Tls
@@ -1210,15 +1211,26 @@ func serveUntilStopped(l: in HttpListener, scheme: in String, port: in Int): Uni
       respondText(ctx, 200, Str.joinList("\n", sqs.log))
       sqs.log = newList()
     } else {
-      // A bug in the fake must surface as a failed request, not as a server
-      // thread that died and a test run that waits for it.
-      try {
-        handle(sqs, ctx)
-      } catch Bug as b {
-        respondFault(ctx, 500, "com.amazonaws.sqs#FakeServerBug", b.message)
-      }
+      handleGuarded(sqs, ctx)
     }
   }
+}
+
+// A bug in the fake must surface as a failed request, not as a server thread
+// that died and a test run that waits for it. Native has no unwinding
+// (D-N-003): there a bug in the fake ends the test process with its message.
+@cfg(not(target = "native"))
+func handleGuarded(sqs: in FakeSqs, ctx: in HttpContext): Unit {
+  try {
+    handle(sqs, ctx)
+  } catch Bug as b {
+    respondFault(ctx, 500, "com.amazonaws.sqs#FakeServerBug", b.message)
+  }
+}
+
+@cfg(target = "native")
+func handleGuarded(sqs: in FakeSqs, ctx: in HttpContext): Unit {
+  handle(sqs, ctx)
 }
 
 // ─── Running a scenario against the server ───────────────────────────────────
@@ -1245,6 +1257,17 @@ func withFakeSqs(port: in Int, scenario: in (String) -> String): String {
   val server = taskRun({ -> serveUntilStopped(l, "http", port) })
   val transcript = scenario(endpointOf(port))
   taskWait(server)
+  stopListener(l)
+  transcript
+}
+
+@cfg(target = "native")
+func withFakeSqs(port: in Int, scenario: in (String) -> String): String {
+  val l = startListener(endpointOf(port) + "/")
+  val server = StdTask.makeScope()
+  StdTask.scopeSpawn(server, { -> serveUntilStopped(l, "http", port) })
+  val transcript = scenario(endpointOf(port))
+  val _ = StdTask.awaitAll(server)
   stopListener(l)
   transcript
 }
@@ -1305,21 +1328,26 @@ func finish(n: in Notes, endpoint: in String): String {
   Str.joinList("\n", n.lines)
 }
 
+// A panic in a scenario is a finding on the managed targets, so that the fake
+// is still stopped; on native it ends the test process with its message.
+@cfg(not(target = "native"))
+func scenarioGuarded(scenario: in (String, Notes) -> Unit, endpoint: in String, n: in Notes): Unit {
+  try {
+    scenario(endpoint, n)
+  } catch Bug as b {
+    note(n, "panicked", b.message)
+  }
+}
+
+@cfg(target = "native")
+func scenarioGuarded(scenario: in (String, Notes) -> Unit, endpoint: in String, n: in Notes): Unit {
+  scenario(endpoint, n)
+}
+
 // The findings of `scenario`, run against a fresh fake on `port`.
 func run(port: in Int, scenario: in (String, Notes) -> Unit): slice[String] {
   Str.split(
-    withFakeSqs(
-      port,
-      { endpoint ->
-        val n = newNotes()
-        try {
-          scenario(endpoint, n)
-        } catch Bug as b {
-          note(n, "panicked", b.message)
-        }
-        finish(n, endpoint)
-      }
-    ),
+    withFakeSqs(port, { endpoint -> val n = newNotes(); scenarioGuarded(scenario, endpoint, n); finish(n, endpoint) }),
     "\n"
   )
 }
@@ -2551,6 +2579,17 @@ func withFakeSqsTls(port: in Int, scenario: in (String) -> String): String {
   val server = taskRun({ -> serveUntilStopped(l, "https", port) })
   val transcript = scenario(tlsEndpointOf(port))
   taskWait(server)
+  stopListener(l)
+  transcript
+}
+
+@cfg(target = "native")
+func withFakeSqsTls(port: in Int, scenario: in (String) -> String): String {
+  val l = startFakeTls(port)
+  val server = StdTask.makeScope()
+  StdTask.scopeSpawn(server, { -> serveUntilStopped(l, "https", port) })
+  val transcript = scenario(tlsEndpointOf(port))
+  val _ = StdTask.awaitAll(server)
   stopListener(l)
   transcript
 }

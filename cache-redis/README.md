@@ -8,7 +8,7 @@
 | Lyric packages | `Cache.Redis` (the store), `Cache.Redis.Extras` (Redis-only operations) |
 | Targets | `dotnet`, `jvm` |
 | Stability | experimental (0.1.0) |
-| Interface | `Lyric.Cache` (`Cache.CacheStore`), re-exported with `pub use Cache`; conformance suite `Testing.Conformance.Cache` from `Lyric.Testing` |
+| Interface | `Lyric.Cache` (`Cache.CacheStore`), re-exported with `pub use Cache`; conformance suite `Testing.Conformance.Cache` from `Lyric.Conformance` |
 | Third-party libraries | none; `Lyric.Redis` (`redis/` in this repository) is a `{ workspace = true }` dependency, and so is `Lyric.Net` (`net/`), which `Lyric.Redis` connects through and whose `Net.Tcp.Testing` the tests use |
 
 ## Usage
@@ -207,7 +207,7 @@ real second. The conformance suite cannot run hermetically: there is no in-proce
 ## Pinned versions
 
 No third-party library. `Lyric.Redis` is the version in this repository; `Lyric.Cache` and
-`Lyric.Testing` are those of the `lyric-lang` commit in `.lyric-lang-rev`, resolved through the root
+`Lyric.Conformance` are those of the `lyric-lang` commit in `.lyric-lang-rev`, resolved through the root
 `[workspace.overrides]`. Redis servers the suites run against: the `redis:7.4` service container (plain)
 and the `ubuntu-latest` runner's `redis-server` package (TLS) in CI, 7.0.15 in development.
 

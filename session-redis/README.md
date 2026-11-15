@@ -10,7 +10,7 @@ requests on a session lose no update and `set` can never create a session. It ru
 | Lyric packages | `Session.Redis` (the store), `Session.Redis.Admin` (Redis-only operations) |
 | Targets | `dotnet`, `jvm` |
 | Stability | experimental (0.1.0) |
-| Interface | `Lyric.Session` (`Session.SessionStore`), re-exported with `pub use Session`; conformance suite `Testing.Conformance.Session` from `Lyric.Testing` |
+| Interface | `Lyric.Session` (`Session.SessionStore`), re-exported with `pub use Session`; conformance suite `Testing.Conformance.Session` from `Lyric.Conformance` |
 | Third-party libraries | none; `Lyric.Redis` (`redis/` in this repository) is a `{ workspace = true }` dependency, and so is `Lyric.Net` (`net/`), which `Lyric.Redis` connects through and whose `Net.Tcp.Testing` the tests use |
 | Server requirement | `EVAL` must be allowed for the connecting user; Redis 4.0 or later (the scripts use `HSET` with several fields), 6.0 or later for ACL users, RESP3 and TLS |
 
@@ -242,7 +242,7 @@ there is no in-process Redis.
 ## Pinned versions
 
 No third-party library. `Lyric.Redis` is the version in this repository; `Lyric.Session` and
-`Lyric.Testing` are those of the `lyric-lang` commit in `.lyric-lang-rev`, resolved through the root
+`Lyric.Conformance` are those of the `lyric-lang` commit in `.lyric-lang-rev`, resolved through the root
 `[workspace.overrides]`. Redis servers the suites run against: the `redis:7.4` service container (plain)
 and the `ubuntu-latest` runner's `redis-server` package (TLS) in CI, 7.0.15 in development.
 

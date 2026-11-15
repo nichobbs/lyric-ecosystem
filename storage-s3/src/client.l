@@ -542,11 +542,7 @@ func transportError(message: in String): StorageError {
 /// The credentials to sign with now, from the client's provider.
 /// `Err(CREDENTIALS_UNAVAILABLE)` when it has none.
 pub func S3Client.currentCredentials(client: in S3Client): Result[Credentials, StorageError] {
-  val resolved = try {
-    client.credentials.resolve()
-  } catch Bug as bug {
-    Err(error = CredentialError(code = "REQUEST_FAILED", provider = "provider", message = bug.message))
-  }
+  val resolved = resolveGuarded(client.credentials)
   match resolved {
     case Ok(c) -> Ok(c.credentials)
     case Err(e) -> Err(StorageError(message = "no AWS credentials: " + e.text(), code = "CREDENTIALS_UNAVAILABLE"))
@@ -569,16 +565,13 @@ func isTimeoutCause(cause: in String): Bool {
   cause == "request timed out" or cause == "HTTP connect timed out" or Str.contains(cause, "HttpClient.Timeout")
 }
 
-// Plain (non-`async`) so it may `await` in place and still wrap the send in
-// `try` (V0012 forbids `await` inside `try` in an `async func`).
-func sendCatching(client: in S3Client, req: in HttpRequest, url: in String): Attempt {
+// One send, bounded by the request timeout and awaited in place. `Std.Http`
+// reports every transport failure as `Err` on all three targets, so nothing
+// is caught here.
+func sendBounded(client: in S3Client, req: in HttpRequest, url: in String): Attempt {
   val src = makeCancelSourceTimeout(client.requestTimeoutMs)
   val tok = sourceToken(src)
-  val sent = try {
-    await client.http.sendWithCancel(req, tok)
-  } catch Bug as bug {
-    Err(error = ConnectionFailed(url = url, message = bug.message))
-  }
+  val sent = await client.http.sendWithCancel(req, tok)
   val deadlinePassed = isCancelled(tok)
   disposeSource(src)
   val resp = match sent {
@@ -610,11 +603,7 @@ func sendCatching(client: in S3Client, req: in HttpRequest, url: in String): Att
 }
 
 func readBody(resp: in HttpResponse): Result[slice[Byte], StorageError] {
-  val read = try {
-    await HttpResponse.bodyBytes(resp)
-  } catch Bug as bug {
-    return Err(transportError("cannot read S3 response body: " + bug.message))
-  }
+  val read = await HttpResponse.bodyBytes(resp)
   match read {
     case Ok(bytes) -> Ok(bytes)
     case Err(e) -> Err(transportError("cannot read S3 response body: " + IOError.message(e)))
@@ -710,7 +699,7 @@ func attempt(
     }
     k = k + 1
   }
-  sendCatching(client, req, url)
+  sendBounded(client, req, url)
 }
 
 func sendRetrying(

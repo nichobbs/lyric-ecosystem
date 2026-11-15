@@ -500,7 +500,7 @@ supplied as secrets.
 |---|---|
 | SDK / native libraries | none |
 | `Lyric.Aws.SigV4` | the version in this repository (`aws-sigv4/`) |
-| `Lyric.Storage`, `Lyric.Testing`, standard library | the `lyric-lang` commit in `.lyric-lang-rev`, through the root `[workspace.overrides]`. The package needs `Std.Http.withBytesBody`, `HttpResponse.headerNames` and (for the tests) `Std.HttpServer.requestBodyBytes` (nichobbs/lyric-lang#9047) |
+| `Lyric.Storage`, `Lyric.Conformance`, standard library | the `lyric-lang` commit in `.lyric-lang-rev`, through the root `[workspace.overrides]`. The package needs `Std.Http.withBytesBody`, `HttpResponse.headerNames` and (for the tests) `Std.HttpServer.requestBodyBytes` (nichobbs/lyric-lang#9047) |
 | Cloud Storage XML API | as documented and as served on 2026-11-12 |
 | Emulator | none (see Verification status) |
 

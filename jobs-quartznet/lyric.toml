@@ -26,7 +26,7 @@ output_assembly = "Jobs.QuartzNet.dll"
 [dependencies]
 # The interface and its conformance suite, resolved through the root
 # [workspace.overrides].
-"Lyric.Testing"    = { workspace = true }
+"Lyric.Conformance" = { workspace = true }
 "Lyric.Jobs"       = { workspace = true }
 
 [nuget]

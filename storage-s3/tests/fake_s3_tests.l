@@ -27,7 +27,7 @@
 //!
 //! The server runs on its own thread: a `Task.Run` worker on `--target dotnet`
 //! (`spawn` is synchronous there), a `spawn` inside a `scope` on `--target
-//! jvm`. No assertion runs while it is waiting for a request: a scenario
+//! jvm`, a `Std.Task` scope thread on `--target native`. No assertion runs while it is waiting for a request: a scenario
 //! returns its findings and ends by asking the server to stop.
 @test_module
 package Storage.S3.FakeS3Tests
@@ -41,6 +41,7 @@ import Std.File as File
 import Std.Http
 import Std.HttpServer
 import Std.String as Str
+import Std.Task as StdTask
 import Std.Testing
 import Std.Time as Time
 import Std.Tls as Tls
@@ -653,15 +654,26 @@ func serveUntilStopped(l: in HttpListener): Unit {
     } else if requestPath(ctx) == LAST_KEY_PATH {
       respondText(ctx, 200, s3.lastKeyId)
     } else {
-      // A bug in the fake must surface as a failed request, not as a server
-      // thread that died and a test run that waits for it.
-      try {
-        handle(s3, ctx)
-      } catch Bug as b {
-        respondFault(ctx, 500, "FakeServerBug", b.message)
-      }
+      handleGuarded(s3, ctx)
     }
   }
+}
+
+// A bug in the fake must surface as a failed request, not as a server thread
+// that died and a test run that waits for it. Native has no unwinding
+// (D-N-003): there a bug in the fake ends the test process with its message.
+@cfg(not(target = "native"))
+func handleGuarded(s3: in FakeS3, ctx: in HttpContext): Unit {
+  try {
+    handle(s3, ctx)
+  } catch Bug as b {
+    respondFault(ctx, 500, "FakeServerBug", b.message)
+  }
+}
+
+@cfg(target = "native")
+func handleGuarded(s3: in FakeS3, ctx: in HttpContext): Unit {
+  handle(s3, ctx)
 }
 
 // ─── Running a scenario against the server ───────────────────────────────────
@@ -688,6 +700,17 @@ func withFakeS3(port: in Int, scenario: in (String) -> String): String {
   val server = taskRun({ -> serveUntilStopped(l) })
   val transcript = scenario(endpointOf(port))
   taskWait(server)
+  stopListener(l)
+  transcript
+}
+
+@cfg(target = "native")
+func withFakeS3(port: in Int, scenario: in (String) -> String): String {
+  val l = startListener(endpointOf(port) + "/")
+  val server = StdTask.makeScope()
+  StdTask.scopeSpawn(server, { -> serveUntilStopped(l) })
+  val transcript = scenario(endpointOf(port))
+  val _ = StdTask.awaitAll(server)
   stopListener(l)
   transcript
 }
@@ -1334,6 +1357,17 @@ func withFakeS3Tls(port: in Int, scenario: in (String) -> String): String {
   transcript
 }
 
+@cfg(target = "native")
+func withFakeS3Tls(port: in Int, scenario: in (String) -> String): String {
+  val l = startFakeTls(port)
+  val server = StdTask.makeScope()
+  StdTask.scopeSpawn(server, { -> serveUntilStopped(l) })
+  val transcript = scenario(tlsEndpointOf(port))
+  val _ = StdTask.awaitAll(server)
+  stopListener(l)
+  transcript
+}
+
 @cfg(target = "jvm")
 func withFakeS3Tls(port: in Int, scenario: in (String) -> String): String {
   val l = startFakeTls(port)
@@ -1373,6 +1407,18 @@ func roundTrip(cfg: in S3Config, key: in String): String {
   }
 }
 
+// `Std.Tls` reads the first certificate of a PEM text on dotnet and the JVM and
+// all of them on native (OpenSSL).
+@cfg(not(target = "native"))
+func wholePemTextIsTrusted(): Bool {
+  false
+}
+
+@cfg(target = "native")
+func wholePemTextIsTrusted(): Bool {
+  true
+}
+
 func tlsScenario(endpoint: in String): String {
   val base = configFor(endpoint, "tls")
   var text = "additive=" + roundTrip(base.withCaCertificate(FIXTURE_CA_PEM), "a")
@@ -1384,7 +1430,8 @@ func tlsScenario(endpoint: in String): String {
   text = text + "\notherExclusive=" + roundTrip(base.withExclusiveCaCertificate(FIXTURE_OTHER_CA_PEM), "f")
   // The refused handshakes did not break the server or reach it.
   text = text + "\nafter=" + roundTrip(base.withCaCertificate(FIXTURE_CA_PEM), "g")
-  // A PEM text with several certificates: the first one is the one trusted.
+  // A PEM text with several certificates: the first one is the one trusted
+  // on dotnet and the JVM, every one of them on native.
   text = text + "\nbundleSecond=" + roundTrip(base.withCaCertificate(FIXTURE_OTHER_CA_PEM + FIXTURE_CA_PEM), "h")
   text = text + "\nbundleFirst=" + roundTrip(base.withCaCertificate(FIXTURE_CA_PEM + FIXTURE_OTHER_CA_PEM), "i")
   text + "\n" + stopFakeTls(endpoint)
@@ -1400,13 +1447,22 @@ test "an HTTPS server with a private CA is reachable with withCaCertificate, and
   assertTrue(lines[4].startsWith("otherAdditive=CONNECTION_FAILED "), "a CA that did not sign it: " + lines[4])
   assertTrue(lines[5].startsWith("otherExclusive=CONNECTION_FAILED "), "only a CA that did not sign it: " + lines[5])
   assertEqual(lines[6], "after=ok", "the server still serves after refused handshakes")
-  assertTrue(
-    lines[7].startsWith("bundleSecond=CONNECTION_FAILED "),
-    "the CA as the second certificate of the PEM text is not read: " + lines[7]
+  if wholePemTextIsTrusted() {
+    assertEqual(lines[7], "bundleSecond=ok", "native trusts every certificate of the PEM text")
+  } else {
+    assertTrue(
+      lines[7].startsWith("bundleSecond=CONNECTION_FAILED "),
+      "the CA as the second certificate of the PEM text is not read: " + lines[7]
+    )
+  }
+  assertEqual(lines[8], "bundleFirst=ok", "the first certificate of the PEM text is trusted")
+  // A round trip is two signed requests; nothing but the trusted clients'
+  // requests got through.
+  assertEqual(
+    lines[9],
+    if wholePemTextIsTrusted() { "served 12" } else { "served 10" },
+    "only the trusted clients' requests reached the server"
   )
-  assertEqual(lines[8], "bundleFirst=ok", "the first certificate of the PEM text is the one trusted")
-  // Five round trips of two signed requests each; nothing else got through.
-  assertEqual(lines[9], "served 10", "only the trusted clients' requests reached the server")
 }
 
 test "a CA certificate that is not a PEM certificate is INVALID_CONFIG before any request" {
