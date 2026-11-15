@@ -127,6 +127,20 @@ start_node() {
     nohup "$server" > "$dir/server.log" 2>&1 &
 }
 
+# Both nodes register with epmd as they boot. Left to themselves each starts
+# it on demand, and when they boot at the same moment both can try to register
+# before it listens ("register/listen error: econnrefused", then BOOT FAILED
+# with nodistribution). So it is started first, and waited for.
+if ! listening "$epmd_port"; then
+  command -v epmd > /dev/null || { echo "error: epmd (Erlang) is not installed" >&2; exit 1; }
+  ERL_EPMD_ADDRESS=127.0.0.1 epmd -port "$epmd_port" -daemon
+  for _ in $(seq 50); do
+    listening "$epmd_port" && break
+    sleep 0.1
+  done
+  listening "$epmd_port" || { echo "error: epmd did not start on 127.0.0.1:$epmd_port" >&2; exit 1; }
+fi
+
 start_node a "$((epmd_port + 1))" "$(printf 'listeners.tcp.1 = 127.0.0.1:%s\nlisteners.ssl.1 = 127.0.0.1:%s\nssl_options.fail_if_no_peer_cert = false' "$port" "$tls_port")"
 start_node b "$((epmd_port + 2))" "$(printf 'listeners.tcp = none\nlisteners.ssl.1 = 127.0.0.1:%s\nssl_options.fail_if_no_peer_cert = true' "$mtls_port")"
 
