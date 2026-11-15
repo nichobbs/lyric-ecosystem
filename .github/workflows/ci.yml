@@ -195,7 +195,8 @@ jobs:
 
   # The packages that claim `native` in `[package] targets`, built with the
   # LLVM backend and run as native executables, then the ones with an
-  # integration suite against real services.
+  # integration suite against real services: Redis (plain and TLS), MinIO and
+  # ElasticMQ, started as in the `integration` job.
   native:
     name: native
     runs-on: ubuntu-latest
@@ -212,6 +213,9 @@ jobs:
           --health-retries 10
     env:
       LYRIC_REDIS_URL: redis://127.0.0.1:6379
+      LYRIC_S3_ENDPOINT: http://127.0.0.1:9000
+      LYRIC_S3_BUCKET: lyric-it
+      LYRIC_S3_REGION: us-east-1
     steps:
       - name: Check out lyric-ecosystem
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -233,6 +237,27 @@ jobs:
       - name: Start Redis with TLS
         working-directory: lyric-ecosystem
         run: bash scripts/ci/start-redis-tls.sh
+
+      - name: Cache the MinIO build
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/lyric-ci/minio
+          key: minio-${{ runner.os }}-${{ hashFiles('lyric-ecosystem/scripts/ci/start-minio.sh') }}
+
+      - name: Start MinIO
+        working-directory: lyric-ecosystem
+        run: bash scripts/ci/start-minio.sh
+
+      - name: Cache the ElasticMQ jars
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/lyric-ci/elasticmq
+          key: elasticmq-${{ runner.os }}-${{ hashFiles('lyric-ecosystem/scripts/ci/start-elasticmq.sh') }}
+
+      # After MinIO: it keeps the AWS credentials MinIO exported.
+      - name: Start ElasticMQ
+        working-directory: lyric-ecosystem
+        run: bash scripts/ci/start-elasticmq.sh
 
       - name: Test packages on native against the services
         working-directory: lyric-ecosystem

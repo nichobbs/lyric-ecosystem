@@ -280,7 +280,7 @@ Integration, against the AWS Emulator, 4 tests:
 ```sh
 scripts/ci/start-aws-emulator.sh          # exports AWS_EMULATOR_CREDENTIALS_FILE and AWS_EMULATOR_CONFIG_FILE
 scripts/ci/test-aws-emulator.sh dotnet    # runs this package, mq-sqs and storage-s3
-scripts/ci/test-aws-emulator.sh native    # runs the ones of the three that claim native
+scripts/ci/test-aws-emulator.sh native    # the same three packages on native
 ```
 
 | Variable | Meaning |

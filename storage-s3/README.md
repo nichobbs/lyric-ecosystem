@@ -1,15 +1,16 @@
 # lyric-storage-s3
 
 Amazon S3, and S3-compatible servers (MinIO, LocalStack, Ceph RGW, Cloudflare R2), as a backend for
-the `Storage.StorageBucket` interface of `lyric-storage` (`nichobbs/lyric-lang`). It runs on `dotnet`
-and `jvm` and is `experimental` (0.1.0). The backend is pure Lyric: the S3 REST API over `Std.Http`,
-signed with AWS Signature Version 4. There is no AWS SDK underneath and no extern declaration in the
-package, so the same code runs on both targets and there is no `_kernel_<target>/` directory.
+the `Storage.StorageBucket` interface of `lyric-storage` (`nichobbs/lyric-lang`). It runs on `dotnet`,
+`jvm` and `native` and is `experimental` (0.1.0). The backend is pure Lyric: the S3 REST API over
+`Std.Http`, signed with AWS Signature Version 4. There is no AWS SDK underneath and no extern
+declaration in the package, so the same code runs on every target and there is no
+`_kernel_<target>/` directory.
 
 | | |
 |---|---|
 | Package | `Lyric.Storage.S3` (Lyric packages `Storage.S3`, `Storage.S3.Client`, `Storage.S3.Extras`, `Storage.S3.SigV4`, `Storage.S3.Wire`) |
-| Targets | `dotnet`, `jvm` |
+| Targets | `dotnet`, `jvm`, `native` (Linux x86-64; clang and lyric-rt to build, OpenSSL 3 at run time for HTTPS) |
 | Stability | `experimental` (0.1.0) |
 | Interface | `Storage.StorageBucket` from `Lyric.Storage`, re-exported with `pub use Storage` |
 | Dependencies | `Lyric.Aws.SigV4` (`aws-sigv4/`, the signing) and `Lyric.Aws.Credentials` (`aws-credentials/`, credential providers and the retry policy), both shared with the other AWS backends of this repository, as `{ workspace = true }` dependencies. No SDK and no native dependency |
@@ -257,19 +258,21 @@ Connecting and addressing:
 - **A CA certificate applies to the client's own requests only.** A presigned URL is fetched by
   whoever receives it, with their own trust store. On an `http://` (loopback) endpoint the option is
   validated and then has nothing to verify.
-- **Only the first certificate of the PEM text is read.** `withCaCertificate` and
-  `withExclusiveCaCertificate` take one certificate authority, not a bundle: in a file with several
-  certificates the others are ignored, on both targets. Pass the authority that signed the server
-  certificate (for a self-signed server, its own certificate).
+- **Only the first certificate of the PEM text is read on `dotnet` and `jvm`; `native` reads all of
+  them.** `withCaCertificate` and `withExclusiveCaCertificate` take one certificate authority, not
+  a bundle: in a file with several certificates the managed targets ignore the others, and
+  `native` (OpenSSL) trusts every one of them. The difference is the standard library's
+  (`Std.Tls.Certificate.fromPem`); there is no lyric-lang issue for it yet. Pass one certificate,
+  the authority that signed the server certificate (for a self-signed server, its own
+  certificate), and the three targets agree.
 - **An untrusted server certificate is `CONNECTION_FAILED`, and the message differs by target.** On
   the JVM it names the cause (`PKIX path building failed: ... unable to find valid certification path
   to requested target`); on dotnet it is only `The SSL connection could not be established, see inner
-  exception`. The code is the same, and so are the CA options: both targets accept the same PEM and
-  behave the same in the hermetic and integration suites.
+  exception`; on native it is OpenSSL's (`TLS handshake failed: ... certificate verify failed`). The
+  code is the same, and so are the CA options: every target accepts the same PEM, and with a PEM of
+  one certificate they behave the same in the hermetic and integration suites.
 - **Bucket names are validated to today's S3 rules**, so a legacy bucket with uppercase letters or
   underscores cannot be opened.
-- **Credentials are static.** There is no provider chain and no refresh: when a session token is
-  renewed, build a new client.
 
 Keys:
 
@@ -316,9 +319,10 @@ Errors:
 - **`delete` of a missing key is `Ok`**, as S3 defines.
 - **Out-of-range arguments differ between targets.** An empty content type, `maxKeys` outside 1 to
   1000 and `expiresInSeconds` outside 1 to 604800 violate the interface's `requires:` clauses. On `jvm`
-  a call through `StorageBucket` panics with `PreconditionViolated`; on `dotnet` the same call reaches
-  the backend, which answers `Err(INVALID_ARGUMENT)` for the two ranges and does not check the
-  content type.
+  and `native` a call through `StorageBucket` panics with `PreconditionViolated`; on `dotnet` the
+  same call reaches the backend, which answers `Err(INVALID_ARGUMENT)` for the two ranges and does
+  not check the content type. On `native` a panic cannot be caught (there is no unwinding): it aborts
+  the process after printing the message.
   Validate before calling.
 - **Failed requests are sent again, up to three attempts.** Throttling (`SlowDown`,
   `RequestLimitExceeded`, HTTP 429 and 503), server failures (HTTP 500, 502, 504, `InternalError`,
@@ -340,6 +344,10 @@ Errors:
   provider that calls a service makes every request pay for that call; `Aws.Credentials.cached`
   avoids it. When the provider has nothing, the operation is `CREDENTIALS_UNAVAILABLE` and no
   request is made.
+- **On `native` a credential provider that panics ends the process.** `dotnet` and `jvm` turn a
+  panic in a provider into an error (`aws-credentials/README.md`); native has no unwinding. The
+  providers of `Aws.Credentials` do not panic; this is about a `CredentialProvider` an application
+  writes.
 - **A request is not retried because its credentials expired.** `ExpiredToken` is returned; the
   cache replaces credentials by the clock, five minutes ahead of their expiry.
 
@@ -400,9 +408,14 @@ Run from the repository root:
 ```sh
 lyric test --manifest storage-s3/lyric.toml --target dotnet
 lyric test --manifest storage-s3/lyric.toml --target jvm
+lyric test --manifest storage-s3/lyric.toml --target native
 ```
 
-The default run is hermetic and needs no network:
+The native run needs clang and lyric-rt (`make -C ../lyric-lang/lyric-rt`), compiles the package and
+its dependencies from source into one executable per test module, and has nothing to restore;
+`bash scripts/ci/test-native.sh` does it for every package that claims `native`.
+
+The default run is hermetic and needs no network (31 tests on every target):
 
 - `tests/sigv4_tests.l`: what is S3's own in the signing: an object key encoded once with `/` kept,
   and two worked examples of the Amazon S3 API reference (PUT Object with a storage class and an
@@ -412,8 +425,8 @@ The default run is hermetic and needs no network:
 - `tests/fake_s3_tests.l`: `Testing.Conformance.Storage` and the backend's own behaviour over real
   HTTP against an S3 server written in Lyric on `Std.HttpServer` inside the test. The server
   verifies the SigV4 signature of every request (header and presigned-URL forms) with the shared
-  secret and the hash of the body it received, keeps objects in memory, and pages ListObjectsV2. It
-  The same server is also started over HTTPS (`Std.HttpServer.startListenerTls`, both targets) with
+  secret and the hash of the body it received, keeps objects in memory, and pages ListObjectsV2.
+  The same server is also started over HTTPS (`Std.HttpServer.startListenerTls`, every target) with
   a fixture certificate from a private CA: a client given that CA with `withCaCertificate` or
   `withExclusiveCaCertificate` stores and reads an object, and a client without it, or with another
   CA, gets `CONNECTION_FAILED` and never reaches the server. The certificates and the key in the
@@ -456,7 +469,10 @@ them to `$GITHUB_ENV` under GitHub Actions.
 
 A missing variable fails every integration test with a message naming it. The suite runs the
 conformance suite, binary objects with encoded keys and metadata, HEAD, presigned GET and PUT
-fetched by a client without credentials, and S3's own error codes, on both targets.
+fetched by a client without credentials, and S3's own error codes, on every target. On `native`,
+replace `--target dotnet` with `--target native`, or run `bash scripts/ci/test-native.sh
+--integration` with the same variables (it also runs the other packages that claim `native`, so
+it needs their services too).
 
 ## Pinned versions
 
@@ -468,11 +484,11 @@ fetched by a client without credentials, and S3's own error codes, on both targe
 | MinIO (integration suite) | `github.com/minio/minio@v0.0.0-20260212201848-7aac2a2c5b7c`, single node, built from that module version by `scripts/ci/start-minio.sh` |
 
 The suite also runs against [AWS Emulator](https://github.com/aws/aws-emulator) 1.0.341, AWS's own
-local emulator, in the `aws-emulator` CI job (all four integration tests, both targets):
+local emulator, in the `aws-emulator` CI job (all four integration tests, every target):
 
 ```sh
 set -a; eval "$(bash scripts/ci/start-aws-emulator.sh)"; set +a
-bash scripts/ci/test-aws-emulator.sh dotnet     # or jvm; runs aws-credentials, mq-sqs and storage-s3
+bash scripts/ci/test-aws-emulator.sh dotnet     # or jvm, native; runs aws-credentials, mq-sqs and storage-s3
 ```
 
 It verifies signatures against a key generated at start, takes the bucket in the path only, and
@@ -481,23 +497,22 @@ follows Amazon where MinIO differs: creating a bucket the account already owns i
 start, from its own CA. `test-aws-emulator.sh` passes that CA as `LYRIC_S3_CA_FILE`, so the suite
 trusts it through `withCaCertificateFile` and nothing process-wide is changed (no `SSL_CERT_FILE`,
 no JVM trust store): this run is the check of the CA option against a real HTTPS server with a
-private certificate, on both targets.
+private certificate, on every target.
 
 The suite has not been run against AWS S3 itself; `LYRIC_S3_ENDPOINT=aws` is there to do so by
 hand.
 
 ## Known gaps
 
-- **`native` is not claimed.** The package has no `try` any more and its code is the same on every
-  target, but a native build stops in the compiler: a method call on a field of a record whose type
-  is declared in another package (`client.retry.decide(...)`, `Aws.Retry.RetryPolicy`) fails with
-  `N0007` ("method '.decide' on this receiver is not yet supported for --target native"). It is a
-  `lyric-lang` compiler bug with a two-package reproduction; no issue number yet. With that one
-  call bound to a local first, in a scratch copy, the 31 hermetic tests and the 4 integration tests
-  passed on `--target native` against MinIO and against AWS Emulator; the tests already carry what
-  native needs (a `Std.Task` thread for the fake server). Two things differ there: a credential
-  provider that panics ends the process (`aws-credentials/README.md`), and `withCaCertificate` /
-  `withExclusiveCaCertificate` trust every certificate of the PEM text, not the first only.
+- **`native` differs from the managed targets in three places**, all described under Surprises: a
+  panic ends the process, whether it comes from a credential provider an application wrote or from
+  a violated `requires:` clause of the interface; `withCaCertificate` /
+  `withExclusiveCaCertificate` (and so `AWS_CA_BUNDLE` / `ca_bundle`) trust every certificate of a
+  PEM text with several, where `dotnet` and `jvm` trust the first only (a difference in
+  `Std.Tls`, nichobbs/lyric-lang#9146); and the text of a `CONNECTION_FAILED` message is the
+  standard library's and OpenSSL's. `native` has been built and run on Linux x86-64 only, and a
+  native program that talks HTTPS needs OpenSSL 3 (`libssl.so.3`) at run time. It needs a
+  `lyric-lang` with the fix of nichobbs/lyric-lang#9136, which the commit in `.lyric-lang-rev` has.
 - Objects are held in memory whole, as the interface's base64 payloads require: no multipart
   upload, no streaming, no range reads. `Std.Http` buffers bodies too.
 - No server-side encryption headers, object tagging, versioning, ACLs, or batch delete. `list` has no
@@ -507,11 +522,12 @@ hand.
   been run against in-process fakes only, not on ECS, EKS or EC2.
 - Retries have no retry quota and no clock-skew correction, and a request refused with
   `ExpiredToken` is not sent again with fresh credentials.
-- A `ca_bundle` / `AWS_CA_BUNDLE` file holding more than one certificate is untested.
+- A `ca_bundle` / `AWS_CA_BUNDLE` file holding more than one certificate is untested through
+  `configFromEnv`; the hermetic suite covers the same PEM text given to `withCaCertificate`.
 - A presigned URL is signed with the local clock, as every request is; a clock more than 15
   minutes off is `RequestTimeTooSkewed`.
-- The interface's `requires:` clauses are enforced on `jvm` and not on `dotnet` for this backend (see
-  Surprises). No lyric-lang issue number yet.
+- The interface's `requires:` clauses are enforced on `jvm` and `native` and not on `dotnet` for
+  this backend (see Surprises). No lyric-lang issue number yet.
 - In the hermetic tests the fake server answers HEAD with `Content-Length: 0`, because
   `Std.HttpServer` cannot send a HEAD response that reports an entity's length. `stat`'s
   `contentLength` is therefore asserted only by the integration tests.

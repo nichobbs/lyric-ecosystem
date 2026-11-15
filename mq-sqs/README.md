@@ -1,7 +1,7 @@
 # lyric-mq-sqs
 
 Amazon SQS backend for the `Mq.MessageQueue` and `Mq.QueueConsumer` interfaces of `lyric-mq`, for
-`dotnet` and `jvm`, `experimental` (0.1.0). The client is written in Lyric: the AWS JSON 1.0
+`dotnet`, `jvm` and `native`, `experimental` (0.1.0). The client is written in Lyric: the AWS JSON 1.0
 protocol over `Std.Http`, signed with AWS Signature Version 4 by `Lyric.Aws.SigV4`. There is no AWS
 SDK underneath and no extern declaration in the package. One `SqsQueue` is one queue and implements
 both interfaces.
@@ -10,7 +10,7 @@ both interfaces.
 |---|---|
 | Package | `Lyric.Mq.Sqs` (Lyric packages `Mq.Sqs`, `Mq.Sqs.Client`, `Mq.Sqs.Extras`, `Mq.Sqs.Address`, `Mq.Sqs.Wire`; `Mq.Sqs.Text` is internal) |
 | Interfaces | `Mq.MessageQueue`, `Mq.QueueConsumer` of `Lyric.Mq` 0.1.0. `Mq.DeadLetterStore` is not implemented. |
-| Targets | `dotnet`, `jvm` |
+| Targets | `dotnet`, `jvm`, `native` (Linux x86-64; clang and lyric-rt to build, OpenSSL 3 at run time for HTTPS) |
 | Stability | `experimental` (0.1.0) |
 | Service | Amazon SQS, standard and FIFO queues, and SQS-compatible servers that speak the JSON protocol (ElasticMQ 1.6.11 is what CI runs) |
 | Protocol | AWS JSON 1.0 (`X-Amz-Target: AmazonSQS.<Action>`, `Content-Type: application/x-amz-json-1.0`), AWS Signature Version 4, service `sqs` |
@@ -191,7 +191,7 @@ message in order" (`x`, `y`). A standard queue promises no order, so those two c
 there. No case assumes exactly-once delivery: every case uses a fresh queue and consumes within the
 visibility timeout, so at-least-once delivery does not show.
 
-The suite is therefore run against **FIFO queues**, on both targets, hermetically against the fake
+The suite is therefore run against **FIFO queues**, on every target, hermetically against the fake
 server and in the integration suite against ElasticMQ, with all eleven cases and no case changed or
 skipped. `tests/fake_sqs_tests.l` also runs it against standard queues on a fake that returns the
 newest message first (which SQS is free to do) and asserts that exactly the delivery-order
@@ -363,10 +363,16 @@ Messages:
   U+D7FF, U+E000 to U+FFFD and the supplementary planes, and may not be empty. A body outside that
   is sent base64-encoded and marked, so every `String` round-trips through this library; a consumer
   that is not this library sees the base64 text and the `lyric.body-encoding` attribute. A body
-  that is not well-formed UTF-16 (an unpaired surrogate) is not preserved: the surrogate is replaced when
-  the body is encoded as UTF-8.
+  that is not well-formed text is not preserved, and the targets differ. On `dotnet` and `jvm` a
+  `String` is UTF-16 and the ill-formed case is an unpaired surrogate: it is replaced when the body
+  is encoded as UTF-8, and the message is delivered with the replacement. On `native` a `String` is
+  UTF-8 bytes (`length` counts bytes, and `substring` can cut a character in half) and the
+  ill-formed case is a byte sequence that is not UTF-8: the bytes are sent as they are, base64
+  encoded, and a consumer that is this library answers `Err` naming the message ("the body is
+  marked base64 and does not decode to UTF-8"), which stays in flight under its id.
 - **An id with a control character, U+FFFE, U+FFFF or an unpaired surrogate is refused** with
-  `Err`, before anything is sent: the id is the handle `ack` takes, so it is not altered.
+  `Err`, before anything is sent: the id is the handle `ack` takes, so it is not altered. On
+  `native` the same `Err`, with the same text, refuses an id whose bytes are not well-formed UTF-8.
 - **Headers are one attribute**, `lyric.headers`, not one attribute per header: SQS allows ten
   attributes, restricts their names to letters, digits, `-`, `_` and `.`, refuses empty values and
   returns them unordered. SNS filter policies and other consumers therefore cannot match on a
@@ -404,7 +410,7 @@ Waiting and failures:
   message that a long poll would find.
 - **A `consume` cannot be interrupted**, and a long poll holds its HTTP connection for up to 20 s
   plus `requestTimeoutMs`.
-- **A timeout is its own outcome, with one message on both targets**: code `TIMEOUT`, text
+- **A timeout is its own outcome, with one message on every target**: code `TIMEOUT`, text
   `<Action> timed out after <n> ms at <endpoint>`. It means the request may have been applied: a
   `publish` that timed out may be in the queue, a `publishBatch` reports that it is not known whether
   SQS accepted the messages of that request, and a `consume` whose `ReceiveMessage` timed out may
@@ -413,15 +419,19 @@ Waiting and failures:
   transport failure; `publishBatch` treats it as unknown too, because a connection can also break
   after the request was sent. A slow `ReceiveMessage` is never reported as the interface's
   `"timeout"`, which only means the queue had nothing.
-- **Only the first certificate of the PEM text is read.** `withCaCertificate` and
-  `withExclusiveCaCertificate` take one certificate authority, not a bundle: in a file with several
-  certificates the others are ignored, on both targets. Pass the authority that signed the server
-  certificate (for a self-signed server, its own certificate).
+- **Only the first certificate of the PEM text is read on `dotnet` and `jvm`; `native` reads all of
+  them.** `withCaCertificate` and `withExclusiveCaCertificate` take one certificate authority, not
+  a bundle: in a file with several certificates the managed targets ignore the others, and
+  `native` (OpenSSL) trusts every one of them. The difference is the standard library's
+  (`Std.Tls.Certificate.fromPem`); there is no lyric-lang issue for it yet. Pass one certificate,
+  the authority that signed the server certificate (for a self-signed server, its own
+  certificate), and the three targets agree.
 - **An untrusted server certificate is `CONNECTION_FAILED`, and the message differs by target.** On
   the JVM it names the cause (`PKIX path building failed: ... unable to find valid certification path
   to requested target`); on dotnet it is only `The SSL connection could not be established, see inner
-  exception`. The code is the same, and so are the CA options: both targets accept the same PEM and
-  behave the same in the hermetic and integration suites.
+  exception`; on native it is OpenSSL's (`TLS handshake failed: ... certificate verify failed`). The
+  code is the same, and so are the CA options: every target accepts the same PEM, and with a PEM of
+  one certificate they behave the same in the hermetic and integration suites.
 - **A CA certificate is for the endpoint and for every queue URL the client is used with**: there is
   one HTTP client per `SqsClient`. On an `http://` (loopback) endpoint the option is validated and
   then has nothing to verify.
@@ -457,17 +467,23 @@ Waiting and failures:
   provider that calls a service makes every request pay for that call; `Aws.Credentials.cached`
   avoids it. When the provider has nothing the operation fails with `CREDENTIALS_UNAVAILABLE`
   (`sqs: no AWS credentials: ...`) and no request is made.
+- **On `native` a credential provider that panics ends the process.** `dotnet` and `jvm` turn a
+  panic in a provider into an error (`aws-credentials/README.md`); native has no unwinding. The
+  providers of `Aws.Credentials` do not panic; this is about a `CredentialProvider` an application
+  writes.
 - **Redirects are not followed**: a redirect would send a signed request to a host the signature
   does not cover; it is reported as `HTTP_3xx`.
 - **`close` makes requests.** It returns unsettled deliveries to the queue (best effort) and does
   not delete them.
 - **The clock matters.** SQS refuses a request whose `x-amz-date` is more than 15 minutes off.
 
-Differences between the targets: none in behaviour that the suites can see, except one inherited
-from the compiler. On `jvm`, `publishBatch` with an empty message id panics with
-`PreconditionViolated` (the interface's `requires: allHaveIds(messages)` is enforced); on `dotnet`
-the inherited clause is not enforced and the call returns `Err("sqs: empty message id")`. Do not
-pass an empty id.
+Differences between the targets, besides the ones above (text that is not well formed, a PEM text
+with several certificates, the wording of a TLS failure, a credential provider that panics): one,
+inherited from the compiler. On `jvm` and `native`, `publishBatch` with an empty message id panics
+with `PreconditionViolated` (the interface's `requires: allHaveIds(messages)` is enforced); on
+`dotnet` the inherited clause is not enforced and the call returns `Err("sqs: empty message id")`.
+On `native` a panic cannot be caught (there is no unwinding): it aborts the process after printing
+the message. Do not pass an empty id.
 
 ## Backend-specific module
 
@@ -498,7 +514,13 @@ Hermetic (no server needed), on each target:
 ```sh
 lyric test --manifest mq-sqs/lyric.toml --target dotnet
 lyric test --manifest mq-sqs/lyric.toml --target jvm
+lyric test --manifest mq-sqs/lyric.toml --target native
 ```
+
+The native run needs clang and lyric-rt (`make -C ../lyric-lang/lyric-rt`), compiles the package and
+its dependencies from source into one executable per test module, and has nothing to restore;
+`bash scripts/ci/test-native.sh` does it for every package that claims `native`. The 51 tests are
+the same on the three targets.
 
 - `tests/address_tests.l` (6 tests): endpoints and queue URLs, the HTTPS-off-loopback rule, regions
   in AWS host names.
@@ -524,7 +546,7 @@ lyric test --manifest mq-sqs/lyric.toml --target jvm
   signature and error mapping, queue management, messages from other producers, and timeouts (a
   listener that accepts and never answers, 40 short deadlines in a row, every call path) against
   refused connections (port 1). The same server is also started over HTTPS
-  (`Std.HttpServer.startListenerTls`, both targets) with a fixture certificate from a private CA: a
+  (`Std.HttpServer.startListenerTls`, every target) with a fixture certificate from a private CA: a
   client given that CA with `withCaCertificate` or `withExclusiveCaCertificate` creates a queue,
   publishes, consumes and acknowledges, and a client without it, or with another CA, gets
   `CONNECTION_FAILED` and never reaches the server. The certificates and the key in the file are
@@ -556,7 +578,7 @@ emulator, in the `aws-emulator` CI job and by hand:
 
 ```sh
 set -a; eval "$(bash scripts/ci/start-aws-emulator.sh)"; set +a   # downloads, verifies and installs the pinned package
-bash scripts/ci/test-aws-emulator.sh dotnet                        # or jvm; runs aws-credentials, mq-sqs and storage-s3
+bash scripts/ci/test-aws-emulator.sh dotnet                        # or jvm, native; runs aws-credentials, mq-sqs and storage-s3
 ```
 
 The emulator checks every SigV4 signature against a key it generates at start (a wrong secret is
@@ -564,7 +586,7 @@ The emulator checks every SigV4 signature against a key it generates at start (a
 made at start, from its own CA. `test-aws-emulator.sh` passes that CA as `LYRIC_SQS_CA_FILE`, so the
 suite trusts it through `withCaCertificateFile` and nothing process-wide is changed (no
 `SSL_CERT_FILE`, no JVM trust store): this run is the check of the CA option against a real HTTPS
-server with a private certificate, on both targets.
+server with a private certificate, on every target.
 
 The integration suite also runs against Amazon SQS itself (set `LYRIC_SQS_ENDPOINT` to
 `https://sqs.<region>.amazonaws.com` and real credentials), but that has not been done; see "Known
@@ -581,23 +603,23 @@ There is no third-party library (`[nuget]` and `[maven]` are empty). What the su
 | Credentials and retries | `Lyric.Aws.Credentials` 0.1.0, the version in this repository (`aws-credentials/`) |
 | SQS API | the JSON 1.0 protocol of the 2012-11-05 API |
 | ElasticMQ (CI and development) | `org.elasticmq:elasticmq-server_2.13` 1.6.11 from Maven Central, `sqs-limits = strict`, started by `scripts/ci/start-elasticmq.sh` |
-| AWS Emulator (CI) | 1.0.341, the signed Debian package, started by `scripts/ci/start-aws-emulator.sh`; all 14 integration tests pass on both targets |
-| Runtimes | .NET 10; OpenJDK 21 in development |
+| AWS Emulator (CI) | 1.0.341, the signed Debian package, started by `scripts/ci/start-aws-emulator.sh`; all 14 integration tests pass on every target |
+| Runtimes | .NET 10; OpenJDK 21 in development; for native, clang 18.1.3 and OpenSSL 3.0.13 on Linux x86-64 in development |
 
 ## Known gaps
 
-- **`native` is not claimed.** The package has no `try` any more, and the one place that reads the
-  characters of a string (`isSqsText`, `jsonStringLiteral`) is `Mq.Sqs.Text`, one package in two
-  files: UTF-16 code units on `dotnet` and `jvm`, UTF-8 bytes on `native`. A native build still
-  stops in the compiler, on two `lyric-lang` bugs that have reproductions and no issue number yet:
-  a method call on a field of a record whose type is declared in another package
-  (`client.retry.decide(...)`) fails with `N0007`; and a function that a package re-exports with
-  `pub use` cannot be called through an alias of that package (`import Mq.Sqs as Sqs`,
-  `Sqs.configFromEnv(...)`, as the usage example of this README does: `N0007`, "cannot resolve
-  call target"). With the first call bound to a local and the example importing `Mq.Sqs.Client`,
-  in a scratch copy, the 51 hermetic tests and the 14 integration tests passed on `--target native`
-  against AWS Emulator. A credential provider that panics ends the process there
-  (`aws-credentials/README.md`).
+- **`native` differs from the managed targets in four places**, all described under Surprises: a
+  panic ends the process, whether it comes from a credential provider an application wrote or from
+  the interface's `requires:` clause on `publishBatch`; a `String` is UTF-8 bytes, so text that is
+  not well formed is a different thing and is treated differently (the one place that reads the
+  characters of a string is `Mq.Sqs.Text`, one package in two files selected by `@cfg`);
+  `withCaCertificate` / `withExclusiveCaCertificate` (and so `AWS_CA_BUNDLE` / `ca_bundle`) trust
+  every certificate of a PEM text with several, where `dotnet` and `jvm` trust the first only (a
+  difference in `Std.Tls`, observed by `storage-s3`'s hermetic suite for the same call;
+  nichobbs/lyric-lang#9146); and the text of a `CONNECTION_FAILED` message is the standard library's
+  and OpenSSL's. `native` has been built and run on Linux x86-64 only, and a native program that
+  talks HTTPS needs OpenSSL 3 (`libssl.so.3`) at run time. It needs a `lyric-lang` with the fix of
+  nichobbs/lyric-lang#9136, which the commit in `.lyric-lang-rev` has.
 - **Not run against Amazon SQS.** The integration suite runs against ElasticMQ and against AWS
   Emulator. The emulator is AWS's own and verifies signatures, so signing is now checked by an AWS
   implementation as well as by the hermetic fake server and the published examples in `aws-sigv4`,
@@ -627,8 +649,9 @@ There is no third-party library (`[nuget]` and `[maven]` are empty). What the su
   the timeouts in a measurement), so `Mq.Sqs.Client.isTimeoutCause` also matches the JDK's two
   timeout messages exactly (`request timed out`, `HTTP connect timed out`) and, on dotnet, the
   message of `HttpClient.Timeout` (its 100 s cap, reachable only with `requestTimeoutMs` above
-  80000). A host runtime that words these differently would turn a `TIMEOUT` into
-  `CONNECTION_FAILED`. Not yet filed in lyric-lang; the fix belongs in `Std.Http` (produce
+  80000). On `native` only the token is asked and no message is matched; the timeout tests pass
+  there (every call path, 40 short deadlines in a row). A host runtime that words these
+  differently would turn a `TIMEOUT` into `CONNECTION_FAILED`. Not yet filed in lyric-lang; the fix belongs in `Std.Http` (produce
   `HttpError.Timeout`).
 - On `--target jvm` the request deadline covers the time until the response headers arrive, not the
   reading of the body (`Std.Http`'s JVM kernel reads the body after the JDK's timer has stopped). A
