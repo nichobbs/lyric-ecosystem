@@ -8,7 +8,7 @@ both interfaces.
 
 | | |
 |---|---|
-| Package | `Lyric.Mq.Sqs` (Lyric packages `Mq.Sqs`, `Mq.Sqs.Client`, `Mq.Sqs.Extras`, `Mq.Sqs.Address`, `Mq.Sqs.Wire`) |
+| Package | `Lyric.Mq.Sqs` (Lyric packages `Mq.Sqs`, `Mq.Sqs.Client`, `Mq.Sqs.Extras`, `Mq.Sqs.Address`, `Mq.Sqs.Wire`; `Mq.Sqs.Text` is internal) |
 | Interfaces | `Mq.MessageQueue`, `Mq.QueueConsumer` of `Lyric.Mq` 0.1.0. `Mq.DeadLetterStore` is not implemented. |
 | Targets | `dotnet`, `jvm` |
 | Stability | `experimental` (0.1.0) |
@@ -576,7 +576,7 @@ There is no third-party library (`[nuget]` and `[maven]` are empty). What the su
 
 | | |
 |---|---|
-| Interface | `Lyric.Mq` 0.1.0 and `Lyric.Testing` from the lyric-lang commit in `.lyric-lang-rev` |
+| Interface | `Lyric.Mq` 0.1.0 and `Lyric.Conformance` from the lyric-lang commit in `.lyric-lang-rev` |
 | Signing | `Lyric.Aws.SigV4` 0.1.0, the version in this repository (`aws-sigv4/`) |
 | Credentials and retries | `Lyric.Aws.Credentials` 0.1.0, the version in this repository (`aws-credentials/`) |
 | SQS API | the JSON 1.0 protocol of the 2012-11-05 API |
@@ -586,6 +586,18 @@ There is no third-party library (`[nuget]` and `[maven]` are empty). What the su
 
 ## Known gaps
 
+- **`native` is not claimed.** The package has no `try` any more, and the one place that reads the
+  characters of a string (`isSqsText`, `jsonStringLiteral`) is `Mq.Sqs.Text`, one package in two
+  files: UTF-16 code units on `dotnet` and `jvm`, UTF-8 bytes on `native`. A native build still
+  stops in the compiler, on two `lyric-lang` bugs that have reproductions and no issue number yet:
+  a method call on a field of a record whose type is declared in another package
+  (`client.retry.decide(...)`) fails with `N0007`; and a function that a package re-exports with
+  `pub use` cannot be called through an alias of that package (`import Mq.Sqs as Sqs`,
+  `Sqs.configFromEnv(...)`, as the usage example of this README does: `N0007`, "cannot resolve
+  call target"). With the first call bound to a local and the example importing `Mq.Sqs.Client`,
+  in a scratch copy, the 51 hermetic tests and the 14 integration tests passed on `--target native`
+  against AWS Emulator. A credential provider that panics ends the process there
+  (`aws-credentials/README.md`).
 - **Not run against Amazon SQS.** The integration suite runs against ElasticMQ and against AWS
   Emulator. The emulator is AWS's own and verifies signatures, so signing is now checked by an AWS
   implementation as well as by the hermetic fake server and the published examples in `aws-sigv4`,

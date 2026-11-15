@@ -464,7 +464,7 @@ fetched by a client without credentials, and S3's own error codes, on both targe
 |---|---|
 | SDK / native libraries | none |
 | `Lyric.Aws.SigV4`, `Lyric.Aws.Credentials` | the versions in this repository (`aws-sigv4/`, `aws-credentials/`) |
-| `Lyric.Storage`, `Lyric.Testing`, standard library | the `lyric-lang` commit in `.lyric-lang-rev`, through the root `[workspace.overrides]`. The package needs `Std.Http.withBytesBody`, `HttpResponse.headerNames` and (for the tests) `Std.HttpServer.requestBodyBytes`, added in nichobbs/lyric-lang#9047 and not in a release yet |
+| `Lyric.Storage`, `Lyric.Conformance`, standard library | the `lyric-lang` commit in `.lyric-lang-rev`, through the root `[workspace.overrides]`. The package needs `Std.Http.withBytesBody`, `HttpResponse.headerNames` and (for the tests) `Std.HttpServer.requestBodyBytes`, added in nichobbs/lyric-lang#9047 and not in a release yet |
 | MinIO (integration suite) | `github.com/minio/minio@v0.0.0-20260212201848-7aac2a2c5b7c`, single node, built from that module version by `scripts/ci/start-minio.sh` |
 
 The suite also runs against [AWS Emulator](https://github.com/aws/aws-emulator) 1.0.341, AWS's own
@@ -488,6 +488,16 @@ hand.
 
 ## Known gaps
 
+- **`native` is not claimed.** The package has no `try` any more and its code is the same on every
+  target, but a native build stops in the compiler: a method call on a field of a record whose type
+  is declared in another package (`client.retry.decide(...)`, `Aws.Retry.RetryPolicy`) fails with
+  `N0007` ("method '.decide' on this receiver is not yet supported for --target native"). It is a
+  `lyric-lang` compiler bug with a two-package reproduction; no issue number yet. With that one
+  call bound to a local first, in a scratch copy, the 31 hermetic tests and the 4 integration tests
+  passed on `--target native` against MinIO and against AWS Emulator; the tests already carry what
+  native needs (a `Std.Task` thread for the fake server). Two things differ there: a credential
+  provider that panics ends the process (`aws-credentials/README.md`), and `withCaCertificate` /
+  `withExclusiveCaCertificate` trust every certificate of the PEM text, not the first only.
 - Objects are held in memory whole, as the interface's base64 payloads require: no multipart
   upload, no streaming, no range reads. `Std.Http` buffers bodies too.
 - No server-side encryption headers, object tagging, versioning, ACLs, or batch delete. `list` has no

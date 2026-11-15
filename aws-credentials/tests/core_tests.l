@@ -6,6 +6,7 @@ package Aws.Credentials.CoreTests
 import Std.Core
 import Std.Collections
 import Std.String as Str
+import Std.Task as StdTask
 import Std.Testing
 import Std.Time as Time
 import Aws.SigV4
@@ -352,6 +353,17 @@ func fourAtOnce(provider: in CredentialProvider, tally: in Tally): Unit {
   taskWait(d)
 }
 
+@cfg(target = "native")
+func fourAtOnce(provider: in CredentialProvider, tally: in Tally): Unit {
+  val cache = Shared(provider = provider)
+  val threads = StdTask.makeScope()
+  StdTask.scopeSpawn(threads, { -> resolveInto(cache, tally) })
+  StdTask.scopeSpawn(threads, { -> resolveInto(cache, tally) })
+  StdTask.scopeSpawn(threads, { -> resolveInto(cache, tally) })
+  StdTask.scopeSpawn(threads, { -> resolveInto(cache, tally) })
+  val _ = StdTask.awaitAll(threads)
+}
+
 @cfg(target = "jvm")
 func fourAtOnce(provider: in CredentialProvider, tally: in Tally): Unit {
   val cache = Shared(provider = provider)
@@ -391,6 +403,38 @@ test "four threads waiting on a refresh that fails all receive its error, from o
     assertEqual(r, "REQUEST_FAILED slow: attempt 1 failed", "every thread got the one refresh's error")
   }
   assertEqualInt(tally.callCount(), 1, "the provider was called once")
+}
+
+// ─── A provider that panics ─────────────────────────────────────────────────
+// Caught on dotnet and the JVM. Native has no unwinding (D-N-003): there the
+// panic ends the process, so the test is not built for it.
+@cfg(not(target = "native"))
+record Panicky {
+  why: String
+}
+
+@cfg(not(target = "native"))
+impl CredentialProvider for Panicky {
+  func resolve(): Result[ResolvedCredentials, CredentialError] {
+    panic(self.why)
+  }
+}
+
+@cfg(not(target = "native"))
+test "a provider that panics is an error, from resolveGuarded and from the cache" {
+  val broken: CredentialProvider = Panicky(why = "the provider broke")
+  assertEqual(describe(resolveGuarded(broken)), "REQUEST_FAILED provider: the provider broke", "resolveGuarded")
+  val cache = cached(broken)
+  assertEqual(describe(cache.resolve()), "REQUEST_FAILED cache: the provider failed: the provider broke", "the cache")
+  assertEqual(
+    describe(
+      resolveGuarded(
+        staticProviderOf(Credentials(accessKeyId = "AKIAGUARD", secretAccessKey = SECRET, sessionToken = ""))
+      )
+    ),
+    "ok AKIAGUARD from static",
+    "a provider that returns is passed through"
+  )
 }
 
 // ─── Timestamps ──────────────────────────────────────────────────────────────

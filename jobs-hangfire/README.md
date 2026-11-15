@@ -445,7 +445,7 @@ database: every test creates a schema `lyric_it_<uuid>` and leaves it there.
 | Resolved transitively | `Npgsql` 6.0.11, `Dapper` 2.0.123, `Dapper.AOT` 1.0.48 |
 | PostgreSQL server | Tested against 16.15 |
 | .NET | `net10.0` |
-| Interface and conformance suite | `Lyric.Jobs` and `Lyric.Testing` at the `lyric-lang` commit in `.lyric-lang-rev`, through the root `[workspace.overrides]` |
+| Interface and conformance suite | `Lyric.Jobs` and `Lyric.Conformance` at the `lyric-lang` commit in `.lyric-lang-rev`, through the root `[workspace.overrides]` |
 
 ## Known gaps
 

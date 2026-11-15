@@ -1,16 +1,16 @@
 # lyric-aws-credentials
 
 Where AWS credentials come from, and when a failed AWS request is sent again, in pure Lyric, for
-`dotnet` and `jvm`, `experimental` (0.1.0). It is what the AWS backends of this repository share
+`dotnet`, `jvm` and `native`, `experimental` (0.1.0). It is what the AWS backends of this repository share
 (`storage-s3`, `mq-sqs`) on top of `aws-sigv4`; it implements no library interface of `lyric-lang`.
 There is no AWS SDK and no extern declaration: files are read with `Std.File`, services are called
 with `Std.Http`, commands are run with `Std.Process`.
 
 | | |
 |---|---|
-| Package | `Lyric.Aws.Credentials` (Lyric packages `Aws.Credentials`, `Aws.Credentials.Ini`, `Aws.Credentials.Profile`, `Aws.Credentials.Remote`, `Aws.Credentials.Chain`, `Aws.Retry`) |
+| Package | `Lyric.Aws.Credentials` (Lyric packages `Aws.Credentials`, `Aws.Credentials.Ini`, `Aws.Credentials.Profile`, `Aws.Credentials.Remote`, `Aws.Credentials.Chain`, `Aws.Retry`; `Aws.Credentials.Guard` is internal) |
 | Interface | none: a shared building block. It defines `CredentialProvider` |
-| Targets | `dotnet`, `jvm` |
+| Targets | `dotnet`, `jvm`, `native` |
 | Stability | `experimental` (0.1.0) |
 | Dependencies | `Lyric.Aws.SigV4` and the standard library. No SDK, no `[nuget]`, no `[maven]`, no native dependency |
 
@@ -86,6 +86,10 @@ provider with `withCredentialProvider` and a policy with `withRetry`.
 `ResolvedCredentials` is the `Aws.SigV4.Credentials`, `expiresAtEpochMs` (`None` for long-term
 credentials) and `source`, the name of the provider. A provider does no caching: every `resolve`
 reads the variables or files, or calls the service, again.
+
+`resolveGuarded(provider)` is `provider.resolve()` for a provider written elsewhere: on `dotnet` and
+`jvm` a panic in it comes back as `Err(REQUEST_FAILED)` with the panic's message (the cache does the
+same for the provider it wraps). On `native` a panic cannot be caught; see "Surprises".
 
 Every provider that reads the environment takes a lookup, `(String) -> String`, that returns `""`
 for an unset variable: `processEnvironment()` for the real one, `environmentOf(map)` for a test or
@@ -188,8 +192,10 @@ tables above; a variable set to the empty string counts as unset.
 
 ## Supported targets
 
-`dotnet` and `jvm`. Both run the same code; there is no per-target kernel. `native` has not been
-tried.
+`dotnet`, `jvm` and `native` (Linux x86-64; clang and lyric-rt to build, OpenSSL 3 at run time for
+HTTPS). All three run the same code and there is no extern declaration. The one per-target piece is
+`Aws.Credentials.Guard`, one package in two files selected by `@cfg`: the managed targets catch a
+panic in a credential provider, `native`, which has no unwinding, calls the provider directly.
 
 ## Surprises
 
@@ -216,35 +222,45 @@ tried.
 - **The container host is not resolved.** A full URI over plain `http://` must name an allowed
   address literally; a host name other than `localhost` needs `https://`.
 - **`ca_bundle` and `AWS_CA_BUNDLE` are trusted in addition to the system trust store**, through
-  `Std.Tls.Certificate.fromPem`, which is documented for a file of one certificate. A bundle of
-  several certificates has not been tried.
+  `Std.Tls.Certificate.fromPem`, which is documented for a file of one certificate. Of a bundle of
+  several certificates `dotnet` and `jvm` read the first and `native` (OpenSSL) reads all of them;
+  that is what `storage-s3`'s tests observe for the same standard library call, and it has not been
+  tried through this package.
+- **On `native` a provider that panics ends the process.** `dotnet` and `jvm` turn a panic in a
+  provider into `Err(REQUEST_FAILED)` (`resolveGuarded`, the cache). Native has no unwinding
+  (D-N-003 in lyric-lang), so there the panic is not caught. The providers of this package do not
+  panic; this is about a `CredentialProvider` an application writes.
 - **The cache serves credentials that are inside the refresh window while a refresh runs or after
   it failed**, until they expire. An error is never cached when there are no credentials at all:
   the next `resolve` asks again.
 - **A wait is never longer than `maxDelayMs`**, also when `Retry-After` asks for more. The HTTP-date
   form of `Retry-After` is not read.
 - **Clock skew errors are classified, not retried.** Nothing corrects the clock.
-- **`isConnectFailure` reads error texts** of the .NET and JDK HTTP clients, because `Std.Http`
-  reports every transport failure as one kind. A text it does not know is `NoResponse`, which is
+- **`isConnectFailure` reads error texts** of the .NET and JDK HTTP clients and, on `native`, of the
+  C library (`Connection refused`, `Name or service not known`), because `Std.Http` reports every
+  transport failure as one kind. A text it does not know is `NoResponse`, which is
   retried less, never more.
 - **No message holds a secret.** `ResolvedCredentials` and `Credentials` are plain records, though:
   printing one prints the secret.
 
-There is no difference between the targets.
+The two differences between the targets are the ones above: a panicking provider, and how much of
+a CA bundle is read.
 
 ## Tests
 
 ```sh
 lyric test --manifest aws-credentials/lyric.toml --target dotnet
 lyric test --manifest aws-credentials/lyric.toml --target jvm
+lyric test --manifest aws-credentials/lyric.toml --target native
 ```
 
-Hermetic, 52 tests in six modules:
+Hermetic, 53 tests in six modules on `dotnet` and `jvm`, 52 on `native`:
 
 - `tests/ini_tests.l` (9): the INI dialect, malformed lines included.
-- `tests/core_tests.l` (13): static and environment providers, chains, the cache with an injected
-  clock (reuse, refresh at the window, a failed refresh, invalidation) and under four concurrent
-  callers, expiry timestamps.
+- `tests/core_tests.l` (14; 13 on `native`): static and environment providers, chains, the cache
+  with an injected clock (reuse, refresh at the window, a failed refresh, invalidation) and under
+  four concurrent callers, expiry timestamps, and a provider that panics (`dotnet` and `jvm` only:
+  on `native` it would end the test process).
 - `tests/profile_tests.l` (12): file and profile selection, merging, section naming, sub-property
   blocks, refused profiles, real files, `credential_process` with a real command (`/bin/sh` on a
   script the test writes), settings.
@@ -264,6 +280,7 @@ Integration, against the AWS Emulator, 4 tests:
 ```sh
 scripts/ci/start-aws-emulator.sh          # exports AWS_EMULATOR_CREDENTIALS_FILE and AWS_EMULATOR_CONFIG_FILE
 scripts/ci/test-aws-emulator.sh dotnet    # runs this package, mq-sqs and storage-s3
+scripts/ci/test-aws-emulator.sh native    # runs the ones of the three that claim native
 ```
 
 | Variable | Meaning |

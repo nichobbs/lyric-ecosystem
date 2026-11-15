@@ -18,6 +18,12 @@ output_assembly = "Mq.Sqs.dll"
 "Mq.Sqs.Extras" = "src/extras.l"
 "Mq.Sqs.Address" = "src/address.l"
 "Mq.Sqs.Wire"   = "src/wire.l"
+# Mq.Sqs.Text is one package in two files: a String is UTF-16 code units on
+# the managed targets and UTF-8 bytes on native.
+"Mq.Sqs.Text"   = [
+  "src/text_utf16.l",
+  "src/text_utf8.l",
+]
 
 [project.tests]
 "Mq.Sqs.AddressTests" = "tests/address_tests.l"
@@ -39,7 +45,7 @@ integration = []   # run tests/integration against the server named by LYRIC_SQS
 [dependencies]
 # The interface and its conformance suite, resolved through the root
 # [workspace.overrides].
-"Lyric.Testing"   = { workspace = true }
+"Lyric.Conformance" = { workspace = true }
 "Lyric.Mq"        = { workspace = true }
 # AWS Signature Version 4, shared with the other AWS backends in this repository.
 "Lyric.Aws.SigV4" = { workspace = true }

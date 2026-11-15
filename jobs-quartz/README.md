@@ -275,7 +275,7 @@ two minutes.
 | | |
 |---|---|
 | Quartz | `org.quartz-scheduler:quartz` 2.5.2 (`[maven]` in `lyric.toml`), with its transitive dependencies as Maven resolves them |
-| Interface and conformance suite | `Lyric.Jobs` and `Lyric.Testing` at the `lyric-lang` commit in `.lyric-lang-rev`, through the root `[workspace.overrides]` |
+| Interface and conformance suite | `Lyric.Jobs` and `Lyric.Conformance` at the `lyric-lang` commit in `.lyric-lang-rev`, through the root `[workspace.overrides]` |
 
 ## Known gaps
 

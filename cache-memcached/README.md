@@ -9,7 +9,7 @@ memcached's meta text protocol written in Lyric. It runs on `dotnet` and `jvm` a
 | Lyric packages | `Cache.Memcached` (the store), `Cache.Memcached.Extras` (memcached-only operations), `Cache.Memcached.Client` (the connection), `Cache.Memcached.Meta` (the protocol codec), `Cache.Memcached.Keys` (key and TTL mapping), `Cache.Memcached.Url` |
 | Targets | `dotnet`, `jvm` |
 | Stability | experimental (0.1.0) |
-| Interface | `Lyric.Cache` (`Cache.CacheStore`), re-exported with `pub use Cache`; conformance suite `Testing.Conformance.Cache` from `Lyric.Testing` |
+| Interface | `Lyric.Cache` (`Cache.CacheStore`), re-exported with `pub use Cache`; conformance suite `Testing.Conformance.Cache` from `Lyric.Conformance` |
 | Server | memcached 1.6.10 or later (the first release with the stable meta protocol and base64 keys); tested against 1.6.24 |
 | Third-party libraries | none (`[nuget]` and `[maven]` are empty); `Lyric.Net` (`net/` in this repository) is a `{ workspace = true }` dependency for the TCP and TLS connection. The package has no extern declarations |
 

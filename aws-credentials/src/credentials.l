@@ -37,6 +37,7 @@ import Std.Environment as Env
 import Std.String as Str
 import Std.Time as Time
 import Aws.SigV4
+import Aws.Credentials.Guard
 
 /// Why a provider has no credentials.
 pub record CredentialError {
@@ -354,6 +355,46 @@ pub protected type CacheState {
   }
 }
 
+// Where a guarded call leaves its result: a closure cannot return it through
+// `guardedCall`.
+ref record ResolveSlot {
+  var outcome: Option[Result[ResolvedCredentials, CredentialError]]
+}
+
+func resolveCatching(
+  provider: in CredentialProvider, reportedBy: in String, prefix: in String
+): Result[ResolvedCredentials, CredentialError] {
+  val slot = ResolveSlot(outcome = None)
+  val panicked = guardedCall({ -> slot.outcome = Some(value = provider.resolve()) })
+  match panicked {
+    case Some(message) -> Err(
+      error = CredentialError(
+        code = "REQUEST_FAILED",
+        provider = reportedBy,
+        message = prefix + message
+      )
+    )
+    case None -> match slot.outcome {
+      case Some(outcome) -> outcome
+      case None -> Err(
+        error = CredentialError(
+          code = "REQUEST_FAILED",
+          provider = reportedBy,
+          message = prefix + "no result"
+        )
+      )
+    }
+  }
+}
+
+/// `provider.resolve()`, for a provider written outside this package. On
+/// `dotnet` and the JVM a panic in it is `Err(REQUEST_FAILED)` from provider
+/// `provider` with the panic's message. On `native` there is no unwinding
+/// (D-N-003 in lyric-lang): a panicking provider ends the process.
+pub func resolveGuarded(provider: in CredentialProvider): Result[ResolvedCredentials, CredentialError] {
+  resolveCatching(provider, "provider", "")
+}
+
 /// A provider that remembers what another provider returned.
 pub record CachedProvider {
   inner: CredentialProvider
@@ -369,17 +410,7 @@ impl CredentialProvider for CachedProvider {
       match self.state.claim(now, self.options.refreshWindowMs, self.options.retryAfterFailureMs) {
         case Use(c) -> return Ok(c)
         case Refresh(fallback) -> {
-          val outcome = try {
-            self.inner.resolve()
-          } catch Bug as bug {
-            Err(
-              error = CredentialError(
-                code = "REQUEST_FAILED",
-                provider = "cache",
-                message = "the provider failed: " + bug.message
-              )
-            )
-          }
+          val outcome = resolveCatching(self.inner, "cache", "the provider failed: ")
           match outcome {
             case Ok(fresh) -> {
               self.state.install(fresh)

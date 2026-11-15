@@ -368,10 +368,9 @@ lyric test --manifest net/lyric.toml --target dotnet
 lyric test --manifest net/lyric.toml --target jvm
 ```
 
-`lyric test --manifest` does not run on `--target native` yet (nichobbs/lyric-lang#6815). There the
-same four test modules are built as executables, each together with the package's own packages
-(`lyric build --manifest ... --target native`), and run, by `bash scripts/ci/test-native.sh` here
-and in the `native` CI job: all 31 tests pass that way on Linux x86-64.
+On `native` the same four modules run with `lyric test --manifest net/lyric.toml --target native`:
+all 31 tests pass on Linux x86-64. `bash scripts/ci/test-native.sh` does that for every package that
+claims `native`, here and in the `native` CI job.
 A native build needs `clang` and lyric-rt (`lyric_rt.a`); a native program that uses TLS needs
 OpenSSL 3 (`libssl.so.3`) at run time.
 
@@ -415,16 +414,9 @@ development, the runner's clang and OpenSSL 3 in CI.
 - On `dotnet` every connection that has been read from holds one thread until it is closed.
 - `native` is POSIX only: the kernel binds `pthread_self`, so a Windows build fails at link time.
   macOS has not been run.
-- On `native` the suites run through `scripts/ci/native-tests.py`, which builds each test module into
-  an executable, because `lyric test --manifest --target native` is refused
-  (nichobbs/lyric-lang#6815).
 - The native kernel imports `Std.TcpHost` and `Std.IoWait`, kernel packages of the standard library
   that are public but `@experimental` or undocumented as API, and recognises a socket timeout by
   the failure text (see "How the kernels do TLS").
-- On `native` a program in which any package declares a record with the name of a union case that
-  has fields, declared in any other package of the build, fails to compile (`N0007`, "missing
-  field"; nichobbs/lyric-lang#9088). The cases of this package with fields are `Data` (`Net.Tcp`), and in
-  `Net.Tcp.Kernel` `LockHeld`, `CarryBytes`, `CarryFailed`, `WireGot`, `WireBroken`.
 - Standard library and compiler issues behind the design, in `nichobbs/lyric-lang`:
   - [#9042](https://github.com/nichobbs/lyric-lang/issues/9042): `Std.TcpHost` has no JVM kernel and
     cannot tell a read timeout from a failure, so this package binds the host socket API itself on

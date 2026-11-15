@@ -147,10 +147,9 @@ lyric test --manifest aws-sigv4/lyric.toml --target dotnet
 lyric test --manifest aws-sigv4/lyric.toml --target jvm
 ```
 
-`lyric test --manifest` does not run on `--target native` yet (nichobbs/lyric-lang#6815): there the
-same three test modules are built as executables, each with the package's own packages
-(`lyric build --manifest ... --target native`), and run, by `bash scripts/ci/test-native.sh` here and
-in the `native` CI job; all 25 tests pass that way.
+On `native` the same three modules run with `lyric test --manifest aws-sigv4/lyric.toml --target
+native` (25 tests); `bash scripts/ci/test-native.sh` does that for every package that claims
+`native`, here and in the `native` CI job.
 
 Everything is hermetic; there is no integration suite, because nothing here talks to a service
 (the packages that use it sign real requests: `storage-s3` and `mq-sqs` each run an in-process

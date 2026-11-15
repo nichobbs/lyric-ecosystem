@@ -9,7 +9,8 @@
 //! `AssumeRoleWithWebIdentity` and answers with the XML documents STS sends.
 //!
 //! The server runs on its own thread: a `Task.Run` worker on `--target
-//! dotnet`, a `spawn` inside a `scope` on `--target jvm`. A scenario returns
+//! dotnet`, a `spawn` inside a `scope` on `--target jvm`, a `Std.Task` scope
+//! thread on `--target native`. A scenario returns
 //! its findings as lines and ends by asking the server to stop.
 @test_module
 package Aws.Credentials.RemoteTests
@@ -23,6 +24,7 @@ import Std.File as File
 import Std.Http
 import Std.HttpServer
 import Std.String as Str
+import Std.Task as StdTask
 import Std.Testing
 import Std.Time as Time
 import Aws.Credentials
@@ -232,6 +234,22 @@ func handle(fake: in Fake, ctx: in HttpContext): Unit {
   }
 }
 
+// A bug in the fake is a failed request on the managed targets. Native has no
+// unwinding (D-N-003): there it ends the test process with its message.
+@cfg(not(target = "native"))
+func handleGuarded(fake: in Fake, ctx: in HttpContext): Unit {
+  try {
+    handle(fake, ctx)
+  } catch Bug as b {
+    respondText(ctx, 500, "fake server bug: " + b.message)
+  }
+}
+
+@cfg(target = "native")
+func handleGuarded(fake: in Fake, ctx: in HttpContext): Unit {
+  handle(fake, ctx)
+}
+
 func serveUntilStopped(l: in HttpListener): Unit {
   val fake = Fake(mode = "", imdsTokens = 0, lastImdsToken = "", requests = 0)
   var running = true
@@ -241,11 +259,7 @@ func serveUntilStopped(l: in HttpListener): Unit {
       respondText(ctx, 200, "served " + fake.requests.toString())
       running = false
     } else {
-      try {
-        handle(fake, ctx)
-      } catch Bug as b {
-        respondText(ctx, 500, "fake server bug: " + b.message)
-      }
+      handleGuarded(fake, ctx)
     }
   }
 }
@@ -273,6 +287,17 @@ func withFake(port: in Int, scenario: in (String) -> String): String {
   val server = taskRun({ -> serveUntilStopped(l) })
   val transcript = scenario(endpointOf(port))
   taskWait(server)
+  stopListener(l)
+  transcript
+}
+
+@cfg(target = "native")
+func withFake(port: in Int, scenario: in (String) -> String): String {
+  val l = startListener(endpointOf(port) + "/")
+  val server = StdTask.makeScope()
+  StdTask.scopeSpawn(server, { -> serveUntilStopped(l) })
+  val transcript = scenario(endpointOf(port))
+  val _ = StdTask.awaitAll(server)
   stopListener(l)
   transcript
 }

@@ -49,8 +49,8 @@ func isTimeoutCause(cause: in String): Bool {
   cause == "request timed out" or cause == "HTTP connect timed out" or Str.contains(cause, "HttpClient.Timeout")
 }
 
-// One request. Plain (non-`async`) so it may `await` in place and still wrap
-// the send in `try`.
+// One request, awaited in place. `Std.Http` reports every transport failure
+// as `Err` on all three targets, so nothing is caught here.
 func call(
   http: in HttpClient,
   method: in HttpMethod,
@@ -83,11 +83,7 @@ func call(
   }
   val src = makeCancelSourceTimeout(timeoutMs)
   val tok = sourceToken(src)
-  val sent = try {
-    await http.sendWithCancel(req, tok)
-  } catch Bug as bug {
-    Err(error = ConnectionFailed(url = url, message = bug.message))
-  }
+  val sent = await http.sendWithCancel(req, tok)
   val deadlinePassed = isCancelled(tok)
   disposeSource(src)
   val resp = match sent {
@@ -110,11 +106,7 @@ func call(
       )
     }
   }
-  val read = try {
-    await HttpResponse.bodyText(resp)
-  } catch Bug as bug {
-    return Err(NoResponse(message = "the answer of " + url + " could not be read: " + bug.message))
-  }
+  val read = await HttpResponse.bodyText(resp)
   match read {
     case Ok(text) -> Ok(Reply(status = HttpResponse.statusCode(resp), body = text))
     case Err(e) -> Err(NoResponse(message = "the answer of " + url + " could not be read: " + IOError.message(e)))

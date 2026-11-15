@@ -35,6 +35,7 @@ import Std.Encoding as Enc
 import Std.JsonValue
 import Std.String as Str
 import Mq
+import Mq.Sqs.Text as Text
 
 /// The attribute that carries `Message.id`.
 @pure
@@ -82,42 +83,13 @@ pub record Incoming {
 }
 
 // ─── Text SQS can carry ──────────────────────────────────────────────────────
-func isSurrogate(u: in Int): Bool {
-  u >= 0xD800 and u <= 0xDFFF
-}
-
 /// True when every character of `text` is one SQS accepts in a body or a
 /// string attribute: tab, line feed, carriage return, U+0020 to U+D7FF,
-/// U+E000 to U+FFFD, and well-formed surrogate pairs.
+/// U+E000 to U+FFFD, and the characters above U+FFFF (well-formed surrogate
+/// pairs on the managed targets).
 @pure
 pub func isSqsText(text: in String): Bool {
-  var i = 0
-  while i < text.length {
-    val u = Str.codeUnitAt(text, i)
-    if u >= 0xD800 and u <= 0xDBFF {
-      if i + 1 >= text.length {
-        return false
-      }
-      val low = Str.codeUnitAt(text, i + 1)
-      if low < 0xDC00 or low > 0xDFFF {
-        return false
-      }
-      i = i + 2
-    } else {
-      val ok = u == 9 or u == 10 or u == 13 or (u >= 0x20 and u <= 0xD7FF) or (u >= 0xE000 and u <= 0xFFFD)
-      if not ok {
-        return false
-      }
-      i = i + 1
-    }
-  }
-  true
-}
-
-func hex4(u: in Int): String {
-  val digits = "0123456789abcdef"
-  digits.substring((u / 4096) % 16, 1) + digits.substring((u / 256) % 16, 1) + digits.substring((u / 16) % 16, 1) +
-    digits.substring(u % 16, 1)
+  Text.sqsText(text)
 }
 
 /// `text` as a JSON string literal in which every character SQS would refuse
@@ -125,31 +97,7 @@ func hex4(u: in Int): String {
 /// text whatever `text` holds.
 @pure
 pub func jsonStringLiteral(text: in String): String {
-  val sb = Str.StringBuilder.new()
-  sb.append("\"")
-  var i = 0
-  while i < text.length {
-    val u = Str.codeUnitAt(text, i)
-    if u == 34 {
-      sb.append("\\\"")
-    } else if u == 92 {
-      sb.append("\\\\")
-    } else if u == 10 {
-      sb.append("\\n")
-    } else if u == 13 {
-      sb.append("\\r")
-    } else if u == 9 {
-      sb.append("\\t")
-    } else if u < 0x20 or isSurrogate(u) or u >= 0xFFFE {
-      sb.append("\\u")
-      sb.append(hex4(u))
-    } else {
-      sb.append(text.substring(i, 1))
-    }
-    i = i + 1
-  }
-  sb.append("\"")
-  sb.toString()
+  Text.jsonLiteral(text)
 }
 
 /// `headers` as the JSON array `lyric.headers` carries.
@@ -327,8 +275,11 @@ pub func decodeMessage(incoming: in Incoming): Result[Mq.Message, String] {
       }
     }
   }
-  val headers = match attributeValue(incoming.attributes, attributeHeaders()) {
-    case Some(json) -> match headersFromJson(json) { case Ok(hs) -> hs; case Err(e) -> return Err(e) }
+  val headers: slice[Mq.MessageHeader] = match attributeValue(incoming.attributes, attributeHeaders()) {
+    case Some(json) -> match headersFromJson(json) {
+      case Ok(hs) -> hs
+      case Err(e) -> return Err(e)
+    }
     case None -> match attributeValue(incoming.attributes, attributeId()) {
       case Some(_) -> []
       case None -> foreignHeaders(incoming.attributes)

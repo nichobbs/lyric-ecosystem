@@ -37,7 +37,7 @@ integration = []   # run tests/integration against the server named by LYRIC_S3_
 [dependencies]
 # The interface and its conformance suite, resolved through the root
 # [workspace.overrides].
-"Lyric.Testing" = { workspace = true }
+"Lyric.Conformance" = { workspace = true }
 "Lyric.Storage" = { workspace = true }
 # AWS Signature Version 4, shared with the other AWS backends in this repository.
 "Lyric.Aws.SigV4" = { workspace = true }

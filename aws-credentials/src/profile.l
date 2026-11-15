@@ -330,11 +330,7 @@ func runCredentialProcess(commandLine: in String, profile: in String): Result[Re
     args.add(parts[i])
     i = i + 1
   }
-  val ran = try {
-    Process.runCapture(parts[0], args, PROCESS_TIMEOUT_MS)
-  } catch Bug as bug {
-    Err(error = bug.message)
-  }
+  val ran = Process.runCapture(parts[0], args, PROCESS_TIMEOUT_MS)
   val result = match ran {
     case Ok(r) -> r
     case Err(_) -> return Err(failure("PROCESS_FAILED", what + " could not be started: " + parts[0]))
