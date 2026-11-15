@@ -14,8 +14,10 @@ interface's conformance suite on every target it claims.
 | `Lyric.Storage.Gcs` | `storage-gcs/` | `Storage.StorageBucket` | Google Cloud Storage | dotnet, jvm | pure Lyric (XML API, GOOG4-HMAC-SHA256 over `Std.Http`); not yet verified with a real key |
 | `Lyric.Storage.AzureBlob` | `storage-azure-blob/` | `Storage.StorageBucket` | Azure Blob Storage | dotnet, jvm | pure Lyric (Shared Key over `Std.Http`) |
 | `Lyric.Aws.SigV4` | `aws-sigv4/` | (shared signing) | AWS Signature V4 | dotnet, jvm, native | pure Lyric |
+| `Lyric.Aws.Credentials` | `aws-credentials/` | (shared credential providers and retry policy) | environment, shared config and credentials files, `credential_process`, container endpoint, IMDSv2, web identity (STS); default chain with a refreshing cache | dotnet, jvm | pure Lyric; used by `Lyric.Storage.S3` and `Lyric.Mq.Sqs` |
 | `Lyric.Jobs.Quartz` | `jobs-quartz/` | `Jobs.JobScheduler` | Quartz | jvm | Quartz via Maven |
 | `Lyric.Jobs.QuartzNet` | `jobs-quartznet/` | `Jobs.JobScheduler` | Quartz.NET | dotnet | Quartz.NET via NuGet |
+| `Lyric.Jobs.Hangfire` | `jobs-hangfire/` | `Jobs.JobScheduler` | Hangfire (in-memory and PostgreSQL storage) | dotnet | Hangfire via NuGet |
 | `Lyric.Net` | `net/` | (shared TCP and TLS client connections, TLS options, URL authority parsing) | host sockets and TLS | dotnet, jvm, native | pure Lyric over one per-target socket kernel; used by `Lyric.Redis`, `Lyric.Mq.RabbitMq` and `Lyric.Mq.ActiveMq` |
 | `Lyric.Redis` | `redis/` | (client) | Redis | dotnet, jvm, native | pure Lyric (RESP over TCP) |
 | `Lyric.Cache.Redis` | `cache-redis/` | `Cache.CacheStore` | Redis | dotnet, jvm | on `Lyric.Redis` |

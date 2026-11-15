@@ -23,6 +23,14 @@
 //!                                 ERROR frame; the delivery stays unsettled
 //!   login `stall`                 CONNECTED, then nothing is read for 8 s, then the socket closes
 //!   header `fake-pad:N`           the MESSAGE carries a `padding` header of N characters
+//!   /queue/fail.storedrop.*       SEND is stored, then the socket closes without a receipt
+//!
+//! For the heart-beat and reconnect tests a broker of its own is started
+//! (`startKnobBroker`) and steered through its fields: the `heart-beat` it
+//! answers with, whether its sessions send heart-beats, whether it refuses
+//! logins or subscriptions, and `dropConnections`, which closes every open
+//! connection the way a failing network does. It counts the logins,
+//! subscriptions and client heart-beats it sees.
 //!
 //! The broker is started three times: on plain TCP, behind TLS, and behind
 //! TLS with a required client certificate. The TLS ones use the TEST-ONLY
@@ -72,11 +80,31 @@ ref record FakeBroker {
   lock: K.Lock
   var queues: Map[String, List[Stored]]
   var counter: Int
+  // The `heart-beat` header of CONNECTED.
+  var heartBeat: String
+  // Every session writes a heart-beat this often (0 = never), while
+  // `beating`.
+  var beatEveryMs: Int
+  var beating: Bool
+  var refuseLogins: Bool
+  var refuseSubscribes: Bool
+  // What the broker saw: CONNECT frames, the `heart-beat` header of the last
+  // one, SUBSCRIBE frames, heart-beat bytes from clients.
+  var logins: Int
+  var lastOffer: String
+  var subscribes: Int
+  var beatsSeen: Int
+  // Stalled connections whose pause has run out.
+  var stallsEnded: Int
+  var sessions: List[Session]
 }
 
 ref record Session {
   broker: FakeBroker
   sock: K.Sock
+  // Serializes writes: replies and heart-beats come from two threads.
+  writeLock: K.Lock
+  var alive: Bool
   var subscriptionId: String
   var destination: String
   var unacked: Map[String, Stored]
@@ -91,12 +119,47 @@ func h(name: in String, value: in String): Stomp.Header {
   Stomp.Header(name = name, value = value)
 }
 
+func sessionWrite(s: in Session, bytes: in slice[Byte]): Unit {
+  K.lockEnter(s.writeLock)
+  val _ = K.sockWrite(s.sock, bytes)
+  K.lockExit(s.writeLock)
+}
+
 func reply(s: in Session, command: in String, headers: in slice[Stomp.Header], body: in String): Unit {
   match Stomp.encodeFrame(Stomp.textFrame(command, headers, body)) {
-    case Ok(bytes) -> {
-      val _ = K.sockWrite(s.sock, bytes)
-    }
+    case Ok(bytes) -> sessionWrite(s, bytes)
     case Err(_) -> ()
+  }
+}
+
+func sessionAlive(s: in Session): Bool {
+  K.lockEnter(s.writeLock)
+  val alive = s.alive
+  K.lockExit(s.writeLock)
+  alive
+}
+
+// The session's heart-beats, on a thread of their own.
+func beatLoop(s: in Session, everyMs: in Int): Unit {
+  val b = s.broker
+  while sessionAlive(s) {
+    K.lockEnter(b.lock)
+    val beating = b.beating
+    K.lockExit(b.lock)
+    if beating {
+      sessionWrite(s, encodeUtf8("\n"))
+    }
+    K.sleepMs(everyMs)
+  }
+}
+
+// Close every open connection without a word, as a failing network does.
+func dropConnections(b: in FakeBroker): Unit {
+  K.lockEnter(b.lock)
+  val open = b.sessions.toArray()
+  K.lockExit(b.lock)
+  for s in open {
+    K.sockClose(s.sock)
   }
 }
 
@@ -188,9 +251,7 @@ func pump(s: in Session): Unit {
     s.unacked[ackId] = stored
     s.unackedOrder.add(ackId)
     match Stomp.encodeFrame(Stomp.Frame(command = "MESSAGE", headers = headers.toArray(), body = stored.body)) {
-      case Ok(bytes) -> {
-        val _ = K.sockWrite(s.sock, bytes)
-      }
+      case Ok(bytes) -> sessionWrite(s, bytes)
       case Err(_) -> ()
     }
   }
@@ -215,18 +276,39 @@ func returnUnacked(s: in Session): Unit {
     rebuilt.add(waiting)
   }
   b.queues[s.destination] = rebuilt
-  K.lockExit(b.lock)
   s.unacked = newMap()
   s.unackedOrder = newList()
+  K.lockExit(b.lock)
 }
 
 func settleFake(s: in Session, frame: in Stomp.Frame, ackId: in String): Bool {
-  if s.unacked.containsKey(ackId) {
+  K.lockEnter(s.broker.lock)
+  val known = s.unacked.containsKey(ackId)
+  if known {
     s.unacked.remove(ackId)
-    return true
   }
-  brokerError(s, frame, "Unexpected ACK received for message-id [null]")
-  false
+  K.lockExit(s.broker.lock)
+  if not known {
+    brokerError(s, frame, "Unexpected ACK received for message-id [null]")
+  }
+  known
+}
+
+// Dispatch what waits on `destination` to the other connections subscribed
+// to it: what a connection that ended gave back goes to a consumer that is
+// already there, as on a real broker.
+func pumpSubscribers(b: in FakeBroker, destination: in String): Unit {
+  K.lockEnter(b.lock)
+  val open = b.sessions.toArray()
+  K.lockExit(b.lock)
+  for other in open {
+    K.lockEnter(b.lock)
+    val subscribed = other.subscriptionId.length > 0 and other.destination == destination
+    K.lockExit(b.lock)
+    if subscribed {
+      pump(other)
+    }
+  }
 }
 
 // Refuse a settlement of a `/queue/flaky.*` subscription, once.
@@ -244,7 +326,15 @@ func handle(s: in Session, frame: in Stomp.Frame): Bool {
   val command = frame.command
   val tx = Stomp.headerOr(frame, "transaction", "")
   if command == "CONNECT" or command == "STOMP" {
-    if Stomp.headerOr(frame, "passcode", "") == "wrong" {
+    val b = s.broker
+    K.lockEnter(b.lock)
+    b.logins = b.logins + 1
+    b.lastOffer = Stomp.headerOr(frame, "heart-beat", "")
+    val refused = b.refuseLogins
+    val heartBeat = b.heartBeat
+    val beatEveryMs = b.beatEveryMs
+    K.lockExit(b.lock)
+    if refused or Stomp.headerOr(frame, "passcode", "") == "wrong" {
       reply(
         s,
         "ERROR",
@@ -254,9 +344,15 @@ func handle(s: in Session, frame: in Stomp.Frame): Bool {
       return false
     }
     val version = if Stomp.headerOr(frame, "login", "") == "ancient" { "1.0" } else { "1.2" }
-    reply(s, "CONNECTED", [h("server", "FakeMQ/1.0"), h("version", version), h("heart-beat", "0,0")], "")
+    reply(s, "CONNECTED", [h("server", "FakeMQ/1.0"), h("version", version), h("heart-beat", heartBeat)], "")
+    if beatEveryMs > 0 {
+      val _ = KT.startBackground({ -> beatLoop(s, beatEveryMs) })
+    }
     if Stomp.headerOr(frame, "login", "") == "stall" {
       K.sleepMs(STALL_MS)
+      K.lockEnter(b.lock)
+      b.stallsEnded = b.stallsEnded + 1
+      K.lockExit(b.lock)
       return false
     }
     return true
@@ -268,6 +364,10 @@ func handle(s: in Session, frame: in Stomp.Frame): Bool {
       return true
     }
     if destination == "/queue/fail.drop" {
+      return false
+    }
+    if Str.startsWith(destination, "/queue/fail.storedrop.") {
+      enqueue(s.broker, frame)
       return false
     }
     if destination == "/queue/fail.silent" {
@@ -291,8 +391,19 @@ func handle(s: in Session, frame: in Stomp.Frame): Bool {
     return true
   }
   if command == "SUBSCRIBE" {
+    val b = s.broker
+    K.lockEnter(b.lock)
+    b.subscribes = b.subscribes + 1
+    val refused = b.refuseSubscribes
+    K.lockExit(b.lock)
+    if refused {
+      brokerError(s, frame, "User lyric is not authorized to read from this destination")
+      return true
+    }
+    K.lockEnter(b.lock)
     s.subscriptionId = Stomp.headerOr(frame, "id", "")
     s.destination = Stomp.headerOr(frame, "destination", "")
+    K.lockExit(b.lock)
     if Str.startsWith(s.destination, "/queue/slow.subscribe.") {
       K.sleepMs(SLOW_MS)
     }
@@ -373,6 +484,8 @@ func serve(b: in FakeBroker, sock: in K.Sock): Unit {
   val s = Session(
     broker = b,
     sock = sock,
+    writeLock = K.newLock(),
+    alive = true,
     subscriptionId = "",
     destination = "",
     unacked = newMap(),
@@ -381,6 +494,9 @@ func serve(b: in FakeBroker, sock: in K.Sock): Unit {
     txAcks = newMap(),
     refuseLeft = 0
   )
+  K.lockEnter(b.lock)
+  b.sessions.add(s)
+  K.lockExit(b.lock)
   val decoder = Stomp.newDecoder(1048576)
   var open = true
   while open {
@@ -395,15 +511,49 @@ func serve(b: in FakeBroker, sock: in K.Sock): Unit {
         }
       }
       case Ok(None) -> match K.sockRead(sock, 16384, 60000) {
-        case Ok(Data(bytes)) -> Stomp.feed(decoder, bytes)
+        case Ok(Data(bytes)) -> {
+          // Line ends that arrive while no frame is under way are the
+          // client's heart-beats.
+          if Stomp.buffered(decoder) == 0 and onlyLineEnds(bytes) {
+            K.lockEnter(b.lock)
+            b.beatsSeen = b.beatsSeen + bytes.length
+            K.lockExit(b.lock)
+          }
+          Stomp.feed(decoder, bytes)
+        }
         case _ -> {
           open = false
         }
       }
     }
   }
+  K.lockEnter(s.writeLock)
+  s.alive = false
+  K.lockExit(s.writeLock)
+  K.lockEnter(b.lock)
+  var at = 0
+  while at < b.sessions.count {
+    if b.sessions[at].writeLock == s.writeLock {
+      b.sessions.removeAt(at)
+    } else {
+      at += 1
+    }
+  }
+  K.lockExit(b.lock)
   returnUnacked(s)
   K.sockClose(sock)
+  if s.destination.length > 0 {
+    pumpSubscribers(b, s.destination)
+  }
+}
+
+func onlyLineEnds(bytes: in slice[Byte]): Bool {
+  for b in bytes {
+    if b.toInt() != 10 and b.toInt() != 13 {
+      return false
+    }
+  }
+  true
 }
 
 // A connection whose handshake fails is dropped; the broker keeps listening.
@@ -437,7 +587,25 @@ func startBrokerWith(secured: in Bool, tls: in KT.ServerTls): FakeBroker {
     case Ok(s) -> s
     case Err(e) -> panic("the fake broker cannot listen: " + e)
   }
-  val b = FakeBroker(server = server, secured = secured, tls = tls, lock = K.newLock(), queues = newMap(), counter = 0)
+  val b = FakeBroker(
+    server = server,
+    secured = secured,
+    tls = tls,
+    lock = K.newLock(),
+    queues = newMap(),
+    counter = 0,
+    heartBeat = "0,0",
+    beatEveryMs = 0,
+    beating = true,
+    refuseLogins = false,
+    refuseSubscribes = false,
+    logins = 0,
+    lastOffer = "",
+    subscribes = 0,
+    beatsSeen = 0,
+    stallsEnded = 0,
+    sessions = newList()
+  )
   val _ = KT.startBackground({ -> acceptLoop(b) })
   b
 }
@@ -537,7 +705,13 @@ func mustTake(q: in ActiveMq.ActiveMqQueue): Mq.Message {
   val got = Got(messages = newList())
   match q.consume(2000, { m -> keep(got, m) }) {
     case Ok(_) -> got.messages[0]
-    case Err(e) -> panic("consume failed: " + e)
+    case Err(e) -> {
+      val status = ActiveMq.status(q)
+      panic(
+        "consume failed: " + e + " (reconnects: " + status.reconnects.toString() + ", lost because: \"" + status.lostBecause +
+          "\")"
+      )
+    }
   }
 }
 
@@ -713,8 +887,13 @@ test "a broker ERROR frame fails the publish and leaves the connection usable" {
   q.close()
 }
 
+// These look at a connection that stays lost, so reconnecting is off.
+func lasting(options: in ActiveMq.ConnectOptions): ActiveMq.ConnectOptions {
+  options.copy(reconnect = ActiveMq.noReconnect())
+}
+
 test "a broker that drops the connection during a publish" {
-  val q = openFresh()
+  val q = open(lasting(optionsFor(freshName())))
   val e = errorOf(
     ActiveMq.publishWithHeaders(q, message("m", "x"), [h("destination", "/queue/fail.drop")]),
     "publish while the broker hangs up"
@@ -729,7 +908,7 @@ test "a broker that drops the connection during a publish" {
 }
 
 test "a broker that drops the connection in the middle of a consume" {
-  val q = open(optionsFor("/queue/fail.dropconsume"))
+  val q = open(lasting(optionsFor("/queue/fail.dropconsume")))
   val e = errorOf(q.consume(2000, { m -> Ok(()) }), "consume while the broker hangs up")
   assertTrue(e != "timeout", "a lost connection is not a timeout")
   expectContains(e, "activemq: connection lost: the broker closed the connection", "lost")
@@ -737,7 +916,7 @@ test "a broker that drops the connection in the middle of a consume" {
 }
 
 test "a broker that never confirms a publish times the request out" {
-  val options = optionsFor(freshName())
+  val options = lasting(optionsFor(freshName()))
   val q = open(options.copy(requestTimeoutMs = 150))
   val e = errorOf(
     ActiveMq.publishWithHeaders(q, message("m", "x"), [h("destination", "/queue/fail.silent")]),
@@ -1278,7 +1457,7 @@ test "a negative deliveryCount is refused on publish" {
 }
 
 test "an ERROR frame without a receipt-id is a lost connection, not the current request's failure" {
-  val q = openFresh()
+  val q = open(lasting(optionsFor(freshName())))
   val e = errorOf(
     ActiveMq.publishWithHeaders(q, message("m", "x"), [h("destination", "/queue/fail.stray")]),
     "publish answered by an uncorrelated ERROR"
@@ -1325,14 +1504,16 @@ test "consume does not wait past its timeout for the connection's lock" {
 }
 
 test "a publish to a broker that stops reading ends with the request timeout" {
-  val base = optionsFor(freshName())
+  val base = lasting(optionsFor(freshName()))
   val q = open(base.copy(login = "stall", requestTimeoutMs = 1000))
   val body = filler(33554432)
-  val started = K.monotonicMillis()
+  val ended = stallsEndedOf(theBroker())
   val e = errorOf(q.publish(message("huge", body)), "a publish nobody reads")
-  val elapsed = K.monotonicMillis() - started
   expectContains(e, "activemq: connection lost:", "a write that cannot finish loses the connection")
-  assertTrue(elapsed < 6000i64, "the publish returned after " + elapsed.toString() + " ms")
+  // The request timeout ended it, not the broker closing its socket when its
+  // pause is over. A count, not a clock: encoding 32 MiB takes seconds on a
+  // loaded machine.
+  assertEqualInt(stallsEndedOf(theBroker()), ended, "the publish returned while the broker was still reading nothing")
   assertTrue(not ActiveMq.isOpen(q), "the connection is unusable afterwards")
   q.close()
 }
@@ -1546,6 +1727,591 @@ test "a publisher thread and a consuming thread share one connection" {
   }
   assertEqualInt(ActiveMq.unsettledCount(q), 0, "all settled")
   q.close()
+}
+
+// ─── Heart-beats and reconnecting ────────────────────────────────────────────
+// A broker of its own for one test, answering CONNECT with `heartBeat` and
+// writing a heart-beat every `beatEveryMs` ms on each connection (0 = never).
+func startKnobBroker(heartBeat: in String, beatEveryMs: in Int): FakeBroker {
+  val b = startBrokerWith(false, serverTls(""))
+  K.lockEnter(b.lock)
+  b.heartBeat = heartBeat
+  b.beatEveryMs = beatEveryMs
+  K.lockExit(b.lock)
+  b
+}
+
+func stopKnobBroker(b: in FakeBroker): Unit {
+  KT.serverClose(b.server)
+  dropConnections(b)
+}
+
+func setBeating(b: in FakeBroker, on: in Bool): Unit {
+  K.lockEnter(b.lock)
+  b.beating = on
+  K.lockExit(b.lock)
+}
+
+func setRefuseLogins(b: in FakeBroker, on: in Bool): Unit {
+  K.lockEnter(b.lock)
+  b.refuseLogins = on
+  K.lockExit(b.lock)
+}
+
+func setRefuseSubscribes(b: in FakeBroker, on: in Bool): Unit {
+  K.lockEnter(b.lock)
+  b.refuseSubscribes = on
+  K.lockExit(b.lock)
+}
+
+func theBroker(): FakeBroker {
+  val _ = brokerPort()
+  match slot.broker {
+    case Some(b) -> b
+    case None -> panic("no broker")
+  }
+}
+
+func stallsEndedOf(b: in FakeBroker): Int {
+  K.lockEnter(b.lock)
+  val n = b.stallsEnded
+  K.lockExit(b.lock)
+  n
+}
+
+func loginsOf(b: in FakeBroker): Int {
+  K.lockEnter(b.lock)
+  val n = b.logins
+  K.lockExit(b.lock)
+  n
+}
+
+func subscribesOf(b: in FakeBroker): Int {
+  K.lockEnter(b.lock)
+  val n = b.subscribes
+  K.lockExit(b.lock)
+  n
+}
+
+func beatsSeenBy(b: in FakeBroker): Int {
+  K.lockEnter(b.lock)
+  val n = b.beatsSeen
+  K.lockExit(b.lock)
+  n
+}
+
+func lastOfferTo(b: in FakeBroker): String {
+  K.lockEnter(b.lock)
+  val offer = b.lastOffer
+  K.lockExit(b.lock)
+  offer
+}
+
+// Reconnecting after 100 ms, at most 200 ms apart.
+func fastReconnect(): ActiveMq.ReconnectOptions {
+  val base = ActiveMq.defaultReconnect()
+  base.copy(initialDelayMs = 100, maxDelayMs = 200)
+}
+
+// Options for a knob broker: no heart-beats, quick reconnects.
+func knobOptions(b: in FakeBroker, destination: in String): ActiveMq.ConnectOptions {
+  val base = ActiveMq.defaultOptions("127.0.0.1", KT.serverPort(b.server), destination)
+  base.copy(
+    login = "lyric",
+    passcode = "secret",
+    requestTimeoutMs = 3000,
+    heartBeatSendMs = 0,
+    heartBeatReceiveMs = 0,
+    reconnect = fastReconnect()
+  )
+}
+
+// Wait for `condition`, looking every 10 ms; the test fails when it does not
+// hold within `limitMs`. The limits are far above what a healthy run needs,
+// so a slow machine does not fail a test.
+func waitUntil(label: in String, limitMs: in Int, condition: in () -> Bool): Unit {
+  val deadline = K.monotonicMillis() + limitMs.toLong()
+  while not condition() {
+    if K.monotonicMillis() >= deadline {
+      assertTrue(false, label + ": not within " + limitMs.toString() + " ms")
+      return
+    }
+    K.sleepMs(10)
+  }
+}
+
+func takeWithin(q: in ActiveMq.ActiveMqQueue, limitMs: in Int, label: in String): Mq.Message {
+  val got = Got(messages = newList())
+  match q.consume(limitMs, { m -> keep(got, m) }) {
+    case Ok(_) -> got.messages[0]
+    case Err(e) -> panic(label + ": consume failed: " + e)
+  }
+}
+
+// Publish `m`, trying again while the connection is away.
+func publishEventually(q: in ActiveMq.ActiveMqQueue, m: in Mq.Message, limitMs: in Int, label: in String): Unit {
+  val deadline = K.monotonicMillis() + limitMs.toLong()
+  var last = ""
+  var published = false
+  while not published and K.monotonicMillis() < deadline {
+    match q.publish(m) {
+      case Ok(_) -> {
+        published = true
+      }
+      case Err(e) -> {
+        last = e
+        K.sleepMs(20)
+      }
+    }
+  }
+  assertTrue(published, label + ": no publish succeeded within " + limitMs.toString() + " ms, the last error: " + last)
+}
+
+func lostBecause(q: in ActiveMq.ActiveMqQueue): String {
+  val status = ActiveMq.status(q)
+  status.lostBecause
+}
+
+func reconnectsOf(q: in ActiveMq.ActiveMqQueue): Int {
+  val status = ActiveMq.status(q)
+  status.reconnects
+}
+
+func isReconnecting(q: in ActiveMq.ActiveMqQueue): Bool {
+  val status = ActiveMq.status(q)
+  status.reconnecting
+}
+
+test "heart-beats are negotiated as STOMP 1.2 says" {
+  val b = startKnobBroker("300,200", 0)
+  val base = knobOptions(b, "/queue/hb").copy(reconnect = ActiveMq.noReconnect())
+  // The larger of what one side guarantees and the other asks for.
+  val q = open(base.copy(heartBeatSendMs = 100, heartBeatReceiveMs = 150))
+  assertEqual(lastOfferTo(b), "100,150", "the CONNECT frame offers the configured intervals")
+  val agreed = ActiveMq.status(q)
+  assertEqualInt(agreed.heartBeatSendMs, 200, "the client sends as often as the broker asks, not more")
+  assertEqualInt(agreed.heartBeatReceiveMs, 300, "the broker sends as often as it can, not more")
+  assertTrue(ActiveMq.hasBackgroundThread(q), "heart-beats need the background thread")
+  q.close()
+  val slower = open(base.copy(heartBeatSendMs = 4000, heartBeatReceiveMs = 5000))
+  assertEqual(lastOfferTo(b), "4000,5000", "the offer")
+  val slow = ActiveMq.status(slower)
+  assertEqualInt(slow.heartBeatSendMs, 4000, "the client's own limit wins when it is larger")
+  assertEqualInt(slow.heartBeatReceiveMs, 5000, "the client's wish wins when it is larger")
+  slower.close()
+  // 0 on either side switches a direction off.
+  val off = open(base)
+  assertEqual(lastOfferTo(b), "0,0", "no heart-beats offered")
+  val none = ActiveMq.status(off)
+  assertEqualInt(none.heartBeatSendMs, 0, "nothing to send")
+  assertEqualInt(none.heartBeatReceiveMs, 0, "nothing to expect")
+  assertTrue(not ActiveMq.hasBackgroundThread(off), "no heart-beats and no reconnecting: no thread")
+  off.close()
+  K.lockEnter(b.lock)
+  b.heartBeat = "0,0"
+  K.lockExit(b.lock)
+  val refused = open(base.copy(heartBeatSendMs = 100, heartBeatReceiveMs = 150))
+  val declined = ActiveMq.status(refused)
+  assertEqualInt(declined.heartBeatSendMs, 0, "a broker that wants none gets none")
+  assertEqualInt(declined.heartBeatReceiveMs, 0, "a broker that sends none is not expected to")
+  refused.close()
+  expectContains(errorOfConnect(base.copy(heartBeatSendMs = -1)), "heartBeatSendMs", "a negative interval")
+  expectContains(errorOfConnect(base.copy(heartBeatReceiveMs = -1)), "heartBeatReceiveMs", "a negative interval")
+  stopKnobBroker(b)
+}
+
+test "an idle connection sends heart-beats, and frames still pass between them" {
+  val b = startKnobBroker("0,100", 0)
+  val base = knobOptions(b, "/queue/idle").copy(reconnect = ActiveMq.noReconnect())
+  val q = open(base.copy(heartBeatSendMs = 100))
+  waitUntil("three heart-beats from an idle client", 20000, { -> beatsSeenBy(b) >= 3 })
+  mustPublish(q, message("between", "beats"))
+  assertEqual(mustTake(q).id, "between", "a frame between heart-beats")
+  assertTrue(isOk(q.ack("between")), "ack")
+  val seen = beatsSeenBy(b)
+  waitUntil("heart-beats go on after the frames", 20000, { -> beatsSeenBy(b) >= seen + 2 })
+  assertTrue(ActiveMq.isOpen(q), "still connected")
+  q.close()
+  waitUntil("the background thread ends after close", 10000, { -> not ActiveMq.hasBackgroundThread(q) })
+  stopKnobBroker(b)
+  // A broker that asks for none gets none.
+  val quiet = startKnobBroker("0,0", 0)
+  val silent = open(knobOptions(quiet, "/queue/idle").copy(heartBeatSendMs = 100, reconnect = ActiveMq.noReconnect()))
+  K.sleepMs(500)
+  assertEqualInt(beatsSeenBy(quiet), 0, "no heart-beat was agreed, so none is sent")
+  silent.close()
+  stopKnobBroker(quiet)
+}
+
+test "a broker that stops sending heart-beats is taken for dead" {
+  // Heart-beats agreed every second, sent ten times as often: the connection
+  // must outlive three intervals of idling, and die when they stop.
+  val b = startKnobBroker("1000,0", 100)
+  val base = knobOptions(b, "/queue/dead").copy(heartBeatReceiveMs = 1000, reconnect = ActiveMq.noReconnect())
+  val q = open(base)
+  K.sleepMs(3000)
+  assertTrue(ActiveMq.isOpen(q), "heart-beats keep an idle connection alive: " + lostBecause(q))
+  val waiting = open(base)
+  setBeating(b, false)
+  // An idle connection: the background thread notices.
+  waitUntil("the silent broker is noticed", 30000, { -> not ActiveMq.isOpen(q) })
+  expectContains(lostBecause(q), "the broker sent nothing for", "the reason")
+  expectContains(lostBecause(q), "heart-beat every 1000 ms", "the agreed interval")
+  val later = errorOf(q.publish(message("m", "x")), "publish to the dead connection")
+  expectContains(later, "activemq: connection lost: the broker sent nothing for", "later operations say why")
+  waitUntil("the background thread ends with the connection", 10000, { -> not ActiveMq.hasBackgroundThread(q) })
+  q.close()
+  // A connection in the middle of a consume: the consume ends with the
+  // reason, not with "timeout".
+  val e = errorOf(waiting.consume(30000, { m -> accept(m) }), "consume from a silent broker")
+  expectContains(e, "the broker sent nothing for", "a dead peer is not an empty queue")
+  waiting.close()
+  stopKnobBroker(b)
+}
+
+test "a missing heart-beat leads to a new connection" {
+  val b = startKnobBroker("200,0", 50)
+  val q = open(knobOptions(b, "/queue/revive").copy(heartBeatReceiveMs = 200))
+  setBeating(b, false)
+  waitUntil("a reconnect after the heart-beats stopped", 30000, { -> reconnectsOf(q) >= 1 })
+  setBeating(b, true)
+  publishEventually(q, message("alive", "again"), 30000, "after the broker came back")
+  assertEqual(takeWithin(q, 30000, "after the broker came back").id, "alive", "the new connection works")
+  q.close()
+  stopKnobBroker(b)
+}
+
+test "a dropped connection is re-established, subscribes again and goes on receiving" {
+  val b = startKnobBroker("0,0", 0)
+  val q = open(knobOptions(b, "/queue/again"))
+  mustPublish(q, message("m1", "one"))
+  assertEqual(mustTake(q).id, "m1", "delivered on the first connection")
+  assertEqualInt(loginsOf(b), 1, "one login")
+  assertEqualInt(subscribesOf(b), 1, "one subscription")
+  dropConnections(b)
+  // `consume` waits through the outage; the broker redelivers what the lost
+  // connection had not settled.
+  val again = takeWithin(q, 30000, "after the drop")
+  assertEqual(again.id, "m1", "the unsettled delivery comes back")
+  assertEqualInt(again.deliveryCount, 1, "flagged redelivered by the broker")
+  assertEqualInt(reconnectsOf(q), 1, "one reconnect")
+  assertEqualInt(loginsOf(b), 2, "CONNECT was sent again")
+  assertEqualInt(subscribesOf(b), 2, "SUBSCRIBE was sent again")
+  assertTrue(ActiveMq.isOpen(q), "connected")
+  assertEqualInt(ActiveMq.unsettledCount(q), 1, "the redelivery replaced the dead delivery")
+  assertTrue(isOk(q.ack("m1")), "the redelivery can be settled")
+  expectContains(errorOf(q.ack("m1"), "a second ack"), "no unsettled delivery", "nothing is left of the dead delivery")
+  // Messages published after the reconnect arrive on the new subscription.
+  mustPublish(q, message("m2", "two"))
+  assertEqual(mustTake(q).id, "m2", "published and delivered on the new connection")
+  assertTrue(isOk(q.ack("m2")), "ack")
+  expectTimeout(q, "nothing else")
+  // A second outage works the same way.
+  dropConnections(b)
+  waitUntil("the second reconnect", 30000, { -> reconnectsOf(q) == 2 })
+  mustPublish(q, message("m3", "three"))
+  assertEqual(mustTake(q).id, "m3", "after the second reconnect")
+  assertTrue(isOk(q.ack("m3")), "ack")
+  assertEqualInt(subscribesOf(b), 3, "subscribed a third time")
+  q.close()
+  stopKnobBroker(b)
+}
+
+test "a connection that never subscribed reconnects without subscribing" {
+  val b = startKnobBroker("0,0", 0)
+  val q = open(knobOptions(b, "/queue/publisher"))
+  mustPublish(q, message("p1", "x"))
+  dropConnections(b)
+  waitUntil("the reconnect", 30000, { -> reconnectsOf(q) == 1 })
+  assertEqualInt(subscribesOf(b), 0, "a publisher does not become a consumer")
+  mustPublish(q, message("p2", "y"))
+  assertEqual(mustTake(q).id, "p1", "both messages are on the queue")
+  assertEqual(mustTake(q).id, "p2", "in order")
+  q.close()
+  stopKnobBroker(b)
+}
+
+test "while the connection is away: publish fails at once, unsent; in-flight requests are unknown; old deliveries are stale" {
+  val b = startKnobBroker("0,0", 0)
+  // Six seconds without a connection, so that the calls below meet it.
+  val slowly = fastReconnect().copy(initialDelayMs = 6000, maxDelayMs = 6000, jitterPercent = 0)
+  val q = open(knobOptions(b, "/queue/away").copy(reconnect = slowly))
+  mustPublish(q, message("keep", "k"))
+  assertEqual(mustTake(q).id, "keep", "a delivery on the first connection")
+  // The broker stores this message and drops the connection before the
+  // receipt.
+  val inFlight = errorOf(
+    ActiveMq.publishWithHeaders(
+      q,
+      message("held", "h"),
+      [h("destination", "/queue/fail.storedrop.away")]
+    ),
+    "a publish whose receipt never comes"
+  )
+  expectContains(inFlight, "activemq: connection lost:", "the loss is reported")
+  assertTrue(ActiveMq.isOutcomeUnknownError(inFlight), "the outcome is unknown: " + inFlight)
+  assertTrue(not ActiveMq.isNotConnectedError(inFlight), "it is not the retryable error")
+  assertTrue(not ActiveMq.isOpen(q), "not connected")
+  assertTrue(isReconnecting(q), "reconnecting")
+  // A publish now is refused before anything is written.
+  val started = K.monotonicMillis()
+  val refused = errorOf(q.publish(message("later", "l")), "publish while away")
+  assertTrue(K.monotonicMillis() - started < 2000i64, "it fails at once")
+  assertTrue(ActiveMq.isNotConnectedError(refused), "the retryable error: " + refused)
+  assertTrue(not ActiveMq.isOutcomeUnknownError(refused), "nothing was sent, so nothing is unknown")
+  expectContains(refused, "connection lost:", "it names the cause")
+  val batch = errorOf(q.publishBatch([message("b1", "x"), message("b2", "y")]), "batch while away")
+  assertTrue(ActiveMq.isNotConnectedError(batch), "a batch is refused the same way: " + batch)
+  // The delivery of the lost connection cannot be settled: its ack id died
+  // with the connection.
+  assertEqualInt(ActiveMq.unsettledCount(q), 0, "deliveries of the lost connection do not count")
+  val stale = errorOf(q.ack("keep"), "ack of a delivery of the lost connection")
+  assertTrue(ActiveMq.isStaleDeliveryError(stale), "the stale error: " + stale)
+  expectContains(stale, "the broker redelivers the message", "what happens next")
+  val unknownId = errorOf(q.nack("keep", true), "a second settlement")
+  assertTrue(ActiveMq.isNotConnectedError(unknownId), "the stale delivery is reported once: " + unknownId)
+  val poll = errorOf(q.consume(0, { m -> accept(m) }), "consume(0) while away")
+  assertTrue(ActiveMq.isNotConnectedError(poll), "consume(0) does not wait: " + poll)
+  val short = errorOf(q.consume(100, { m -> accept(m) }), "consume(100) while away")
+  assertTrue(ActiveMq.isNotConnectedError(short), "a consume that ends while away says so, not timeout: " + short)
+  // The broker redelivers; nothing was sent twice and "later" never was.
+  val again = takeWithin(q, 30000, "after the reconnect")
+  assertEqual(again.id, "keep", "redelivered")
+  assertEqualInt(again.deliveryCount, 1, "flagged redelivered")
+  assertTrue(isOk(q.ack("keep")), "ack of the redelivery")
+  expectTimeout(q, "the refused publish and batch were never sent")
+  q.close()
+  val other = open(knobOptions(b, "/queue/fail.storedrop.away"))
+  assertEqual(takeWithin(other, 30000, "the held message").id, "held", "the broker had taken the message")
+  assertTrue(isOk(other.ack("held")), "ack")
+  expectTimeout(other, "the in-flight publish was not sent again")
+  other.close()
+  stopKnobBroker(b)
+}
+
+test "a delivery of a lost connection is still stale after the reconnect, until the redelivery replaces it" {
+  val b = startKnobBroker("0,0", 0)
+  val q = open(knobOptions(b, "/queue/stale"))
+  mustPublish(q, message("s1", "x"))
+  assertEqual(mustTake(q).id, "s1", "delivered")
+  dropConnections(b)
+  waitUntil("the reconnect", 30000, { -> reconnectsOf(q) == 1 })
+  val stale = errorOf(q.nack("s1", true), "nack of the old delivery on the new connection")
+  assertTrue(ActiveMq.isStaleDeliveryError(stale), "the stale error: " + stale)
+  val again = takeWithin(q, 30000, "the redelivery")
+  assertEqual(again.id, "s1", "the broker redelivered it")
+  assertTrue(isOk(q.ack("s1")), "the redelivery is settled")
+  expectTimeout(q, "no copy was made by the refused requeue")
+  q.close()
+  stopKnobBroker(b)
+}
+
+test "publishWaitMs lets a publish wait for the new connection" {
+  val b = startKnobBroker("0,0", 0)
+  val patient = fastReconnect().copy(publishWaitMs = 30000)
+  val q = open(knobOptions(b, "/queue/patient").copy(reconnect = patient))
+  val inFlight = errorOf(
+    ActiveMq.publishWithHeaders(
+      q,
+      message("held", "h"),
+      [h("destination", "/queue/fail.storedrop.patient")]
+    ),
+    "a publish whose receipt never comes"
+  )
+  assertTrue(ActiveMq.isOutcomeUnknownError(inFlight), "the in-flight publish is still unknown: " + inFlight)
+  mustPublish(q, message("after", "a"))
+  assertEqualInt(reconnectsOf(q), 1, "the publish went out on the new connection")
+  assertEqual(mustTake(q).id, "after", "and arrived")
+  q.close()
+  expectContains(
+    errorOfConnect(knobOptions(b, "/queue/x").copy(reconnect = patient.copy(publishWaitMs = -1))),
+    "publishWaitMs",
+    "a negative wait"
+  )
+  stopKnobBroker(b)
+}
+
+test "a batch interrupted by a lost connection is not applied in part and not sent again" {
+  val b = startKnobBroker("0,0", 0)
+  val q = open(knobOptions(b, "/queue/fail.drop"))
+  val e = errorOf(q.publishBatch([message("b1", "x"), message("b2", "y")]), "a batch the broker hangs up on")
+  expectContains(e, "activemq: connection lost:", "the loss")
+  assertTrue(
+    ActiveMq.isOutcomeUnknownError(e) or Str.contains(e, "the transaction was not committed"),
+    "it says what became of the transaction: " + e
+  )
+  q.close()
+  stopKnobBroker(b)
+}
+
+test "an ERROR frame that ends the connection leads to a new one" {
+  val b = startKnobBroker("0,0", 0)
+  val q = open(knobOptions(b, "/queue/stray"))
+  val e = errorOf(
+    ActiveMq.publishWithHeaders(q, message("m", "x"), [h("destination", "/queue/fail.stray")]),
+    "publish answered by an uncorrelated ERROR"
+  )
+  expectContains(e, "the broker sent an ERROR frame that answers no request in flight", "the cause")
+  assertTrue(ActiveMq.isOutcomeUnknownError(e), "the publish in flight is unknown: " + e)
+  waitUntil("the reconnect", 30000, { -> reconnectsOf(q) == 1 })
+  mustPublish(q, message("next", "n"))
+  assertEqual(mustTake(q).id, "next", "the new connection works")
+  q.close()
+  stopKnobBroker(b)
+}
+
+test "reconnecting gives up after maxAttempts with an error that says so" {
+  val b = startKnobBroker("0,0", 0)
+  val bounded = fastReconnect().copy(maxAttempts = 3)
+  val q = open(knobOptions(b, "/queue/gone").copy(reconnect = bounded))
+  // Nothing listens any more: every attempt is refused.
+  stopKnobBroker(b)
+  waitUntil(
+    "three failed attempts",
+    60000,
+    { -> Str.contains(lostBecause(q), "reconnecting was given up after 3 failed attempt(s)") }
+  )
+  val status = ActiveMq.status(q)
+  assertTrue(not status.connected, "not connected")
+  assertTrue(not status.reconnecting, "no longer reconnecting")
+  assertEqualInt(status.failedAttempts, 3, "three attempts were made")
+  expectContains(status.lastAttemptError, "activemq: cannot connect to 127.0.0.1:", "why the last one failed")
+  val e = errorOf(q.publish(message("m", "x")), "publish after giving up")
+  expectContains(e, "activemq: connection lost:", "a lost connection")
+  expectContains(e, "reconnecting was given up after 3 failed attempt(s)", "it says that it gave up")
+  expectContains(e, "cannot connect to 127.0.0.1:", "and why the last attempt failed")
+  assertTrue(not ActiveMq.isNotConnectedError(e), "it is final, not the retryable error")
+  val started = K.monotonicMillis()
+  val consumed = errorOf(q.consume(20000, { m -> accept(m) }), "consume after giving up")
+  assertTrue(K.monotonicMillis() - started < 10000i64, "consume does not wait for a connection that will not come")
+  expectContains(consumed, "reconnecting was given up", "consume reports it too")
+  waitUntil("the background thread ends", 10000, { -> not ActiveMq.hasBackgroundThread(q) })
+  q.close()
+  expectContains(errorOf(q.publish(message("m", "x")), "publish after close"), "connection is closed", "closed")
+  val base = ActiveMq.defaultOptions("127.0.0.1", 1, "/queue/gone")
+  expectContains(errorOfConnect(base.copy(reconnect = bounded.copy(maxAttempts = -1))), "maxAttempts", "attempts")
+  expectContains(errorOfConnect(base.copy(reconnect = bounded.copy(initialDelayMs = 0))), "initialDelayMs", "delay")
+  expectContains(errorOfConnect(base.copy(reconnect = bounded.copy(maxDelayMs = 50))), "maxDelayMs", "cap")
+  expectContains(errorOfConnect(base.copy(reconnect = bounded.copy(jitterPercent = 101))), "jitterPercent", "jitter")
+}
+
+test "a broker that refuses the new login or subscription ends the attempts at once" {
+  val b = startKnobBroker("0,0", 0)
+  val q = open(knobOptions(b, "/queue/denied"))
+  setRefuseLogins(b, true)
+  dropConnections(b)
+  waitUntil(
+    "the refused login is final",
+    30000,
+    { -> Str.contains(lostBecause(q), "the broker refused the new connection") }
+  )
+  expectContains(lostBecause(q), "password is invalid", "the broker's reason")
+  waitUntil("the background thread ends", 10000, { -> not ActiveMq.hasBackgroundThread(q) })
+  assertEqualInt(loginsOf(b), 2, "one attempt, not a loop")
+  val e = errorOf(q.publish(message("m", "x")), "publish after the refusal")
+  expectContains(e, "activemq: connection lost:", "lost for good")
+  assertTrue(not ActiveMq.isNotConnectedError(e), "not the retryable error")
+  assertTrue(not Str.contains(e, "secret"), "the passcode is not in the error")
+  q.close()
+  setRefuseLogins(b, false)
+  val consumer = open(knobOptions(b, "/queue/denied"))
+  mustOk(ActiveMq.subscribe(consumer), "subscribe")
+  setRefuseSubscribes(b, true)
+  dropConnections(b)
+  waitUntil(
+    "the refused subscription is final",
+    30000,
+    { -> Str.contains(lostBecause(consumer), "the broker refused the subscription") }
+  )
+  expectContains(lostBecause(consumer), "not authorized", "the broker's reason")
+  waitUntil("the background thread ends", 10000, { -> not ActiveMq.hasBackgroundThread(consumer) })
+  consumer.close()
+  stopKnobBroker(b)
+}
+
+test "close during the wait for a reconnect returns at once and ends the background thread" {
+  val b = startKnobBroker("0,0", 0)
+  val minute = fastReconnect().copy(initialDelayMs = 60000, maxDelayMs = 60000, jitterPercent = 0)
+  val q = open(knobOptions(b, "/queue/closing").copy(reconnect = minute))
+  assertTrue(ActiveMq.hasBackgroundThread(q), "reconnecting needs the background thread")
+  dropConnections(b)
+  waitUntil("the loss is noticed", 30000, { -> isReconnecting(q) })
+  val started = K.monotonicMillis()
+  q.close()
+  val elapsed = K.monotonicMillis() - started
+  assertTrue(elapsed < 5000i64, "close returned after " + elapsed.toString() + " ms of a 60 s wait")
+  waitUntil("the background thread ends", 10000, { -> not ActiveMq.hasBackgroundThread(q) })
+  assertEqualInt(loginsOf(b), 1, "no attempt was made after close")
+  assertTrue(not isReconnecting(q), "a closed connection does not reconnect")
+  expectContains(errorOf(q.publish(message("m", "x")), "publish after close"), "connection is closed", "closed")
+  // The thread of a healthy connection ends with close as well.
+  val healthy = open(knobOptions(b, "/queue/closing"))
+  assertTrue(ActiveMq.hasBackgroundThread(healthy), "running")
+  healthy.close()
+  waitUntil("the background thread ends", 10000, { -> not ActiveMq.hasBackgroundThread(healthy) })
+  assertEqualInt(loginsOf(b), 2, "and nothing reconnected behind it")
+  stopKnobBroker(b)
+}
+
+test "connectFromEnv reads the heart-beat and reconnect settings" {
+  val b = startKnobBroker("500,500", 0)
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_URL", "stomp://lyric:secret@127.0.0.1:" + KT.serverPort(b.server).toString())
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_QUEUENAME", "env.keeper")
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_HEARTBEATSENDMS", "0")
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_HEARTBEATRECEIVEMS", "0")
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECT", "False")
+  match ActiveMq.connectFromEnv() {
+    case Err(e) -> assertTrue(false, e)
+    case Ok(q) -> {
+      assertEqual(lastOfferTo(b), "0,0", "heart-beats switched off")
+      assertTrue(not ActiveMq.hasBackgroundThread(q), "nothing to do in the background")
+      q.close()
+    }
+  }
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_HEARTBEATSENDMS", "700")
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_HEARTBEATRECEIVEMS", "")
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECT", "")
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECTINITIALDELAYMS", "40000")
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECTMAXATTEMPTS", "2")
+  match ActiveMq.connectFromEnv() {
+    case Err(e) -> assertTrue(false, e)
+    case Ok(q) -> {
+      assertEqual(lastOfferTo(b), "700,10000", "one variable set, the other at its default")
+      assertTrue(q.options.reconnect.enabled, "reconnecting is on by default")
+      assertEqualInt(q.options.reconnect.initialDelayMs, 40000, "initial delay")
+      assertEqualInt(q.options.reconnect.maxDelayMs, 40000, "the cap follows a larger initial delay")
+      assertEqualInt(q.options.reconnect.maxAttempts, 2, "attempts")
+      q.close()
+    }
+  }
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECTMAXDELAYMS", "10")
+  match ActiveMq.connectFromEnv() {
+    case Ok(_) -> assertTrue(false, "a cap below the initial delay")
+    case Err(e) -> expectContains(e, "maxDelayMs", "the cap")
+  }
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECTMAXDELAYMS", "")
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECTINITIALDELAYMS", "")
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECTMAXATTEMPTS", "many")
+  match ActiveMq.connectFromEnv() {
+    case Ok(_) -> assertTrue(false, "attempts that are not a number")
+    case Err(e) -> expectContains(e, "LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECTMAXATTEMPTS must be a whole number", "attempts")
+  }
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECTMAXATTEMPTS", "")
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_HEARTBEATSENDMS", "-5")
+  match ActiveMq.connectFromEnv() {
+    case Ok(_) -> assertTrue(false, "a negative interval")
+    case Err(e) -> expectContains(e, "LYRIC_CONFIG_MQ_ACTIVEMQ_HEARTBEATSENDMS must not be negative", "interval")
+  }
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_HEARTBEATSENDMS", "")
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECT", "sometimes")
+  match ActiveMq.connectFromEnv() {
+    case Ok(_) -> assertTrue(false, "an unknown reconnect setting")
+    case Err(e) -> expectContains(e, "LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECT must be true or false", "reconnect")
+  }
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECT", "")
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_URL", "")
+  Env.setVar("LYRIC_CONFIG_MQ_ACTIVEMQ_QUEUENAME", "")
+  stopKnobBroker(b)
 }
 
 // ─── TLS ─────────────────────────────────────────────────────────────────────

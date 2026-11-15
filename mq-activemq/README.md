@@ -4,7 +4,8 @@ Apache ActiveMQ backend for the `Mq.MessageQueue` and `Mq.QueueConsumer` interfa
 for `dotnet` and `jvm`, `experimental` (0.1.0). The client is a STOMP 1.2 implementation written in
 Lyric; only the TCP socket and the TLS layer over it come from the host platform, so there is no
 JMS, NMS or other SDK dependency. One `ActiveMqQueue` is one connection to the broker and one
-destination, and implements both interfaces.
+destination, and implements both interfaces. The connection sends and expects STOMP heart-beats
+and is re-established when it is lost; both can be tuned or switched off.
 
 | | |
 |---|---|
@@ -68,7 +69,12 @@ passed to `publishBatch`, a negative `timeoutMs`. The error texts:
 | `activemq: empty message id` | an empty id given to `ack`, `nack`, `publishWithHeaders`, or (on dotnet) inside a `publishBatch` |
 | `activemq: no unsettled delivery has message id '...'` | `ack`/`nack` of an id that was never delivered on this connection, or is already settled |
 | `activemq: broker error: ...` | the broker refused this request: an `ERROR` frame carrying the request's `receipt-id` (or the answer to `CONNECT`); the text is its `message` header. The connection stays usable, except after `CONNECT`. |
-| `activemq: connection lost: ...` | the transport failed, a request was not confirmed or a write not taken within `requestTimeoutMs`, the broker sent an `ERROR` frame that answers no request in flight, or the broker ended the connection during login; the connection is unusable from here on |
+| `activemq: connection lost: REASON` | returned by the operation that met the loss: the transport failed, a request was not confirmed or a write not taken within `requestTimeoutMs`, the broker sent nothing for twice the agreed heart-beat interval, it sent an `ERROR` frame that answers no request in flight, or it ended the connection during login. With reconnecting on, a new connection is opened in the background; with it off, every later operation returns the same text. |
+| `...; the outcome is unknown: ...` | appended to `connection lost` for a `publish`, `publishBatch` (`COMMIT`), `ack` or `nack` that had been written when the connection was lost: the broker may or may not have applied it, and the client does not send it again. `isOutcomeUnknownError(e)` |
+| `...; the transaction was not committed, so nothing of it was applied` | appended to `connection lost` for a `publishBatch` or `nack(id, true)` that lost the connection before its `COMMIT` was written |
+| `activemq: not connected, reconnecting (nothing was sent); connection lost: REASON` | an operation called while the connection is being re-established. Nothing was written; the same call can succeed later. `isNotConnectedError(e)` |
+| `activemq: connection lost: REASON; reconnecting was given up ...` | reconnecting ended, after `maxAttempts` failed attempts or because the broker refused the new `CONNECT` or `SUBSCRIBE`; the text carries the last failure. Final: open a new connection. |
+| `activemq: stale delivery: message 'ID' was delivered on a connection that has since been lost ...` | `ack`/`nack` of a delivery received before a reconnect: its ack id died with the connection and the broker redelivers the message. `isStaleDeliveryError(e)` |
 | `activemq: message 'ID' has the negative deliveryCount N` | `publish`, `publishBatch`, `publishWithHeaders`: nothing was sent |
 | `activemq: the connection is closed` | any operation after `close` |
 | `activemq: cannot connect to HOST:PORT: ...` | the TCP connection could not be opened |
@@ -148,6 +154,44 @@ Variations:
   }
   ```
 
+- **Outages.** Reconnecting is on by default, so a consumer loop needs nothing: `consume` waits for
+  the new connection within its timeout. A publisher decides what an error means with the three
+  predicates; only "not connected" is safe to repeat blindly. Heart-beats and the backoff are
+  options:
+
+  ```lyric
+  func publishOrKeep(queue: in ActiveMq.ActiveMqQueue, m: in Mq.Message): Result[Bool, String] {
+    match queue.publish(m) {
+      case Ok(_) -> Ok(true)
+      case Err(e) -> if ActiveMq.isNotConnectedError(e) {
+        // Nothing was sent: keep the message and publish it later.
+        Ok(false)
+      } else {
+        // `isOutcomeUnknownError(e)`: the broker may have it. Publishing it
+        // again can make a duplicate; that is the application's decision.
+        Err(e)
+      }
+    }
+  }
+
+  func tuned(url: in String): Result[ActiveMq.ActiveMqQueue, String] {
+    val base = ActiveMq.optionsFromUrl(url, "orders")?
+    val reconnect = ActiveMq.defaultReconnect()
+    ActiveMq.connectWith(
+      base.copy(
+        heartBeatSendMs = 5000,
+        heartBeatReceiveMs = 5000,
+        reconnect = reconnect.copy(initialDelayMs = 500, maxDelayMs = 10000, maxAttempts = 20)
+      )
+    )
+  }
+
+  func withoutReconnect(url: in String): Result[ActiveMq.ActiveMqQueue, String] {
+    val base = ActiveMq.optionsFromUrl(url, "orders")?
+    ActiveMq.connectWith(base.copy(heartBeatSendMs = 0, heartBeatReceiveMs = 0, reconnect = ActiveMq.noReconnect()))
+  }
+  ```
+
 - **Through the interfaces**, for code that must not know the backend:
 
   ```lyric
@@ -210,7 +254,14 @@ Variations:
 Other functions of `Mq.ActiveMq`: `subscribe(queue)` (open the subscription before the first
 `consume`), `publishWithHeaders(queue, message, extra)`, `serverInfo(queue)` (the broker's `server`
 header, such as `ActiveMQ/5.17.6`), `destination(queue)`, `isOpen(queue)`, `unsettledCount(queue)`,
-`resolveDestination(name)`, `skipsVerification(tls)` and `insecureAllowedByEnvironment()`.
+`status(queue)` (a `ConnectionStatus`: `connected`, `reconnecting`, `lostBecause`, `failedAttempts`,
+`lastAttemptError`, `reconnects`, and the agreed `heartBeatSendMs` / `heartBeatReceiveMs`),
+`hasBackgroundThread(queue)`, `isNotConnectedError(e)`, `isOutcomeUnknownError(e)`,
+`isStaleDeliveryError(e)`, `defaultReconnect()`, `noReconnect()`, `resolveDestination(name)`,
+`skipsVerification(tls)` and `insecureAllowedByEnvironment()`.
+
+All of the examples above are compiled by `tests/readme_tests.l`, which also runs the ones that
+connect as far as a refused connection.
 
 ## Configuration
 
@@ -259,6 +310,20 @@ full STOMP destination taken as written (`/queue/NAME`, `/topic/NAME`). An empty
 | `maxFrameBytes` | 16777216 (16 MiB) | largest message body accepted from the broker, in bytes, inclusive; at least 1. A larger message is undeliverable (next row); the connection stays usable. |
 | `onUndeliverable` | `UndeliverablePolicy.LeaveUnacknowledged` | what `consume` does with a message it cannot hand to a handler: `LeaveUnacknowledged` leaves it on the broker, `RejectToBroker` sends `NACK` (dead-letter queue if persistent, discarded if not). Either way `consume` returns an `Err`. See "Surprises". |
 | `tls` | `plainTcp()` | `TlsOptions` (`Net.Tls`, re-exported by `Mq.ActiveMq`), set with the functions below |
+| `heartBeatSendMs` | 10000 | the heart-beat the client offers to send, in milliseconds (the first number of the STOMP `heart-beat` header); 0 = none. The agreed interval is the larger of this and what the broker asks for. |
+| `heartBeatReceiveMs` | 10000 | the heart-beat the client asks the broker for (the second number); 0 = none. The agreed interval is the larger of this and what the broker says it can do. The connection counts as dead after twice the agreed interval without a byte. |
+| `reconnect` | `defaultReconnect()` | `ReconnectOptions`, below; `noReconnect()` switches reconnecting off |
+
+`ReconnectOptions` (start from `defaultReconnect()` and `.copy(...)`):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | re-establish a lost connection in the background. `false`: a lost connection stays lost. |
+| `initialDelayMs` | 1000 | wait before the first attempt; doubled after every failed attempt. At least 1. |
+| `maxDelayMs` | 30000 | the longest wait between two attempts; not less than `initialDelayMs` |
+| `maxAttempts` | 0 (no limit) | failed attempts in a row after which reconnecting is given up |
+| `jitterPercent` | 20 | each wait is shortened by a random part of up to this many percent of it (0 to 100) |
+| `publishWaitMs` | 0 (fail at once) | how long `publish`, `publishBatch` and `publishWithHeaders` wait for a connection that is being re-established before they return the "not connected" error |
 
 TLS options. The function names and the rule for skipping verification are those of
 `Std.Http.HttpClientBuilder` (docs/61 in lyric-lang):
@@ -281,6 +346,12 @@ Environment variables. An empty variable counts as unset.
 | `LYRIC_CONFIG_MQ_ACTIVEMQ_QUEUENAME` | `connectFromEnv` | queue name or destination (required) |
 | `LYRIC_CONFIG_MQ_ACTIVEMQ_ACKMODE` | `connectFromEnv` | `Manual` (default) or `Auto`, in any case |
 | `LYRIC_CONFIG_MQ_ACTIVEMQ_ONUNDELIVERABLE` | `connectFromEnv` | `Leave` (default) or `Reject`, in any case: the `onUndeliverable` option |
+| `LYRIC_CONFIG_MQ_ACTIVEMQ_HEARTBEATSENDMS` | `connectFromEnv` | `heartBeatSendMs` (default 10000; 0 = none) |
+| `LYRIC_CONFIG_MQ_ACTIVEMQ_HEARTBEATRECEIVEMS` | `connectFromEnv` | `heartBeatReceiveMs` (default 10000; 0 = none) |
+| `LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECT` | `connectFromEnv` | `true` (default) or `false`, in any case: `reconnect.enabled` |
+| `LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECTINITIALDELAYMS` | `connectFromEnv` | `reconnect.initialDelayMs` (default 1000) |
+| `LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECTMAXDELAYMS` | `connectFromEnv` | `reconnect.maxDelayMs` (default 30000, or the initial delay when that is larger) |
+| `LYRIC_CONFIG_MQ_ACTIVEMQ_RECONNECTMAXATTEMPTS` | `connectFromEnv` | `reconnect.maxAttempts` (default 0 = no limit) |
 | `LYRIC_CONFIG_MQ_ACTIVEMQ_TLSCAFILE` | `connectFromEnv` | PEM file: a CA certificate trusted in addition to the platform trust store |
 | `LYRIC_CONFIG_MQ_ACTIVEMQ_TLSCAEXCLUSIVE` | `connectFromEnv` | `true`: trust only that CA (default `false`; any other value is an `Err`, and so is `true` without a CA file) |
 | `LYRIC_CONFIG_MQ_ACTIVEMQ_TLSCERTFILE` | `connectFromEnv` | PEM file: client certificate (mutual TLS) |
@@ -291,8 +362,10 @@ Environment variables. An empty variable counts as unset.
 
 The `TLS...` variables apply to a `stomp+ssl://` URL; with a `stomp://` URL a CA file, a
 certificate or key file, a server name or `TLSMINVERSION=1.3` is an `Err`. The PEM files are read
-on each `connectFromEnv` call. `persistent`, `selector`, `prefetchSize`, `virtualHost`, the
-timeouts and `maxFrameBytes` have no variable: use `optionsFromUrl` and `.copy(...)`.
+on each `connectFromEnv` call. The numeric variables take whole numbers that are not negative;
+anything else is an `Err` naming the variable. `persistent`, `selector`, `prefetchSize`,
+`virtualHost`, the timeouts, `maxFrameBytes`, `reconnect.jitterPercent` and
+`reconnect.publishWaitMs` have no variable: use `optionsFromUrl` and `.copy(...)`.
 
 ## Surprises
 
@@ -350,8 +423,8 @@ Requeue, reject and `deliveryCount`:
   requeue, the `COMMIT`). If the broker refuses it with an `ERROR` and the connection stays open,
   the call returns `broker error`, the delivery is still unsettled here and on the broker, and
   `ack` / `nack` with the same id tries again. A refused requeue leaves no copy: its transaction
-  is aborted. If the connection is lost instead, nothing can be settled any more and the broker
-  redelivers.
+  is aborted. If the connection is lost instead, the deliveries it carried cannot be settled any
+  more and the broker redelivers them (see "Connection, heart-beats and reconnecting").
 - **In `Manual` mode a handler's `Err` settles nothing.** `consume` returns the handler's error
   and the delivery stays unsettled until `ack`, `nack` or `close`.
 - **In `Auto` mode `ack` and `nack` are no-ops that answer `Ok`** for any non-empty id, delivered
@@ -370,10 +443,12 @@ Publishing:
 - **`publishBatch` is one transaction with one confirmation.** The messages are delivered in
   order, all or none; the reference broker publishes them one by one and can stop half way. The
   broker holds the batch until the `COMMIT`.
-- **An unconfirmed publish may or may not have been published.** When no receipt arrives within
-  `requestTimeoutMs`, or the connection breaks after the frame was written, the result is
-  `connection lost` and the outcome is unknown. Publishing again on a new connection can produce a
-  duplicate; nothing deduplicates by id.
+- **An unconfirmed publish may or may not have been published, and is never sent again.** When no
+  receipt arrives within `requestTimeoutMs`, or the connection breaks after the frame was written,
+  the result is `connection lost: ...; the outcome is unknown: ...` (`isOutcomeUnknownError`). The
+  client does not repeat it on the next connection, because that could publish it twice, and does
+  not report success, because the broker may never have seen it. Publishing it again is the
+  application's decision; nothing deduplicates by id.
 - **An empty message id** (lyric-lang#9043):
   - `ack("")` and `nack("", ...)` are `Err("activemq: empty message id")`, in `Auto` mode too. The
     text is this package's own, not `Mq.EMPTY_MESSAGE_ID`.
@@ -495,25 +570,104 @@ Consuming and timeouts:
 
 Connection, heart-beats and reconnecting:
 
-- **No heart-beats are negotiated** (`heart-beat:0,0`), over TLS as over plain TCP. The client is
-  synchronous and has no thread to send them from. `TCP_NODELAY` is set.
-- **A connection that dies while idle is noticed only by the next operation, and a silent death
-  looks like an empty queue.** If a firewall or NAT drops the idle connection without a reset, a
-  `consume` keeps returning `Err("timeout")`: nothing distinguishes it from a queue with no
-  messages. A `publish` on such a connection fails after `requestTimeoutMs` with
-  `connection lost: the broker did not answer within N ms`. When the broker closes the connection
-  properly, the next operation reports `connection lost: the broker closed the connection` or the
-  platform's write error. A consumer that must detect a dead connection has to publish, or
-  reconnect, periodically.
-- **No automatic reconnect.** After a transport failure, or a request the broker did not confirm
-  within `requestTimeoutMs`, every operation returns `Err("activemq: connection lost: ...")` with
-  the first reason; open a new connection. Deliveries that were unsettled are redelivered by the
-  broker, flagged `redelivered`, to whichever consumer is next; `unsettledCount` on the lost
-  connection keeps counting them.
+- **Heart-beats are on by default, 10 s in each direction.** `CONNECT` carries
+  `heart-beat:heartBeatSendMs,heartBeatReceiveMs`, and the interval agreed for each direction is
+  the larger of what the sender guarantees and what the receiver asks for (STOMP 1.2); a 0 on
+  either side switches that direction off. ActiveMQ answers with the client's numbers swapped, so
+  the agreed intervals are the configured ones. `status(queue)` shows them. `TCP_NODELAY` is set.
+- **The client writes its heart-beat early.** A newline is written when nothing was written for
+  half of the agreed interval, looked at every quarter of it (at most every 250 ms), so the
+  longest silence is about three quarters of the interval. ActiveMQ's inactivity monitor allows
+  no grace on top of the interval, so a client that wrote exactly on time would be dropped now
+  and then. Any frame counts as a heart-beat.
+- **The broker is taken for dead after twice the agreed interval without a single byte**, 20 s by
+  default. STOMP leaves the margin to the receiver; twice is what leaves room for one late
+  heart-beat without waiting much longer than needed. The factor is fixed. The error is
+  `connection lost: the broker sent nothing for N ms, having agreed to a heart-beat every M ms`.
+  A blocked `consume` ends with it (or, with reconnecting on, waits for the new connection);
+  it is not reported as `timeout`.
+- **With `heartBeatReceiveMs = 0`, or against a broker that sends no heart-beats, a silent death
+  looks like an empty queue**: `consume` returns `Err("timeout")` for ever and a `publish` fails
+  after `requestTimeoutMs`. A close by the broker is still noticed at once.
+- **A lost connection is re-established in the background.** Whatever loses the connection
+  (a socket error, a missed heart-beat, a request that was not confirmed in time, an `ERROR` frame
+  that ends the connection, a close by the broker), the keeper thread waits `initialDelayMs`,
+  opens a new transport (with the TLS handshake of the options), sends `CONNECT` again and, when
+  the connection had a subscription or had asked for one, `SUBSCRIBE` again with the same
+  selector and prefetch size. Only then do operations see the new connection. After a failed
+  attempt the wait doubles, up to `maxDelayMs`; every wait is shortened by up to `jitterPercent`
+  of itself. After a successful reconnect the next outage starts again at `initialDelayMs`.
+  `status(queue).reconnects` counts them.
+- **Only an established connection is re-established.** `connectWith`, `connectUrl` and
+  `connectFromEnv` try once and return the error; an application that starts before its broker
+  repeats the connect itself.
+- **A `publish` issued while there is no connection fails at once**, with
+  `activemq: not connected, reconnecting (nothing was sent); connection lost: REASON`
+  (`isNotConnectedError`). It does not wait and it is not queued: a publisher that blocks for the
+  length of an outage, or a client-side queue that is lost with the process, would both hide the
+  outage from the one party that can decide what to do with the message. The error is safe to
+  retry, because nothing was written. `reconnect.publishWaitMs` makes `publish`, `publishBatch`
+  and `publishWithHeaders` wait up to that long for the connection first; `ack`, `nack` and
+  `subscribe` never wait.
+- **A request in flight when the connection drops has an unknown outcome and is not repeated.**
+  A `publish` whose `SEND` was written, a `publishBatch` whose `COMMIT` was written and an `ack` or
+  `nack` whose frame was written return `connection lost: ...; the outcome is unknown: ...`
+  (`isOutcomeUnknownError`). They are not sent again on the new connection (a second copy of a
+  message the broker already has would be a duplicate) and not reported as `Ok`. A batch or a
+  requeue that lost the connection before its `COMMIT` says instead that the transaction was not
+  committed: the broker rolls it back, nothing of it was applied.
+- **`consume` waits through an outage.** A `consume` that is waiting when the connection is lost,
+  or is called while it is away, goes on waiting for the new connection and then for a message,
+  all within its `timeoutMs`. If the time is up first it returns the loss
+  (`connection lost: ...` or `not connected, reconnecting ...`), not `timeout`, so an outage is
+  never mistaken for an empty queue. `consume(0)` returns that error at once.
+- **Deliveries of a lost connection cannot be settled; the broker redelivers them.** STOMP ack ids
+  belong to the connection. When a connection is lost with reconnecting on, the deliveries it
+  carried leave `unsettledCount`, and messages it had received but not yet handed to a handler
+  are dropped. `ack` or `nack` of such a delivery returns `activemq: stale delivery: ...`
+  (`isStaleDeliveryError`), once, whether the new connection is there yet or not; a
+  `nack(id, true)` makes no copy. ActiveMQ puts those messages back on the queue when it sees the
+  old connection end and dispatches them again, to the new subscription or to another consumer.
+  A handler therefore can see a message twice: at-least-once delivery, as after any disconnect.
+- **The redelivery replaces the dead delivery.** Once `consume` has handed out the redelivery of
+  an id, `ack(id)` settles that one and no stale error is reported for the id any more. Before
+  that, `ack(id)` is the stale error. What is remembered of unsettled deliveries of lost
+  connections is their id only, and it is forgotten after eight further reconnects.
+- **`deliveryCount` after a reconnect is one higher**, for every message the lost connection had
+  received and not settled, including those still waiting in the client that no handler had
+  seen: ActiveMQ flags them `redelivered`, and the flag counts as one delivery (and only one,
+  however many outages; see "Requeue, reject and `deliveryCount`").
+- **In `Auto` mode a handler's success can be followed by a stale error.** If the connection is
+  lost while the handler runs, the acknowledgement that follows cannot be sent; `consume` returns
+  the stale error and the message comes again.
+- **Reconnecting ends for good in three cases.** The broker answers the new `CONNECT` with an
+  `ERROR` frame (a login that is no longer valid) or with a STOMP version other than 1.2; it
+  refuses the new `SUBSCRIBE` (a permission that was withdrawn); or `maxAttempts` attempts failed
+  in a row. Every operation then returns
+  `activemq: connection lost: REASON; reconnecting was given up ...` with the last failure, and
+  the background thread ends. Everything else is tried again, for ever by default: a refused TCP
+  connection, a timeout, a TLS handshake that fails (the client cannot tell a broker that is
+  restarting from a certificate that will never verify), and a login that ended without a
+  readable answer (see the wrong-passcode entry below). Set `maxAttempts`, or watch
+  `status(queue)`, where that matters.
+- **`close` does not wait for a reconnect.** It returns at once while the keeper waits between two
+  attempts, and the keeper ends within 50 ms. An attempt that is already under way (a TCP connect
+  or TLS handshake, up to `connectTimeoutMs` each) cannot be interrupted: it runs to its end in
+  the background and its connection is closed right away, without the application waiting for it.
+- **Messages already in the client are bounded.** While no operation runs, the keeper reads what
+  the broker sends, so that heart-beats and a close are noticed; it stops reading when 64
+  messages wait for `consume`, and the broker is not judged by its silence while that is so.
+- **A dead connection without reconnecting stays dead.** With `reconnect.enabled = false`, every
+  operation after the loss returns `Err("activemq: connection lost: ...")` with the first reason;
+  open a new connection. Deliveries that were unsettled are redelivered by the broker, flagged
+  `redelivered`, to whichever consumer is next; `unsettledCount` on the lost connection keeps
+  counting them, and `ack` / `nack` return the `connection lost` error.
 - **A slow broker loses the connection.** A confirmation that takes longer than
   `requestTimeoutMs` (10 s by default) marks the connection lost even if the broker is healthy,
-  because a late receipt could otherwise be taken for the next one.
-- **`isOpen` does not probe.** It is true until `close` or until an operation has failed.
+  because a late receipt could otherwise be taken for the next one. The request's outcome is
+  unknown, and a new connection is opened as after any other loss.
+- **`isOpen` does not probe.** It is false after `close`, and from the moment a loss is noticed
+  until the new connection is in place.
 - **Connecting can take `connectTimeoutMs` twice plus `requestTimeoutMs`**: the TCP connect, the
   TLS handshake and the wait for `CONNECTED` each have their own limit.
 - **A write is given up when the broker takes no data for `requestTimeoutMs`.** A broker that
@@ -533,7 +687,8 @@ Connection, heart-beats and reconnecting:
   gives the second form too.
 - **`close` is idempotent and waits.** It sends `DISCONNECT` and waits up to 2 s (or
   `requestTimeoutMs` if shorter) for the receipt. Deliveries not yet settled go back to the queue
-  in their original order, flagged `redelivered`. `close` on a lost connection does nothing.
+  in their original order, flagged `redelivered`. `close` on a lost connection sends nothing; it
+  stops the reconnecting.
 - **A connection is one destination.** Publishing to one queue and consuming from another takes
   two connections.
 - **A queue is shared by everyone who names it.** With the reference broker each `Mq.connect` is
@@ -546,10 +701,20 @@ Threads:
   There is one socket and no pipelining, so a `publish` waiting for its receipt (up to
   `requestTimeoutMs`) blocks every other operation on the connection, `close` included. A
   `consume` does not wait for the lock beyond its own timeout.
-- **On `dotnet` a connection that has been read from owns a thread** until `close` (or until the
-  broker closes it). The client does not use the runtime's shared thread pool, so it keeps its
-  timing when the application's pool threads are all busy; the price is that a connection dropped
-  without `close` keeps its reader thread and socket. Always `close`.
+- **Every connection has a background thread, the keeper**, on both targets, unless heart-beats
+  were not agreed in either direction and reconnecting is off. It is a daemon thread (it does not
+  keep the process alive), sleeps between ticks of at most 250 ms, and ends within one tick of
+  `close`, when reconnecting is given up, or, with reconnecting off, when the connection is lost.
+  `hasBackgroundThread(queue)` tells. A connection that is dropped without `close` keeps its
+  keeper, which keeps the connection alive with heart-beats and reconnects it: always `close`.
+- **On `dotnet` a connection also owns a reader thread** until `close` (or until it is lost; a
+  new connection gets a new one). Neither thread comes from the runtime's shared thread pool, so
+  the client keeps its timing, heart-beats included, when the application's pool threads are all
+  busy.
+- **The keeper takes the connection's lock for a moment every tick** to read what has arrived.
+  `consume` waits that moment out rather than report `timeout` because of it, so `consume(0)`
+  can take a few milliseconds longer than its poll (longer on a machine that is short of CPU).
+  The keeper's first round comes one tick after the connect.
 - **A waiting `consume` gives the lock up every 100 ms**, so a publisher on another thread is held
   for at most that long. On `jvm` the lock is fair, so the publisher gets it at that point; on
   `dotnet` it is a monitor, which makes no such promise.
@@ -610,6 +775,7 @@ Differences between `dotnet` and `jvm`, collected:
 | TLS handshake limit | whole handshake | each read |
 | Skip-verify | chain policy with `X509VerificationFlags.AllFlags` | a trust manager that accepts everything, and no endpoint identification |
 | Reads | a reader thread per connection doing blocking reads, handing each chunk over; no shared thread pool | `SO_TIMEOUT` on the socket |
+| Threads per connection | the keeper and, once read from, the reader | the keeper |
 | Write limit | `SendTimeout` on the socket | the write runs on a virtual thread; the socket is closed when no 64 KiB chunk gets through in time |
 | A refused login whose `ERROR` frame was cut off, over TLS | a failed read ("The decryption operation failed") | a failed read or a bare close |
 | Platform part of error texts | .NET exception messages | JDK exception messages |
@@ -626,7 +792,7 @@ Differences from the reference in-process broker (`Mq.connect`), collected:
 | Published `deliveryCount` | reset to 0 | kept; a negative one is an `Err` |
 | Acknowledgement mode | none: `ack`/`nack` always act | `Manual` or `Auto` |
 | Empty id on `ack`/`nack` | `Err(Mq.EMPTY_MESSAGE_ID)` | `Err("activemq: empty message id")` |
-| Failure modes | none | connection loss, request timeouts, broker errors |
+| Failure modes | none | connection loss (followed by a reconnect), request timeouts, broker errors, unknown outcomes, stale deliveries |
 
 Things the tests assert that look odd, and why:
 
@@ -637,6 +803,12 @@ Things the tests assert that look odd, and why:
 - `"an ERROR frame alone does not close the connection"` holds against the fake broker and against
   ActiveMQ for a refused `SEND` or `SUBSCRIBE`, because the frame carries the request's
   `receipt-id`; a refused `CONNECT` does close it.
+- The tests of a connection that stays lost switch reconnecting off (`lasting(...)` in
+  `tests/client_tests.l`); with it on, the same connection would come back.
+- `"a batch interrupted by a lost connection ..."` accepts either wording, "not committed" or
+  "the outcome is unknown": which frame of the batch meets the closed socket depends on timing.
+- The heart-beat tests wait for events with limits of 10 to 60 s and use one fixed pause: three
+  seconds during which a connection with a 1 s heart-beat must stay alive.
 - The integration suite accepts two errors for a wrong passcode (`expectLoginRefused`), for the
   reason under "Connection" above, and checks over 300 logins that it is one of the two and
   mostly the broker's.
@@ -753,7 +925,8 @@ The other packages:
 | `src/url.l` | `Mq.ActiveMq.Url` | broker URL parsing (`parseUrl`, `percentDecode`) |
 
 This package has no extern declarations. The TCP connection, the TLS handshake, the lock and the
-clock are `Net.Tcp`'s; `TlsOptions`, `plainTcp()`, their validation, `skipsVerification(tls)`,
+clock are `Net.Tcp`'s; the keeper thread is started with `Net.Threads.start` (a
+dedicated thread on both targets); `TlsOptions`, `plainTcp()`, their validation, `skipsVerification(tls)`,
 `insecureAllowedByEnvironment()` and the reader of the `...TLS*` variables are `Net.Tls`'s; the
 authority part of the broker URL is parsed by `Net.Url`. All three are in the `Lyric.Net` package
 of this repository (`net/`), shared with `mq-rabbitmq` and `redis`; its README describes how each
@@ -775,11 +948,23 @@ lyric test --manifest mq-activemq/lyric.toml --target jvm
 ```
 
 This runs the frame codec, URL, re-export and `Extras` unit tests, and
+`tests/readme_tests.l` (the examples of this file) and
 `tests/client_tests.l`: the `Testing.Conformance.Mq` queue suite and the error paths (refused
 connection, bad credentials, `ERROR` frame with and without a `receipt-id`, connection dropped
 during publish, during consume and during login, unconfirmed request, refused settlements,
 undeliverable and oversize messages under both policies, a broker that stops reading, the bounds
-of `consume`, and a busy thread pool) against an in-process STOMP broker on a loopback socket. The
+of `consume`, and a busy thread pool) against an in-process STOMP broker on a loopback socket. For
+heart-beats and reconnecting each test starts a broker of its own that it can steer: the
+`heart-beat` header it answers with, whether it sends heart-beats, whether it refuses logins or
+subscriptions, and a switch that closes every connection without a word. Those tests cover the
+negotiation in both directions, heart-beats arriving from an idle client, a broker that falls
+silent (noticed by an idle connection and by a blocked `consume`), a dropped connection that
+comes back, subscribes again and receives the redelivery and later messages, a publisher that
+reconnects without subscribing, what `publish`, `publishBatch`, `ack`, `nack` and `consume` return
+while the connection is away, the unknown outcome of a publish in flight (and that the message
+is on the broker exactly once), stale deliveries during and after the outage, `publishWaitMs`,
+giving up after `maxAttempts`, a refused login and a refused subscription on reconnect, `close`
+during a 60 s reconnect wait, and the variables of `connectFromEnv`. The
 socket-level tests (timed reads, write timeout, bytes arriving in pieces across read timeouts,
 independence from the thread pool) are in `net/tests/tcp_tests.l`. The same broker is
 also started behind TLS and behind TLS with a required client certificate: the conformance suite
@@ -813,12 +998,18 @@ lyric test --manifest mq-activemq/lyric.toml --target jvm --features integration
 ```
 
 Over the plain connector it runs the conformance suite and tests of redelivery, the dead-letter
-queue, batches, `Auto` mode, large bodies, foreign and binary messages under both
+queue, batches, `Auto` mode, heart-beats (the agreed intervals; that ActiveMQ drops a raw
+connection that promised heart-beats and sends none; that a connection with 500 ms heart-beats
+idles for seconds without being dropped by either side), a connection cut under the client (the
+test closes the client's socket without a `DISCONNECT`: the client reconnects, subscribes again,
+reports the old delivery as stale, receives the redelivery with `deliveryCount` 1 and goes on
+publishing and consuming, also while a `consume` is waiting), large bodies, foreign and binary messages under both
 `onUndeliverable` policies, bodies and header sections over the limits, repeated wrong-passcode
 logins and broken selectors, selectors, delivery options and their inheritance, expiry, topics
 and competing consumers. Over TLS it runs the conformance suite again and
 tests of a verified connection with the custom CA, refusal without it, refusal of a name the
-certificate lacks, skip-verify with one key and with both, mutual TLS with a client certificate
+certificate lacks, the cut connection again (the reconnect repeats the TLS handshake),
+skip-verify with one key and with both, mutual TLS with a client certificate
 and without, and consume timeouts, receipts, transactions, large bodies, redelivery and `ERROR`
 frames.
 
@@ -858,24 +1049,17 @@ There is no third-party library (`[nuget]` and `[maven]` are empty). What the su
 
 ## Known gaps
 
-- No heart-beats and no automatic reconnect, on either transport (see "Surprises").
-- TLS: one CA certificate per option, not a bundle; no PKCS12 or encrypted keys; no revocation
-  checks; no client certificate chain (intermediates between the client certificate and the
-  broker's CA are not sent).
-- On dotnet, skip-verify relies on `SslStream` honouring `X509VerificationFlags.IgnoreInvalidName`
-  from the chain policy for the name check. That is what .NET 10 does (the tests cover it); a
-  runtime that does not would refuse the connection rather than accept it.
-- The gaps of `Lyric.Net` apply: see its README for the socket and TLS boundary.
-- `DeadLetterStore` is not implemented (see "Surprises").
-- No binary message bodies, in either direction, and no access to the delivery options of a
-  received message.
-- The default for undeliverable messages keeps them on the broker, where one can hold up a
-  consumer with a small prefetch window (see "Surprises"); the client has no option that moves
-  such a message aside without `NACK`.
-- Frames inside a transaction (`publishBatch`, requeue) are sent without receipts, so a broker
-  `ERROR` for one of them cannot be attributed and loses the connection instead of failing the
-  call with `broker error`. The transaction is not committed in that case.
-- On `dotnet` every connection that is read from holds one thread until it is closed.
+- Reconnecting: the first connect is not retried; a failing TLS handshake is retried like a
+  network failure, because the two cannot be told apart, so with the default `maxAttempts = 0` a
+  broker whose certificate no longer verifies is tried for ever (at most every `maxDelayMs`); an
+  attempt under way cannot be interrupted by `close` (it is abandoned, not awaited); the factor
+  of two for a missing heart-beat is not configurable; nothing is buffered or replayed, by
+  design (see "Surprises").
+- `Lyric.Net` has no way to interrupt a blocked connect, handshake, read or `sleepMs`, and
+  `Net.Threads` has no cancellation, which is why `close` abandons a reconnect attempt under way
+  and why the keeper sleeps in pieces of at most 250 ms instead of waiting on a signal.
+- Every connection holds its keeper thread until it is closed, and on `dotnet` a reader thread as
+  well once it has been read from.
 - Not reproduced here: the two failures seen on a hosted CI runner (`dotnet`, TLS) that led to the
   reader-thread design, a `consume(1000)` that missed a delivered message and a wrong-passcode
   login reported as "The decryption operation failed". The first matches what a starved thread

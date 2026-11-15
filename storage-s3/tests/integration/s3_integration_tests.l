@@ -120,6 +120,14 @@ func emptied(client: in S3Client): StorageBucket {
   bucketOf(client)
 }
 
+// `S3Client.presign` as text: the URL, or the error code.
+func presigned(client: in S3Client, methodName: in String, key: in String, seconds: in Int, amzDate: in String): String {
+  match client.presign(methodName, key, seconds, amzDate) {
+    case Ok(url) -> url
+    case Err(e) -> e.code + " " + e.message
+  }
+}
+
 test "S3Bucket conforms to StorageBucket against a real S3 server" {
   val client = readyClient()
   val checks = StorageConformance.run({ -> emptied(client) })
@@ -247,7 +255,7 @@ test "presigned GET and PUT URLs against a real S3 server" {
     "a tampered URL is refused"
   )
   assertTrue(
-    fetchText(client.presign("GET", key, 60, "20200101T000000Z")).startsWith("403 "),
+    fetchText(presigned(client, "GET", key, 60, "20200101T000000Z")).startsWith("403 "),
     "an expired URL is refused"
   )
   val putUrl = match presignedPutUrl(client, "inbox/upload.txt", 300) {

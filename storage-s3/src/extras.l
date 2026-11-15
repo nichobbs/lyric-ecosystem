@@ -104,7 +104,7 @@ pub func presignedPutUrl(client: in S3Client, key: in String, expiresInSeconds: 
   if expiresInSeconds < 1 or expiresInSeconds > 604800 {
     return Err(StorageError(message = "expiresInSeconds must be in [1, 604800]", code = "INVALID_ARGUMENT"))
   }
-  Ok(client.presign("PUT", key, expiresInSeconds, amzDateNow()))
+  client.presign("PUT", key, expiresInSeconds, amzDateNow())
 }
 
 /// Create the client's bucket in the client's region. `Ok(true)` when it was
@@ -122,7 +122,9 @@ pub func createBucket(client: in S3Client): Result[Bool, StorageError] {
     "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint>" + client.region +
       "</LocationConstraint></CreateBucketConfiguration>"
   }
-  val sent = client.send(
+  // Not repeated after an unknown outcome: a second CreateBucket would report
+  // "already owned" for the bucket the first one created.
+  val sent = client.sendUnrepeatable(
     PUT,
     "PUT",
     client.bucketPath(),

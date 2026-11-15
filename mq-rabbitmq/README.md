@@ -42,6 +42,8 @@ names are visible unqualified (`Message`, `MessageQueue`, `publish`). To write t
 are compiled by `tests/reexport_tests.l`.
 
 One `RabbitMqQueue` is one connection, one channel and one queue; it implements both interfaces.
+By default the connection sends heartbeats and is re-established when it is lost (see "Heartbeats"
+and "Recovery"); it owns a background thread for that until `close()`.
 
 ## Configuration
 
@@ -67,6 +69,7 @@ Three ways to connect; none of them reads a credential from source.
   | `LYRIC_CONFIG_MQ_RABBITMQ_QUEUENAME` | queue name (required) |
   | `LYRIC_CONFIG_MQ_RABBITMQ_ACKMODE` | `Manual` (default) or `Auto` |
   | `LYRIC_CONFIG_MQ_RABBITMQ_PREFETCHCOUNT` | prefetch window (default 10) |
+  | `LYRIC_CONFIG_MQ_RABBITMQ_RECOVERY` | `true` (default) or `false`: re-establish a lost connection, with the default delays |
   | `LYRIC_CONFIG_MQ_RABBITMQ_TLSCAFILE` | PEM file: a CA certificate trusted in addition to the platform trust store |
   | `LYRIC_CONFIG_MQ_RABBITMQ_TLSCAEXCLUSIVE` | `true`: trust only that CA (default `false`) |
   | `LYRIC_CONFIG_MQ_RABBITMQ_TLSCERTFILE` | PEM file: client certificate (mutual TLS) |
@@ -74,7 +77,8 @@ Three ways to connect; none of them reads a credential from source.
   | `LYRIC_CONFIG_MQ_RABBITMQ_TLSSERVERNAME` | name to check the certificate against, when it is not the URL's host |
   | `LYRIC_CONFIG_MQ_RABBITMQ_TLSMINVERSION` | `1.2` (default) or `1.3` |
 
-  The `TLS...` variables apply to an `amqps://` URL; with an `amqp://` URL they are an error.
+  The heartbeat comes from the URL (`?heartbeat=N`). The `TLS...` variables apply to an `amqps://`
+  URL; with an `amqp://` URL they are an error.
   `LYRIC_TLS_ALLOW_INSECURE` is the standard library's second key for skipping verification, see
   "TLS".
 
@@ -93,13 +97,23 @@ Three ways to connect; none of them reads a credential from source.
 | `ackMode` | `Manual` | `Auto` acknowledges when the handler returns `Ok` and requeues when it returns `Err` |
 | `persistent` | `true` | delivery mode 2 for published messages |
 | `prefetchCount` | 10 | `basic.qos`: the most deliveries left unsettled on this connection; 0 = no limit |
-| `heartbeatSeconds` | 0 (off) | heartbeat interval to ask for, see "Heartbeats" |
+| `heartbeatSeconds` | 60 | heartbeat interval to ask for, 0 to 65535; 0 = off. See "Heartbeats" |
 | `frameMax` | 131072 | largest frame, at least 4096; the smaller of this and the broker's limit is used |
 | `connectTimeoutMs` | 10000 | TCP connect limit, and again the TLS handshake limit; 0 = the system's |
 | `requestTimeoutMs` | 10000 | how long to wait for a reply or a publisher confirm, and how long a write may make no progress because the broker is not reading |
 | `maxMessageBytes` | 16 MiB | largest message body accepted from the broker |
 | `connectionName` | empty | shown in the broker's management UI |
 | `tls` | `plainTcp()` | TLS settings (`TlsOptions` of `Net.Tls`, re-exported by `Mq.RabbitMq`), see below |
+| `recovery` | `defaultRecovery()` | whether and how a lost connection is re-established, see "Recovery" |
+
+`RecoveryOptions` fields (`withRecovery(r)` sets them, `withoutRecovery()` turns recovery off):
+
+| Field | Default | Meaning |
+|---|---|---|
+| `enabled` | `true` | `false`: after a loss every operation returns `Err` until the application connects again |
+| `initialDelayMs` | 1000 | wait before the first attempt, at least 1; doubled after every failed attempt |
+| `maxDelayMs` | 30000 | cap of that wait, not below `initialDelayMs` |
+| `maxAttempts` | 0 | failed attempts in a row after which the connection is given up for good; 0 = no limit |
 
 ## TLS
 
@@ -203,7 +217,15 @@ Error mapping: every failure is an `Err(String)` starting with `rabbitmq: `; not
 | no confirm, or no reply, within `requestTimeoutMs` | `did not confirm the publish within N ms`, `did not answer METHOD within N ms` | lost |
 | broker closed the connection (`320 CONNECTION_FORCED`, ...) or the socket | `connection lost: ...` | lost |
 | the broker accepts no data for `requestTimeoutMs` during a write | `connection lost: the write timed out: ...` | lost |
+| nothing from the broker for two heartbeat intervals | `connection lost: no frame from the broker for N s (heartbeat M s)` | lost |
+| any operation while the connection is being re-established | `connection lost: REASON; the client is reconnecting; the operation was not attempted` (`isNotAttempted`) | lost, coming back |
+| a publish written, or partly written, when the connection was lost | `connection lost: REASON; ...; the outcome of the publish is unknown: ...` (`isOutcomeUnknown`) | lost, coming back |
+| `ack` / `nack` of a delivery from a lost connection or closed channel | `no unsettled delivery has message id 'ID': it was delivered before the connection or channel was lost ...` | usable |
+| recovery given up (`maxAttempts`, or a refusal) | `connection lost: REASON; reconnecting was given up ...`, `...; not reconnecting, the broker's refusal is permanent` | lost for good |
 | no message within the consume timeout | exactly `timeout` | usable |
+
+"Lost" means: with recovery on (the default) the connection is being re-established and becomes
+usable again; with recovery off every later operation returns `connection lost: REASON`.
 
 `lastReplyCode(queue)` returns the AMQP reply code of the most recent channel or connection error
 or returned message, for code that needs to tell 404 from 406 without reading text.
@@ -211,31 +233,96 @@ or returned message, for code that needs to tell 404 from 406 without reading te
 
 ## Heartbeats
 
-Heartbeats are off by default (`heartbeatSeconds = 0`, sent as 0 in `connection.tune-ok`, which
-RabbitMQ accepts whatever it proposed). The reason is that the client is synchronous: it has no
-thread of its own, so it can only write to the socket while the application is inside one of its
-functions. A heartbeat that is negotiated but not sent makes the broker close a healthy idle
-connection, which is worse than no heartbeat.
+The client asks for an interval of `heartbeatSeconds` (60 by default, or `?heartbeat=N` in the
+URL) in `connection.tune-ok`:
 
-With `heartbeatSeconds = N` (or `?heartbeat=N` in the URL) the interval is the smaller of N and
-the broker's proposal, and precisely this happens:
+| Client asks | Broker proposes | Interval |
+|---|---|---|
+| 0 | anything | none: heartbeats are off, the broker sends none and expects none |
+| N | 0 | N |
+| N | M | the smaller of N and M |
 
-- While the application is inside an operation that waits (a `consume` with a timeout, a publish
-  waiting for its confirm, any request waiting for its reply), the client sends a heartbeat frame
-  every N/2 seconds and gives the connection up
-  (`connection lost: no frame from the broker for ...`) when nothing has arrived for 2N seconds.
-  A consumer loop that calls `consume(timeoutMs, ...)` back to back is therefore fully covered.
-- Between operations nothing is sent. An application that does nothing with the connection for
-  longer than about 2N seconds is disconnected by the broker; the next operation returns
-  `connection lost: the broker closed the connection; this client had sent nothing for ...`.
-- `keepAlive(queue)` sends one heartbeat frame and handles whatever the broker has sent. An
-  application that negotiated a heartbeat and has idle periods calls it from its own timer at
-  least every N/2 seconds. It takes the connection's lock like any operation.
+(This is the rule of the AMQP specification, where the client's `tune-ok` decides. Some clients
+treat their own 0 as "no preference" and take the broker's value; here 0 always means off.)
 
-Without a heartbeat an idle connection stays open as long as the network path keeps it (mind
-load balancers and NAT with idle timeouts), and a broker that vanished without closing the socket
-is noticed by the next operation: at once if the operating system already knows, otherwise when
-`requestTimeoutMs` runs out. `keepAlive` works as a liveness probe here too.
+With an interval of N seconds:
+
+- The client sends a heartbeat frame (frame type 8, channel 0) whenever it has written nothing
+  for N/2 seconds. Any frame it writes counts, so a busy connection sends none.
+- It gives the connection up with `connection lost: no frame from the broker for ...` when nothing
+  at all has arrived for 2N seconds. Any frame from the broker counts, not only heartbeats.
+- An operation that waits (a `consume` with a timeout, a publish waiting for its confirm) does
+  both itself. Between operations the connection's background thread does, under the connection's
+  lock: it wakes a few times per second (every N/8 seconds, between 50 and 250 ms), reads what the
+  broker has sent and sends a heartbeat when one is due. An idle application needs to do nothing.
+- Deliveries the background thread reads are kept for the next `consume`; it stops reading ahead
+  when 1024 wait, so a consumer with `prefetchCount = 0` that stops consuming is held back by TCP
+  as before. A channel error it comes across (the broker's answer to an invalid `ack`, say) is
+  returned by the application's next operation.
+
+With `heartbeatSeconds = 0` nothing is sent. An idle connection then stays open as long as the
+network path keeps it (mind load balancers and NAT with idle timeouts), and a broker that vanished
+without closing the socket is only noticed by an operation, when `requestTimeoutMs` runs out.
+`keepAlive(queue)` sends one heartbeat frame and reads what has arrived: a liveness probe for that
+case. `heartbeatSeconds(queue)` is the negotiated interval.
+
+The background thread exists when a heartbeat was negotiated or recovery is on, which is the
+default. With `heartbeatSeconds = 0` and `withoutRecovery()` the connection has no thread of its
+own and only touches the socket inside the application's calls.
+
+## Recovery
+
+A connection is lost when its socket fails, when the broker is silent for two heartbeat intervals,
+when a reply or a confirm does not come within `requestTimeoutMs`, or when the broker closes it
+(`320 CONNECTION_FORCED` at a shutdown or from `rabbitmqctl close_connection`, for instance). With
+`recovery.enabled` (the default) the background thread then re-establishes it:
+
+1. It waits. The wait before attempt k is `initialDelayMs * 2^(k-1)`, capped at `maxDelayMs`, and
+   then a random point in the upper half of that (attempt 1 with the defaults: 0.5 to 1 s; from
+   attempt 6 on: 15 to 30 s), so that clients which lost a broker together do not return together.
+2. It connects, authenticates and opens the channel in publisher-confirm mode, exactly as
+   `connectWith` does, with the same options (the same host: there is no list of hosts).
+3. It restores what this client had set up, in the order it was made:
+   - the connection's queue, declared (or, with `declare = false`, checked) from the options;
+   - every exchange and queue declared and every binding made through `Mq.RabbitMq.Extras`
+     (`declareExchange`, `declareQueue`, `bindQueue`, `bindQueueWith`, or `request`), unless it was
+     deleted again through `deleteExchange` / `deleteQueue`. Durable entities are declared again
+     too; that is a no-op on a broker that still has them;
+   - the prefetch window (`basic.qos`) and the consumer (`basic.consume`), when one had been
+     started by `consume` or `subscribe` and not cancelled by the broker.
+4. The connection is usable again. `recoveryCount(queue)` counts these.
+
+What is not restored, because the client did not create it or cannot: messages, the contents of
+non-durable queues, entities made by other connections, anything published.
+
+An attempt that fails is followed by the next wait, except when trying again cannot help:
+
+| Failure of an attempt | Recovery |
+|---|---|
+| no listener, timeout, TLS handshake failure, the socket closed during the handshake, `320`, `541`, any other reply code | next attempt after the wait |
+| `403 ACCESS_REFUSED`, `530 NOT_ALLOWED` (credentials, virtual host), `402` | given up |
+| `404`, `405`, `406 PRECONDITION_FAILED` while restoring (the queue of a `declare = false` connection is gone, an entity now exists with other properties) | given up |
+| the peer does not speak AMQP 0-9-1 or does not offer PLAIN | given up |
+| `maxAttempts` attempts in a row failed (when it is not 0) | given up |
+
+The same reply codes decide at the loss itself: a broker that closes an established connection with
+`403`, `530` or another code of the second and third row is not reconnected to. Once recovery is
+given up the connection is lost for good: every operation returns
+`connection lost: REASON; reconnecting was given up ...` and the background thread ends.
+
+Finding out where a connection stands, without reading error text:
+
+| Function | |
+|---|---|
+| `connectionState(queue)` | `Connected`, `Reconnecting(failedAttempts)`, `Lost(reason)` (for good) or `Closed` |
+| `isOpen(queue)` | true while connected |
+| `awaitConnected(queue, timeoutMs)` | wait for a connection that is being re-established; `Err` when the time runs out, or when it is closed or lost for good |
+| `recoveryCount(queue)` | how often the connection has been re-established |
+| `isReconnecting(e)`, `isNotAttempted(e)`, `isOutcomeUnknown(e)` | classify the `Err` text of an operation (below) |
+| `backgroundRunning(queue)` | whether the background thread is alive |
+| `abortTransport(queue)` | close the socket under the client, as a network failure would; for testing an application across a reconnect |
+
+What the operations do across a loss is in "Surprises", under "Across a lost connection".
 
 ## Surprises
 
@@ -269,11 +356,12 @@ Behaviour a user would not expect from the `Mq` interfaces alone:
   (The `Mq` documentation mentions RabbitMQ confirms as all-or-nothing; they are not.)
 - **`publish` returning `Err` does not always mean "not enqueued".** After
   `did not confirm the publish within N ms` the message may or may not be in the queue, and the
-  connection is closed because its confirm stream can no longer be trusted. Consumers should be
-  idempotent.
+  connection is given up (and re-established) because its confirm stream can no longer be
+  trusted. The error says so (`isOutcomeUnknown`), as it does for every publish the connection
+  was lost under. Consumers should be idempotent.
 - **A broker under a memory or disk alarm blocks publishers.** `publish` then waits up to
   `requestTimeoutMs` and fails with `... it has blocked publishers (REASON)`, losing the
-  connection. `blockedReason(queue)` shows the state.
+  connection, which is then re-established. `blockedReason(queue)` shows the state.
 - **`ack` and `nack` return `Ok` once written.** AMQP has no reply to them. A failure shows up as
   an `Err` from a later operation.
 - **`Auto` mode requeues at once when the handler fails**, so a message whose handler always
@@ -281,8 +369,9 @@ Behaviour a user would not expect from the `Mq` interfaces alone:
   and a dead-letter exchange, or a quorum queue with a delivery limit.
 - **A channel error closes the channel, and the client opens a new one.** The failed operation
   returns the broker's reason; the connection stays usable. Deliveries that were unsettled on the
-  old channel can no longer be settled (`no unsettled delivery has message id ...`); the broker
-  requeues them and they arrive again, flagged `redelivered`.
+  old channel can no longer be settled (`no unsettled delivery has message id ...: it was delivered
+  before the connection or channel was lost ...`); the broker requeues them and they arrive again,
+  flagged `redelivered`. The consumer is not restarted here; the next `consume` starts it.
 - **Connecting declares the queue**, durable by default. If a queue of that name exists with
   other properties or arguments, connecting fails with `406 PRECONDITION_FAILED`; pass the same
   ones or `declare = false`. Queue arguments cannot be changed after creation.
@@ -292,8 +381,69 @@ Behaviour a user would not expect from the `Mq` interfaces alone:
   `amqp://host/` is the virtual host with the empty name, which a stock broker does not have
   (`530 NOT_ALLOWED`). Write `/%2f` or leave the path out. A `/` inside a name is `%2F`.
 - **The `guest` user only works from the loopback address** on a stock broker.
-- **No automatic reconnect.** After `connection lost`, every operation returns `Err`; open a new
-  connection.
+- **Across a lost connection** (with recovery on, the default; see "Recovery"):
+  - **Operations issued while disconnected fail at once**; they do not wait and nothing is queued
+    in the client. `publish`, `publishBatch`, `ack`, `nack`, `subscribe`, `keepAlive` and the
+    `Extras` requests return `connection lost: REASON; the client is reconnecting; the operation
+    was not attempted`. `isNotAttempted(e)` is true for it: nothing reached the broker and
+    repeating the operation later is safe. Why not wait: how long a broker stays away is unknown
+    (the default recovery never gives up), a publish that blocks for that long hides the outage
+    from the one caller who can decide what to do with the message, and a client-side queue of
+    publishes would be lost with the process while `publish` had already said `Ok`. A caller that
+    prefers to wait calls `awaitConnected(queue, timeoutMs)` and publishes again.
+  - **`consume` is the exception: it waits.** A `consume(timeoutMs, ...)` that is waiting when
+    the connection drops, or that is called while it is down, keeps waiting within its timeout and
+    returns a message once the connection is back and one arrives. When the time runs out first
+    it returns the `connection lost: ...; the client is reconnecting; ...` error, not `timeout`.
+    `consume(0, ...)` returns that error at once. So a loop around `consume` neither spins nor
+    needs to know about reconnects.
+  - **A publish that was on the wire when the connection dropped has an unknown outcome.** The
+    broker may have enqueued it and the confirm was lost, or it never arrived. The publish returns
+    `connection lost: REASON; ...; the outcome of the publish is unknown: the broker may or may not
+    have enqueued the message, and it was not sent again` (`isOutcomeUnknown(e)`). The client
+    never repeats it on the new connection, since that could enqueue it twice, and never reports
+    it as `Ok`. Publishing again is the caller's decision; a consumer that deduplicates by
+    `Message.id` makes it safe. For `publishBatch` this covers every message of the batch that had
+    no confirm yet: none, some or all of them may be in the queue.
+  - **Unsettled deliveries come back.** The broker requeues every delivery that was not
+    acknowledged when the connection went, including those in the prefetch window that no handler
+    had seen, and delivers them again on the new connection (or to another consumer of the queue)
+    flagged `redelivered`: `deliveryCount` is 1 on a classic queue, however often this happens,
+    and the broker's `x-delivery-count` on a quorum queue (1 after one loss on RabbitMQ 3.12.1;
+    whether a loss counts towards a delivery limit depends on the broker version). A handler can
+    therefore see a message twice although it never called `nack`: handlers must be idempotent.
+  - **An `ack` or `nack` for a delivery from before the reconnect is an `Err`** (`no unsettled
+    delivery has message id 'ID': it was delivered before the connection or channel was lost and
+    cannot be settled any more; ...`) and writes nothing. Delivery tags are numbered per channel
+    and start again at 1 on the new one, so the old tag would name a different message there.
+    The client keeps tags per channel incarnation: settling by id only ever uses a tag of the
+    present channel, and a delivery that was read from the old connection but had not reached a
+    handler is dropped instead of being handed out. If the message has been delivered again in
+    the meantime and is unsettled, `ack(id)` settles that new delivery, which is the same message.
+    In `Auto` mode a handler that returned `Ok` while the connection dropped under it makes
+    `consume` return an `Err` (this one, or the `connection lost` one while the client is still
+    reconnecting); the message is delivered again.
+  - **Recovery does not go on for ever against a refusal.** Wrong credentials, a missing virtual
+    host, a queue or exchange that now exists with other properties (`406`), or the queue of a
+    `declare = false` connection that is gone (`404`) end it after one attempt; see the table in
+    "Recovery". Against an unreachable broker it goes on with waits of up to `maxDelayMs` unless
+    `maxAttempts` is set. A TLS failure (an expired certificate, say) cannot be told from a
+    transient one and is retried like an unreachable broker.
+  - **Recovery declares again, it does not compare.** If the queue was deleted while the client
+    was away, recovery creates it again, empty. An auto-delete queue whose only consumer was this
+    connection is deleted by the broker at the loss, with its messages and bindings, and declared
+    and bound again by recovery.
+  - **`close()` during recovery returns at once.** It does not wait for the wait between attempts
+    or for an attempt in progress; an attempt's socket is closed under it. The background thread
+    ends within a moment (`backgroundRunning(queue)`); only an attempt that is still inside the TCP
+    connect or the TLS handshake runs into `connectTimeoutMs` first, and its connection is then
+    closed unused.
+  - **The first connection is not retried.** `connectWith` returns `Err` when the broker cannot be
+    reached; recovery starts once a connection has been handed out.
+  - **`lastReplyCode`, `serverInfo`, `heartbeatSeconds` and `negotiatedFrameMax` describe the
+    present connection** and can change with a recovery.
+- **With `withoutRecovery()`** a lost connection stays lost: every operation returns
+  `connection lost: REASON`; open a new connection.
 - **An empty message id on `publish` / `publishBatch` violates the interface's precondition.**
   `publish` panics with a contract violation on both targets. `publishBatch` panics on jvm and
   returns `Err("rabbitmq: empty message id")` on dotnet, because the inherited `requires:` clause
@@ -308,8 +458,12 @@ Behaviour a user would not expect from the `Mq` interfaces alone:
 - **Threads.** A `RabbitMqQueue` can be shared between threads. Operations are serialized by a
   lock; a waiting `consume` releases it every 100 ms, and the lock is fair on the JVM so that a
   publisher waiting for it gets it then. The handler runs outside the lock and may call
-  `ack`/`nack`. On `dotnet` a connection owns one thread until it is closed and the client does
-  not use the runtime's shared thread pool (see the `Lyric.Net` README); always `close`.
+  `ack`/`nack`. Every connection with a heartbeat or with recovery (the default has both) owns a
+  background thread until `close()`, or until it is lost for good; it works under the same lock
+  and only when no operation holds it. On `dotnet` the socket adds a reader thread of its own
+  (see the `Lyric.Net` README), and the client does not use the runtime's shared thread pool. The
+  threads do not keep a process alive, but a connection that is dropped without `close()` keeps
+  them, and keeps reconnecting: always `close`.
 - **A write to a broker that has stopped reading fails after `requestTimeoutMs`** and loses the
   connection: how much of the frame was sent is unknown.
 - **`DeadLetterStore` is not implemented.** The interface is an append/list/count store with a
@@ -332,6 +486,8 @@ relies on and what was seen.
 | `durable = false` on a shared queue | accepted | accepted, deprecated (`transient_nonexcl_queues`) and may be refused by a later version | keeps `durable = true` as the default |
 | largest message | 128 MiB by default | 16 MiB by default (`max_message_size`) | a larger publish is a `406 PRECONDITION_FAILED` channel error from the broker |
 | dead-letter `x-death` header | array of tables | the same in the integration suite | delivered as JSON text |
+| heartbeat proposed in `connection.tune` | 60 s | 60 s | asks for 60 s by default, so the interval is 60 s |
+| quorum queue `x-delivery-count` after the consumer's connection was lost | 1 | not asserted: 4.x separates deliveries from acquisitions, and a loss need not count towards the delivery limit | `deliveryCount` is at least 1 (the `redelivered` flag); the integration suite asserts `>= 1` |
 
 The 4.0.5 column comes from the CI run (dotnet integration suite) and the RabbitMQ documentation;
 no 4.x broker was available on the development machine. The hermetic suite has a broker that
@@ -411,12 +567,21 @@ With `--features integration` every test fails with a message naming the variabl
 that variable is unset. The integration suite runs `Testing.Conformance.Mq.runQueue` on a classic
 queue, on a quorum queue and over TLS, and the backend tests: reply codes (403, 404, 406, 530,
 312), channel recovery, requeue order, prefetch, dead-lettering, delivery limits, TTL, priorities,
-exchanges, frame splitting, heartbeats (kept alive, and disconnected when idle), threads, and the
-TLS cases (verified, untrusted, wrong name, TLS 1.3, mutual TLS accepted and refused).
+exchanges, frame splitting, heartbeats (inside a blocked consume, and on an idle connection), recovery
+after the client's socket is failed with `abortTransport` (redelivery on a classic and on a quorum
+queue, the refused stale `ack`, a blocked consume that continues, an auto-delete queue with its
+binding and consumer restored, a `404` that ends recovery, `close` during the wait), threads, and
+the TLS cases (verified, untrusted, wrong name, TLS 1.3, mutual TLS accepted and refused).
 
 The hermetic `tests/client_tests.l` contains the fake broker, built on `Net.Tcp.Testing`, and the
 TEST-ONLY certificates it uses; they are fixtures, generated for that file, and trusted by nothing
-else. The socket-level tests (timed reads, write timeout, the lock, independence from the thread
+else. The fake broker can drop its connections, close them with a reply code, refuse or ignore new
+ones and stay silent, and it counts what it receives; the heartbeat and recovery tests use that to
+assert what went over the wire (heartbeat frames from an idle client, what is declared again, that
+a stale `ack` writes nothing, that a publish is not repeated). Most other tests connect with
+`heartbeatSeconds = 0` and `withoutRecovery()`, so that nothing happens in the background of a
+test about one operation; the conformance suite also runs with the defaults. Waits in these tests
+end when the awaited state is reached; their limits (30 s and more) are only reached on failure. The socket-level tests (timed reads, write timeout, the lock, independence from the thread
 pool) are in `net/tests/tcp_tests.l`.
 
 ## Known gaps
@@ -442,8 +607,15 @@ layer (lyric-lang#9042, lyric-lang#9064) and what each target does.
 
 Not implemented (no issue filed yet):
 
-- A background heartbeat; see "Heartbeats" for what the synchronous client does instead.
-- Automatic reconnect and topology recovery.
+- Recovery connects to the one configured host; there is no list of hosts to fail over to.
+- No notification of a loss or a recovery (a listener); `connectionState` and `recoveryCount`
+  are polled.
+- A failed TLS handshake during recovery is retried like an unreachable broker, because the
+  platform's error text does not tell an expired or untrusted certificate from a transient
+  failure. Set `maxAttempts` to bound it.
+- An attempt that is inside the TCP connect or the TLS handshake cannot be interrupted by
+  `close()`: `Net.Tcp` has no way to abandon a `sockConnect` or `sockStartTls` in progress. It
+  ends with `connectTimeoutMs`.
 - More than one channel per connection, and more than one queue per `RabbitMqQueue`.
 - SASL mechanisms other than PLAIN (EXTERNAL, AMQPLAIN), and `connection.update-secret`.
 - Exclusive and server-named queues, `basic.get`, `basic.recover`, transactions (`tx.*`),

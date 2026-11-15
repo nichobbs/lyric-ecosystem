@@ -1,0 +1,50 @@
+[package]
+name        = "Lyric.Jobs.Hangfire"
+version     = "0.1.0"
+stability   = "experimental"
+authors     = ["Lyric Contributors"]
+license     = "MIT"
+description = "Hangfire backend for the Lyric Jobs.JobScheduler interface (.NET only)."
+targets     = ["dotnet"]
+
+[project]
+name            = "Lyric.Jobs.Hangfire"
+output          = "single"
+output_assembly = "Jobs.Hangfire.dll"
+
+[project.packages]
+"Jobs.Hangfire"               = "src/jobs_hangfire.l"
+"Jobs.Hangfire.Native"        = "src/native.l"
+"Jobs.Hangfire.Store"         = "src/store.l"
+"Jobs.Hangfire.Kernel.Dotnet" = "src/_kernel_dotnet/hangfire_kernel.l"
+
+[project.tests]
+"Jobs.Hangfire.ConformanceTests" = "tests/conformance_tests.l"
+"Jobs.Hangfire.ExecutionTests"   = "tests/execution_tests.l"
+"Jobs.Hangfire.NativeTests"      = "tests/native_tests.l"
+"Jobs.Hangfire.ReadmeExamplesTests" = "tests/readme_examples_tests.l"
+# Need a real PostgreSQL: file-level `@cfg(feature = "integration")`, so a
+# plain `lyric test` skips them.  The last two run in this order, each in a
+# process of its own: the second reads what the first left in the database.
+"Jobs.Hangfire.PostgresIntegrationTests" = "tests/integration/postgres_integration_tests.l"
+"Jobs.Hangfire.PostgresHandoverWriteTests" = "tests/integration/postgres_handover_write_tests.l"
+"Jobs.Hangfire.PostgresHandoverReadTests" = "tests/integration/postgres_handover_read_tests.l"
+
+[features]
+integration = []   # run tests/integration against the PostgreSQL named by LYRIC_HANGFIRE_POSTGRES
+
+[dependencies]
+# The interface and its conformance suite, resolved through the root
+# [workspace.overrides].
+"Lyric.Testing" = { workspace = true }
+"Lyric.Jobs"    = { workspace = true }
+
+[nuget]
+# Hangfire server, client and state machine; the in-memory job storage.
+"Hangfire.Core"     = "1.8.25"
+"Hangfire.InMemory" = "1.0.0"
+# Hangfire.Core asks for Newtonsoft.Json 11.0.1 or later, which NuGet reports
+# as vulnerable (GHSA-5crp-9r3c-p9vr).
+"Newtonsoft.Json" = "13.0.4"
+# The PostgreSQL job storage (Npgsql underneath; managed code only).
+"Hangfire.PostgreSql" = "1.21.1"

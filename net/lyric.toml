@@ -17,6 +17,7 @@ output_assembly = "Net.dll"
 # Test support: listening sockets, server-side TLS and background threads for
 # in-process servers.
 "Net.Tcp.Testing" = "src/tcp_testing.l"
+"Net.Threads"     = "src/threads.l"
 "Net.Tls"         = "src/tls.l"
 "Net.Url"         = "src/url.l"
 # One package in three files: the socket and TLS boundary for each target, the

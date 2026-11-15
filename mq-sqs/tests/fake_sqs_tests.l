@@ -59,6 +59,8 @@ import Testing.Conformance
 import Testing.Conformance.Mq as MqConformance
 import Aws.SigV4
 import Mq
+import Aws.Credentials
+import Aws.Retry
 import Mq.Sqs
 import Mq.Sqs.Extras
 import Mq.Sqs.Wire
@@ -82,6 +84,9 @@ val ACCOUNT: String = "000000000000"
 val STOP_PATH: String = "/__stop"
 
 val LOG_PATH: String = "/__log"
+
+// `GET /__lastkey`: the access key id that signed the last accepted request.
+val LAST_KEY_PATH: String = "/__lastkey"
 
 ref record FakeMessage {
   messageId: String
@@ -110,10 +115,33 @@ ref record FakeSqs {
   var requestCount: Int
   var counter: Int
   var log: List[String]
+  // Requests received per queue whose name makes the server misbehave.
+  var attempts: Map[String, Int]
+  var lastKeyId: String
 }
 
 func newFakeSqs(scheme: in String, port: in Int): FakeSqs {
-  FakeSqs(scheme = scheme, port = port, queues = newMap(), requestCount = 0, counter = 0, log = newList())
+  FakeSqs(
+    scheme = scheme,
+    port = port,
+    queues = newMap(),
+    requestCount = 0,
+    counter = 0,
+    log = newList(),
+    attempts = newMap(),
+    lastKeyId = ""
+  )
+}
+
+// Counts a request to a misbehaving queue and returns how many it has had.
+func countAttempt(sqs: in FakeSqs, name: in String): Int {
+  var n = 1
+  if sqs.attempts.containsKey(name) {
+    val before: Int = sqs.attempts[name]
+    n = before + 1
+  }
+  sqs.attempts[name] = n
+  n
 }
 
 func nextId(sqs: in FakeSqs, prefix: in String): String {
@@ -610,6 +638,14 @@ func sendAction(sqs: in FakeSqs, ctx: in HttpContext, queue: in FakeQueue, doc: 
   match wantedOf(queue, doc) {
     case Err(r) -> sqsFault(ctx, r.code, r.message)
     case Ok(wanted) -> {
+      // The message is stored and the answer is lost: what a client sees as
+      // a 500 after SQS has accepted the message.
+      if Str.startsWith(queue.name, "lost-reply") and countAttempt(sqs, queue.name) == 1 {
+        val _ = store(sqs, queue, wanted)
+        sqs.log.add("stored, reply lost")
+        respondFault(ctx, 500, "com.amazonaws.sqs#InternalError", "We encountered an internal error. Please try again.")
+        return
+      }
       val fields: List[JsonField] = newList()
       if not Str.startsWith(queue.name, "noid") {
         fields.add(jsonField("MessageId", jsonText(store(sqs, queue, wanted))))
@@ -1062,6 +1098,11 @@ func handle(sqs: in FakeSqs, ctx: in HttpContext): Unit {
     }
     case None -> ()
   }
+  sqs.lastKeyId = if Str.contains(headerValue(ctx, "Authorization"), "Credential=" + TEMP_ACCESS_KEY + "/") {
+    TEMP_ACCESS_KEY
+  } else {
+    ACCESS_KEY
+  }
   if requestMethod(ctx) != "POST" or requestPath(ctx) != "/" {
     respondFault(ctx, 404, "com.amazon.coral.service#UnknownOperationException", "POST / is the only route")
     return
@@ -1110,6 +1151,18 @@ func handle(sqs: in FakeSqs, ctx: in HttpContext): Unit {
   if servedFailure(ctx, name) {
     return
   }
+  // Throttled twice, then served.
+  if Str.startsWith(name, "retry-throttle") and countAttempt(sqs, name) <= 2 {
+    sqs.log.add("throttled " + action)
+    sqsFault(ctx, "RequestThrottled", "Rate exceeded")
+    return
+  }
+  // Fails once inside the server, before doing anything, then served.
+  if Str.startsWith(name, "retry-500") and countAttempt(sqs, name) == 1 {
+    sqs.log.add("failed " + action)
+    respondFault(ctx, 500, "com.amazonaws.sqs#InternalError", "We encountered an internal error. Please try again.")
+    return
+  }
   if not sqs.queues.containsKey(name) {
     sqsFault(ctx, "QueueDoesNotExist", "The specified queue does not exist.")
     return
@@ -1151,6 +1204,8 @@ func serveUntilStopped(l: in HttpListener, scheme: in String, port: in Int): Uni
     if requestPath(ctx) == STOP_PATH {
       respondText(ctx, 200, "served " + sqs.requestCount.toString())
       running = false
+    } else if requestPath(ctx) == LAST_KEY_PATH {
+      respondText(ctx, 200, sqs.lastKeyId)
     } else if requestPath(ctx) == LOG_PATH {
       respondText(ctx, 200, Str.joinList("\n", sqs.log))
       sqs.log = newList()
@@ -2654,4 +2709,312 @@ test "withCaCertificateFile reads a PEM file, and a missing or empty one is INVA
     "INVALID_CONFIG the path of the CA certificate is empty",
     "an empty path"
   )
+}
+
+// ─── Retries ─────────────────────────────────────────────────────────────────
+// The standard policy with its waits recorded instead of slept, and the
+// random source at the top of its range: the waits are 100 ms, then 200 ms.
+func recordingRetry(sleeps: in List[Int]): RetryPolicy {
+  standardRetry().withSleep({ ms: Int -> sleeps.add(ms) }).withRandom({ -> 1.0 })
+}
+
+func sleptMs(sleeps: in List[Int]): String {
+  val acc: List[String] = newList()
+  for ms in sleeps {
+    acc.add(ms.toString())
+  }
+  sleeps.clear()
+  Str.joinList(",", acc)
+}
+
+func retryScenario(endpoint: in String, n: in Notes): Unit {
+  val sleeps: List[Int] = newList()
+  val policy = recordingRetry(sleeps)
+  val client = adminFor(endpoint)
+  // Throttling: SQS did not take the request, so even a send to a standard
+  // queue is repeated.
+  val throttled = open(configFor(endpoint, create(endpoint, "retry-throttle-send", standardQueue())).withRetry(policy))
+  discardLog(endpoint)
+  note(n, "throttledSend", outcome(throttled.publish(message("t-1", "x"))))
+  note(n, "throttledSendLog", serverLog(endpoint))
+  note(n, "throttledSendWaits", sleptMs(sleeps))
+  note(n, "throttledSendStored", attribute(client, throttled.queue.url, "ApproximateNumberOfMessages"))
+  // And a receive.
+  val throttledReceive = open(
+    configFor(endpoint, create(endpoint, "retry-throttle-receive", standardQueue())).withRetry(
+      policy
+    )
+  )
+  discardLog(endpoint)
+  note(n, "throttledReceive", take(throttledReceive, 0))
+  note(n, "throttledReceiveLog", serverLog(endpoint))
+  note(n, "throttledReceiveWaits", sleptMs(sleeps))
+  // Retries switched off: the throttling error is returned.
+  val once = open(configFor(endpoint, create(endpoint, "retry-throttle-once", standardQueue())).withoutRetries())
+  discardLog(endpoint)
+  note(n, "withoutRetries", outcome(once.publish(message("t-2", "x"))))
+  note(n, "withoutRetriesLog", serverLog(endpoint))
+  // A 500 leaves the outcome unknown. A send to a standard queue is not
+  // repeated: the message might be there already.
+  val failing = open(configFor(endpoint, create(endpoint, "retry-500-send", standardQueue())).withRetry(policy))
+  discardLog(endpoint)
+  note(n, "send500", outcome(failing.publish(message("f-1", "x"))))
+  note(n, "send500Log", serverLog(endpoint))
+  note(n, "send500Waits", sleptMs(sleeps))
+  // Nor is a receive: the messages of a lost answer would stay hidden.
+  val failingReceive = open(
+    configFor(endpoint, create(endpoint, "retry-500-receive", standardQueue())).withRetry(policy)
+  )
+  discardLog(endpoint)
+  note(n, "receive500", take(failingReceive, 0))
+  note(n, "receive500Log", serverLog(endpoint))
+  note(n, "receive500Waits", sleptMs(sleeps))
+  // An idempotent action is repeated after a 500.
+  val attributesUrl = create(endpoint, "retry-500-attributes", standardQueue())
+  val retrying = match openClient(configFor(endpoint, "").withRetry(policy)) {
+    case Ok(c) -> c
+    case Err(e) -> panic(e.text())
+  }
+  discardLog(endpoint)
+  note(n, "attributes500", attribute(retrying, attributesUrl, "ApproximateNumberOfMessages"))
+  note(n, "attributes500Log", serverLog(endpoint))
+  note(n, "attributes500Waits", sleptMs(sleeps))
+  // The dangerous case: SQS stored the message and the answer was lost. On
+  // a standard queue the send is not repeated, so the queue holds it once.
+  val lost = open(configFor(endpoint, create(endpoint, "lost-reply-standard", standardQueue())).withRetry(policy))
+  discardLog(endpoint)
+  note(n, "lostStandard", outcome(lost.publish(message("l-1", "x"))))
+  note(n, "lostStandardLog", serverLog(endpoint))
+  note(n, "lostStandardWaits", sleptMs(sleeps))
+  note(n, "lostStandardStored", attribute(client, lost.queue.url, "ApproximateNumberOfMessages"))
+  // On a FIFO queue the send is repeated, and the deduplication id makes
+  // SQS accept the repeat without storing the message again.
+  val lostFifo = open(configFor(endpoint, create(endpoint, "lost-reply.fifo", fifoQueue())).withRetry(policy))
+  discardLog(endpoint)
+  note(n, "lostFifo", outcome(lostFifo.publish(message("l-2", "x"))))
+  note(n, "lostFifoLog", serverLog(endpoint))
+  note(n, "lostFifoWaits", sleptMs(sleeps))
+  note(n, "lostFifoStored", attribute(client, lostFifo.queue.url, "ApproximateNumberOfMessages"))
+  // An error that would be the same next time is not retried.
+  val base = endpoint + "/" + ACCOUNT + "/"
+  val missing = open(configFor(endpoint, base + "no-such-queue").withRetry(policy))
+  note(n, "missing", outcome(missing.publish(message("m-1", "x"))))
+  note(n, "missingWaits", sleptMs(sleeps))
+  // Throttled every time: three attempts, then the error.
+  val always = open(configFor(endpoint, base + "fail-throttle").withRetry(policy))
+  note(n, "always", outcome(always.publish(message("a-1", "x"))))
+  note(n, "alwaysWaits", sleptMs(sleeps))
+  val five = open(configFor(endpoint, base + "fail-throttle").withRetry(policy.withMaxAttempts(5)))
+  note(n, "five", outcome(five.publish(message("a-2", "x"))))
+  note(n, "fiveWaits", sleptMs(sleeps))
+}
+
+test "throttling is retried for every action; an unknown outcome only where a repeat is harmless" {
+  val lines = run(19541, { endpoint, n -> retryScenario(endpoint, n) })
+  expectClean(lines)
+  check(lines, "throttledSend", "ok")
+  check(lines, "throttledSendLog", "throttled SendMessage; throttled SendMessage; SendMessage")
+  check(lines, "throttledSendWaits", "100,200")
+  check(lines, "throttledSendStored", "1")
+  check(lines, "throttledReceive", "timeout")
+  check(
+    lines,
+    "throttledReceiveLog",
+    "throttled ReceiveMessage; throttled ReceiveMessage; ReceiveMessage max=1 wait=0 vt=30 -> 0"
+  )
+  check(lines, "throttledReceiveWaits", "100,200")
+  check(lines, "withoutRetries", "sqs: SendMessage failed: RequestThrottled (HTTP 400): Rate exceeded")
+  check(lines, "withoutRetriesLog", "throttled SendMessage")
+  check(
+    lines,
+    "send500",
+    "sqs: SendMessage failed: InternalError (HTTP 500): We encountered an internal error. Please try again."
+  )
+  check(lines, "send500Log", "failed SendMessage")
+  check(lines, "send500Waits", "")
+  checkContains(lines, "receive500", "ReceiveMessage failed: InternalError (HTTP 500)")
+  check(lines, "receive500Log", "failed ReceiveMessage")
+  check(lines, "receive500Waits", "")
+  check(lines, "attributes500", "0")
+  check(lines, "attributes500Log", "failed GetQueueAttributes")
+  check(lines, "attributes500Waits", "100")
+  checkContains(lines, "lostStandard", "SendMessage failed: InternalError (HTTP 500)")
+  check(lines, "lostStandardLog", "SendMessage; stored, reply lost")
+  check(lines, "lostStandardWaits", "")
+  check(lines, "lostStandardStored", "1")
+  check(lines, "lostFifo", "ok")
+  check(lines, "lostFifoLog", "SendMessage; stored, reply lost; SendMessage")
+  check(lines, "lostFifoWaits", "100")
+  check(lines, "lostFifoStored", "1")
+  checkContains(lines, "missing", "QueueDoesNotExist")
+  check(lines, "missingWaits", "")
+  check(lines, "always", "sqs: SendMessage failed: RequestThrottled (HTTP 400): Rate exceeded")
+  check(lines, "alwaysWaits", "100,200")
+  check(lines, "fiveWaits", "100,200,400,800")
+}
+
+test "a connection that cannot be opened is retried even for a send; only idempotent actions say so" {
+  val sleeps: List[Int] = newList()
+  val refused = open(refusedConfig().withRetry(recordingRetry(sleeps)))
+  val text = outcome(refused.publish(message("r", "x")))
+  assertTrue(Str.startsWith(text, "sqs: SendMessage got no response from http://127.0.0.1:1: "), text)
+  assertEqual(sleptMs(sleeps), "100,200", "nothing was sent, so the send is attempted three times")
+  assertTrue(isIdempotentAction("DeleteMessage"), "DeleteMessage")
+  assertTrue(isIdempotentAction("ChangeMessageVisibility"), "ChangeMessageVisibility")
+  assertTrue(isIdempotentAction("GetQueueAttributes"), "GetQueueAttributes")
+  assertTrue(isIdempotentAction("CreateQueue"), "CreateQueue")
+  assertFalse(isIdempotentAction("SendMessage"), "SendMessage")
+  assertFalse(isIdempotentAction("SendMessageBatch"), "SendMessageBatch")
+  assertFalse(isIdempotentAction("ReceiveMessage"), "ReceiveMessage")
+  assertFalse(isIdempotentAction("PurgeQueue"), "PurgeQueue")
+  assertFalse(isIdempotentAction("DeleteQueue"), "DeleteQueue")
+  assertFalse(isIdempotentAction("SomethingNew"), "an unknown action")
+  assertTrue(isFifoQueueUrl("https://sqs.eu-west-1.amazonaws.com/123456789012/orders.fifo"), "a FIFO queue URL")
+  assertFalse(isFifoQueueUrl("https://sqs.eu-west-1.amazonaws.com/123456789012/orders"), "a standard queue URL")
+}
+
+// ─── Credential providers ────────────────────────────────────────────────────
+ref record Clock {
+  var nowMs: Long
+}
+
+// A provider that hands out the long-term test key until `switchAtMs`, with
+// an expiry, and the temporary key after it.
+ref record Rotating {
+  clock: Clock
+  switchAtMs: Long
+  var calls: Int
+  var broken: Bool
+}
+
+impl CredentialProvider for Rotating {
+  func resolve(): Result[ResolvedCredentials, CredentialError] {
+    self.calls = self.calls + 1
+    if self.broken {
+      return Err(
+        CredentialError(code = "REQUEST_FAILED", provider = "rotating", message = "the credential service is down")
+      )
+    }
+    if self.clock.nowMs < self.switchAtMs {
+      Ok(
+        ResolvedCredentials(
+          credentials = Credentials(accessKeyId = ACCESS_KEY, secretAccessKey = SECRET_KEY, sessionToken = ""),
+          expiresAtEpochMs = Some(value = self.switchAtMs + 300000i64),
+          source = "rotating"
+        )
+      )
+    } else {
+      Ok(
+        ResolvedCredentials(
+          credentials = Credentials(
+            accessKeyId = TEMP_ACCESS_KEY,
+            secretAccessKey = TEMP_SECRET_KEY,
+            sessionToken = TEMP_TOKEN
+          ),
+          expiresAtEpochMs = Some(value = self.switchAtMs + 7200000i64),
+          source = "rotating"
+        )
+      )
+    }
+  }
+}
+
+func rotationScenario(endpoint: in String, n: in Notes): Unit {
+  val url = create(endpoint, "rotation", standardQueue())
+  val t0 = 1800000000000i64
+  val clock = Clock(nowMs = t0)
+  // The first credentials expire five minutes after `switchAtMs`; the cache
+  // refreshes five minutes before expiry, which is at `switchAtMs`.
+  val inner = Rotating(clock = clock, switchAtMs = t0 + 3600000i64, calls = 0, broken = false)
+  val cache = cachedWith(
+    inner,
+    CacheOptions(refreshWindowMs = 300000i64, retryAfterFailureMs = 30000i64, nowMs = { -> clock.nowMs })
+  )
+  // Empty static keys: the provider is the only source.
+  val q = open(
+    endpointConfig(endpoint, url, REGION, "", "").withCredentialProvider(cache.asProvider()).withRequestTimeout(
+      10000
+    )
+  )
+  note(n, "first", outcome(q.publish(message("c-1", "x"))))
+  note(n, "firstSignedBy", plainGet(endpoint + LAST_KEY_PATH) + " calls=" + inner.calls.toString())
+  clock.nowMs = t0 + 3599999i64
+  note(n, "before", outcome(q.publish(message("c-2", "x"))))
+  note(n, "beforeSignedBy", plainGet(endpoint + LAST_KEY_PATH) + " calls=" + inner.calls.toString())
+  // The clock reaches the refresh window: the next request is signed with
+  // the temporary key and its session token, which the server verifies.
+  clock.nowMs = t0 + 3600000i64
+  note(n, "after", outcome(q.publish(message("c-3", "x"))))
+  note(n, "afterSignedBy", plainGet(endpoint + LAST_KEY_PATH) + " calls=" + inner.calls.toString())
+  note(n, "consumed", take(q, 1000))
+  // A provider with nothing to give: the operation fails without a request.
+  inner.broken = true
+  cache.invalidate()
+  discardLog(endpoint)
+  note(n, "noCredentials", outcome(q.publish(message("c-4", "x"))))
+  note(n, "noCredentialsLog", serverLog(endpoint))
+  inner.broken = false
+  q.close()
+}
+
+test "credentials from a provider are refreshed mid-run, and the next request is signed with the new ones" {
+  val lines = run(19542, { endpoint, n -> rotationScenario(endpoint, n) })
+  expectClean(lines)
+  check(lines, "first", "ok")
+  check(lines, "firstSignedBy", ACCESS_KEY + " calls=1")
+  check(lines, "before", "ok")
+  check(lines, "beforeSignedBy", ACCESS_KEY + " calls=1")
+  check(lines, "after", "ok")
+  check(lines, "afterSignedBy", TEMP_ACCESS_KEY + " calls=2")
+  checkContains(lines, "consumed", "c-")
+  check(lines, "noCredentials", "sqs: no AWS credentials: rotating: the credential service is down")
+  check(lines, "noCredentialsLog", "")
+}
+
+func sharedFilesScenario(endpoint: in String, n: in Notes): Unit {
+  val url = create(endpoint, "shared-files", standardQueue())
+  val dir = Env.getVarOrDefault("TMPDIR", "/tmp") + "/lyric-sqs-shared-" + Time.nowEpochMillis().toString()
+  match File.createDir(dir) {
+    case Ok(_) -> ()
+    case Err(_) -> panic("cannot create " + dir)
+  }
+  match File.writeText(dir + "/credentials", "[ci]\naws_access_key_id = " + ACCESS_KEY + "\naws_secret_access_key = " + SECRET_KEY + "\n") {
+    case Ok(_) -> ()
+    case Err(_) -> panic("cannot write the credentials file")
+  }
+  match File.writeText(dir + "/config", "[profile ci]\nregion = " + REGION + "\nendpoint_url = " + endpoint + "\nsqs =\n  endpoint_url = http://127.0.0.1:1\n") {
+    case Ok(_) -> ()
+    case Err(_) -> panic("cannot write the config file")
+  }
+  val values: Map[String, String] = newMap()
+  values["AWS_CONFIG_FILE"] = dir + "/config"
+  values["AWS_SHARED_CREDENTIALS_FILE"] = dir + "/credentials"
+  values["AWS_EC2_METADATA_DISABLED"] = "true"
+  values["AWS_PROFILE"] = "ci"
+  match configFromEnvironment(url, environmentOf(values)) {
+    case Err(e) -> note(n, "config", e.code + ": " + e.message)
+    case Ok(cfg) -> {
+      note(
+        n,
+        "config",
+        "key=" + cfg.accessKeyId + " provider=" + (if isSome(cfg.credentialProvider) { "yes" } else { "no" }) + " region=" +
+          cfg.region +
+          " endpoint=" +
+          (if cfg.endpoint == endpoint { "the fake" } else { cfg.endpoint })
+      )
+      val q = open(cfg)
+      note(n, "publish", outcome(q.publish(message("s-1", "from a profile"))))
+      note(n, "consume", take(q, 1000))
+      q.close()
+    }
+  }
+  val _ = File.deleteDirRecursive(dir)
+}
+
+test "a queue configured from a profile of the shared files signs requests the server accepts" {
+  val lines = run(19543, { endpoint, n -> sharedFilesScenario(endpoint, n) })
+  expectClean(lines)
+  check(lines, "config", "key= provider=yes region=" + REGION + " endpoint=the fake")
+  check(lines, "publish", "ok")
+  check(lines, "consume", "s-1/from a profile/0")
 }

@@ -47,13 +47,12 @@
 //! - `close` closes the channel and the connection with the AMQP close
 //!   handshake. Deliveries not yet settled go back to the queue.
 //!
-//! Heartbeats are off by default (`heartbeatSeconds = 0`): the client is
-//! synchronous and has no thread to send them from. With a heartbeat
-//! negotiated the client sends heartbeat frames whenever it is inside an
-//! operation (a blocked `consume`, a publish waiting for its confirm) and
-//! notices a silent broker there; between operations nothing is sent, so an
-//! application that idles longer than twice the interval is disconnected by
-//! the broker unless it calls `keepAlive` in the meantime.
+//! Heartbeats: the client asks for an interval of `heartbeatSeconds` (60 by
+//! default; 0 turns them off) and uses the smaller of that and the broker's
+//! proposal. It sends a heartbeat frame whenever it has written nothing for
+//! half the interval and gives the connection up when nothing has arrived for
+//! two intervals. An operation in progress does both itself; between
+//! operations a background thread of the connection does.
 //!
 //! A channel error (`404 NOT_FOUND`, `406 PRECONDITION_FAILED`, ...) fails
 //! the operation that caused it; the client then opens a fresh channel, so
@@ -63,10 +62,23 @@
 //! A `RabbitMqQueue` may be shared between threads: operations take the
 //! connection's lock one at a time, and a blocked `consume` releases it every
 //! 100 ms so a publisher on another thread is not held for the whole wait.
-//! The handler runs outside the lock and may call `ack` / `nack` itself.
+//! The handler runs outside the lock and may call `ack` / `nack` itself. The
+//! background thread takes the same lock, and only when no operation holds
+//! it. It ends with `close`: always close a connection.
 //!
-//! There is no automatic reconnect. After a transport failure every operation
-//! returns `Err`; open a new connection.
+//! Recovery: when the connection is lost (a socket failure, missed
+//! heartbeats, a `connection.close` from the broker that is not a refusal)
+//! the background thread reconnects with a capped exponential backoff and
+//! restores what this client had set up: the channel in confirm mode, the
+//! queue, the exchanges, queues and bindings made through
+//! `Mq.RabbitMq.Extras`, the prefetch window and the consumer. See
+//! `RecoveryOptions`. While it is disconnected every operation fails at once
+//! with an error that says so (`isNotAttempted`), except `consume`, which
+//! waits within its timeout. A publish whose confirm was outstanding when the
+//! connection dropped returns an error that says its outcome is unknown
+//! (`isOutcomeUnknown`); it is never sent again by the client. Deliveries
+//! that were unsettled are requeued by the broker and arrive again; an `ack`
+//! or `nack` for one of them is an `Err`.
 //!
 //! TLS: an `amqps://` URL, or `withTls()` on the options, runs a TLS
 //! handshake before the AMQP protocol header. The server certificate is
@@ -92,8 +104,10 @@ import Std.Math as Math
 import Std.String as Str
 import Std.Environment as Env
 import Std.Console as Console
+import Std.Random as Rand
 import Std.Tls as Tls
 import Net.Tcp as K
+import Net.Threads as Threads
 import Net.Tls
 import Mq.RabbitMq.Amqp as Amqp
 import Mq.RabbitMq.Url as Url
@@ -115,6 +129,49 @@ pub val HEADER_DELIVERY_COUNT: String = "x-delivery-count"
 /// merge entries with one key (RabbitMQ 4 does both); it cannot touch the
 /// inside of one value.
 pub val HEADER_HEADERS: String = "lyric_headers"
+
+/// Part of every error returned while the connection is being
+/// re-established. See `isReconnecting`.
+pub val RECONNECTING: String = "the client is reconnecting"
+
+/// Part of the error of an operation that failed before anything was written
+/// to the broker, because the connection was already lost. Repeating the
+/// operation later is safe. See `isNotAttempted`.
+pub val NOT_ATTEMPTED: String = "the operation was not attempted"
+
+/// Part of the error of a publish whose confirm had not arrived when the
+/// connection was lost. See `isOutcomeUnknown`.
+pub val OUTCOME_UNKNOWN: String = "the outcome of the publish is unknown"
+
+/// Part of the error of an `ack` or `nack` for a delivery that was unsettled
+/// when its connection or channel was lost.
+pub val STALE_DELIVERY: String = "it was delivered before the connection or channel was lost"
+
+/// How a lost connection is re-established.
+pub record RecoveryOptions {
+  /// `false`: after a loss every operation returns `Err` until the
+  /// application opens a new connection.
+  enabled: Bool
+  /// The wait before the first attempt, in milliseconds. It doubles after
+  /// every failed attempt.
+  initialDelayMs: Int
+  /// The longest wait between two attempts, in milliseconds.
+  maxDelayMs: Int
+  /// How many attempts in a row may fail before the connection is given up
+  /// for good; 0 = no limit.
+  maxAttempts: Int
+}
+
+/// Recovery on: a first attempt after 1 s, the wait doubling up to 30 s, no
+/// limit on the number of attempts.
+pub func defaultRecovery(): RecoveryOptions {
+  RecoveryOptions(enabled = true, initialDelayMs = 1000, maxDelayMs = 30000, maxAttempts = 0)
+}
+
+/// Recovery off.
+pub func noRecovery(): RecoveryOptions {
+  defaultRecovery().copy(enabled = false)
+}
 
 /// The version this client reports to the broker.
 pub val CLIENT_VERSION: String = "0.1.0"
@@ -153,9 +210,9 @@ pub record ConnectOptions {
   /// (`basic.qos`), which is also how many messages the client may hold
   /// before a handler has seen them. 0 = no limit.
   prefetchCount: Int
-  /// The heartbeat interval to ask for, in seconds; 0 (the default) turns
-  /// heartbeats off. See the package comment for what a non-zero value
-  /// requires of the application.
+  /// The heartbeat interval to ask for, in seconds (60 by default); 0 turns
+  /// heartbeats off. The smaller of this and the broker's proposal is used,
+  /// and this value when the broker proposes none.
   heartbeatSeconds: Int
   /// The largest frame to accept and send, in bytes (at least 4096). The
   /// smaller of this and the broker's limit is used; bodies are split to fit.
@@ -174,13 +231,16 @@ pub record ConnectOptions {
   connectionName: String
   /// TLS settings; `plainTcp()` for an `amqp://` listener.
   tls: TlsOptions
+  /// Whether and how a lost connection is re-established.
+  recovery: RecoveryOptions
 }
 
 /// Options for `queue` on `host:port` with the defaults: plain TCP, the
 /// `guest` user, the `/` virtual host, a durable queue declared on connect,
-/// manual acknowledgement, persistent messages, a prefetch of 10, no
-/// heartbeat, a 128 KiB frame limit, a 10 s connect and request timeout and a
-/// 16 MiB message limit. Adjust with `.copy(...)` and the `with...` functions.
+/// manual acknowledgement, persistent messages, a prefetch of 10, a 60 s
+/// heartbeat, a 128 KiB frame limit, a 10 s connect and request timeout, a
+/// 16 MiB message limit and automatic recovery (`defaultRecovery()`). Adjust
+/// with `.copy(...)` and the `with...` functions.
 pub func defaultOptions(host: in String, port: in Int, queue: in String): ConnectOptions {
   ConnectOptions(
     host = host,
@@ -196,14 +256,26 @@ pub func defaultOptions(host: in String, port: in Int, queue: in String): Connec
     ackMode = Mq.AckMode.Manual,
     persistent = true,
     prefetchCount = 10,
-    heartbeatSeconds = 0,
+    heartbeatSeconds = 60,
     frameMax = 131072,
     connectTimeoutMs = 10000,
     requestTimeoutMs = 10000,
     maxMessageBytes = 16777216,
     connectionName = "",
-    tls = plainTcp()
+    tls = plainTcp(),
+    recovery = defaultRecovery()
   )
+}
+
+/// Re-establish a lost connection as `recovery` says.
+pub func ConnectOptions.withRecovery(o: in ConnectOptions, recovery: in RecoveryOptions): ConnectOptions {
+  o.copy(recovery = recovery)
+}
+
+/// Do not re-establish a lost connection: after a loss every operation
+/// returns `Err`.
+pub func ConnectOptions.withoutRecovery(o: in ConnectOptions): ConnectOptions {
+  o.copy(recovery = o.recovery.copy(enabled = false))
 }
 
 /// Connect over TLS, verifying the server certificate against the platform
@@ -273,12 +345,40 @@ pub record Returned {
 /// `connectUrl` or `connectFromEnv`.
 pub ref record RabbitMqQueue {
   options: ConnectOptions
-  sock: K.Sock
-  decoder: Amqp.Decoder
   lock: K.Lock
+  var sock: K.Sock
+  var decoder: Amqp.Decoder
   var server: String
+  // Why the current connection is gone; empty while it is up.
   var lost: String
+  // Why the connection will not be re-established; empty while it will.
+  var failed: String
   var closed: Bool
+  // The first handshake succeeded: the connection was handed out.
+  var established: Bool
+  // A failure during the handshake that no further attempt can cure.
+  var permanent: Bool
+  // The number of the channel incarnation. It changes whenever the channel
+  // is reopened or the connection re-established, so a delivery can be told
+  // from one of an earlier channel that happens to carry the same tag.
+  var epoch: Int
+  // Message ids whose deliveries were unsettled when their channel went.
+  var stale: Map[String, Int]
+  // A consumer was started and not cancelled: recovery starts it again.
+  var wantConsumer: Bool
+  // The exchanges, queues and bindings made through `request`, in order.
+  var topology: List[Amqp.Method]
+  // A channel error the background thread came across; the next operation
+  // reports it.
+  var deferred: String
+  // Publishes without a confirm at the moment the connection was lost.
+  var lostPublishes: Int
+  var failedAttempts: Int
+  var nextAttemptAt: Long
+  var recoveries: Int
+  var background: Bool
+  // The socket of a recovery attempt in progress, so `close` can end it.
+  var attemptSocks: List[K.Sock]
   var frameMax: Int
   var heartbeatMs: Long
   var lastSent: Long
@@ -313,7 +413,26 @@ val CHANNEL: Int = 1
 
 val WAIT_SLICE_MS: Int = 100
 
+// How often a `consume` or `awaitConnected` looks whether the connection is
+// back.
+val RECOVERY_POLL_MS: Int = 25
+
 val READ_CHUNK_BYTES: Int = 65536
+
+// The most message ids remembered as delivered on a channel that is gone.
+val STALE_LIMIT: Int = 4096
+
+// The background thread stops reading ahead when this many deliveries wait
+// for a handler, so a consumer without a prefetch limit that stops consuming
+// is held back by TCP and not by this client's memory.
+val BACKLOG_READ_AHEAD: Int = 1024
+
+// A delivery on its way to a handler, with the channel incarnation it
+// arrived on.
+record Handed {
+  delivery: Delivery
+  epoch: Int
+}
 
 // One frame, method or message from the broker.
 union Event {
@@ -392,12 +511,62 @@ func replyText(code: in Int, text: in String): String {
 }
 
 // ─── Transport (callers hold the lock) ───────────────────────────────────────
+// The reply codes of a refusal that another attempt meets again: the
+// credentials, the virtual host or its permissions, or an entity that exists
+// with other properties.
+func permanentCode(code: in Int): Bool {
+  code == 402 or code == 403 or code == 404 or code == 405 or code == 406 or code == 530
+}
+
+// The wait before attempt number `attempt` (from 1): the initial delay
+// doubled for every earlier attempt, capped, then a random point in its upper
+// half, so that clients disconnected together do not come back together.
+func backoffMs(recovery: in RecoveryOptions, attempt: in Int): Long {
+  val cap = recovery.maxDelayMs.toLong()
+  var delay = recovery.initialDelayMs.toLong()
+  var n = 1
+  while n < attempt and delay < cap {
+    delay = delay * 2i64
+    n += 1
+  }
+  if delay > cap {
+    delay = cap
+  }
+  val half = delay / 2i64
+  val spread = (delay - half).toInt()
+  half + Rand.nextIntBelow(Rand.sharedRandom(), spread + 1).toLong()
+}
+
+// True while the connection is down and the background thread is working on
+// bringing it back.
+func recovering(q: in RabbitMqQueue): Bool {
+  q.lost.length > 0 and q.established and q.options.recovery.enabled and q.failed.length == 0 and not q.closed
+}
+
+func lostText(q: in RabbitMqQueue): String {
+  val base = "rabbitmq: connection lost: " + q.lost
+  if q.failed.length > 0 {
+    base + "; " + q.failed
+  } else if recovering(q) {
+    base + "; " + RECONNECTING
+  } else {
+    base
+  }
+}
+
 func markLost(q: in RabbitMqQueue, reason: in String): String {
   if q.lost.length == 0 {
     q.lost = reason
+    q.lostPublishes = q.unconfirmed.count
     K.sockClose(q.sock)
+    // Everything that lived on the connection is gone with it: unsettled
+    // deliveries go back to the queue, and the fate of publishes without a
+    // confirm stays unknown.
+    resetChannelState(q)
+    q.failedAttempts = 0
+    q.nextAttemptAt = K.monotonicMillis() + backoffMs(q.options.recovery, 1)
   }
-  "rabbitmq: connection lost: " + q.lost
+  lostText(q)
 }
 
 func checkUsable(q: in RabbitMqQueue): Result[Unit, String] {
@@ -405,7 +574,15 @@ func checkUsable(q: in RabbitMqQueue): Result[Unit, String] {
     return Err("rabbitmq: the connection is closed")
   }
   if q.lost.length > 0 {
-    return Err("rabbitmq: connection lost: " + q.lost)
+    if recovering(q) {
+      return Err(lostText(q) + "; " + NOT_ATTEMPTED)
+    }
+    return Err(lostText(q))
+  }
+  if q.deferred.length > 0 {
+    val e = q.deferred
+    q.deferred = ""
+    return Err(e)
   }
   Ok(())
 }
@@ -443,7 +620,7 @@ func closedByPeer(q: in RabbitMqQueue): String {
     return "the broker closed the connection; this client had sent nothing for " + (idle / 1000i64).toString() +
       " s with a heartbeat of " +
       (q.heartbeatMs / 1000i64).toString() +
-      " s (call keepAlive between operations)"
+      " s"
   }
   "the broker closed the connection"
 }
@@ -624,8 +801,18 @@ func confirm(q: in RabbitMqQueue, tag: in Long, multiple: in Bool, refused: in B
   q.unconfirmed = still
 }
 
-// Forget everything that belonged to the channel that just closed.
+// Forget everything that belonged to the channel that just closed. The ids
+// of its unsettled deliveries are kept, so an `ack` for one of them can say
+// what happened to it.
 func resetChannelState(q: in RabbitMqQueue): Unit {
+  if mapSize(q.stale) > STALE_LIMIT {
+    q.stale = newMap()
+  }
+  for id in mapKeys(q.inFlight).toArray() {
+    val before = if q.stale.containsKey(id) { q.stale[id] } else { 0 }
+    q.stale[id] = before + q.inFlight[id].count
+  }
+  q.epoch = q.epoch + 1
   q.consuming = false
   q.publishSeq = 0i64
   q.unconfirmed = newList()
@@ -659,7 +846,11 @@ func step(q: in RabbitMqQueue, timeoutMs: in Int, recover: in Bool): Result[Step
         case ConnectionClose(code, text, _, _) -> {
           q.lastCode = code
           val _ = writeMethod(q, 0, Amqp.ConnectionCloseOk)
-          Err(markLost(q, "the broker closed the connection: " + replyText(code, text)))
+          val _ = markLost(q, "the broker closed the connection: " + replyText(code, text))
+          if q.established and q.options.recovery.enabled and permanentCode(code) and q.failed.length == 0 {
+            q.failed = "not reconnecting, the broker's refusal is permanent"
+          }
+          Err(lostText(q))
         }
         case ConnectionBlocked(reason) -> {
           q.blocked = if reason.length > 0 { reason } else { "resource alarm" }
@@ -698,6 +889,7 @@ func step(q: in RabbitMqQueue, timeoutMs: in Int, recover: in Bool): Result[Step
           // The next consume starts a new one and reports what the broker
           // says about it.
           q.consuming = false
+          q.wantConsumer = false
           Ok(Progress)
         }
         case ChannelFlow(active) -> {
@@ -820,6 +1012,15 @@ func validate(options: in ConnectOptions): Result[Unit, String] {
     case Err(e) -> return Err("rabbitmq: queueArguments: " + e)
     case Ok(_) -> ()
   }
+  if options.recovery.initialDelayMs < 1 {
+    return Err("rabbitmq: recovery.initialDelayMs must be at least 1")
+  }
+  if options.recovery.maxDelayMs < options.recovery.initialDelayMs {
+    return Err("rabbitmq: recovery.maxDelayMs must not be smaller than recovery.initialDelayMs")
+  }
+  if options.recovery.maxAttempts < 0 {
+    return Err("rabbitmq: recovery.maxAttempts must not be negative")
+  }
   match validateTlsOptions(options.tls) {
     case Ok(_) -> Ok(())
     case Err(problem) -> Err("rabbitmq: " + tlsProblemText(problem, "an amqps:// URL"))
@@ -909,12 +1110,14 @@ func handshake(q: in RabbitMqQueue, endpoint: in String): Result[Unit, String] {
   match start {
     case ConnectionStart(major, minor, properties, mechanisms, _) -> {
       if major != 0 or minor != 9 {
+        q.permanent = true
         return Err(
           "rabbitmq: " + endpoint + " speaks AMQP " + major.toString() + "-" + minor.toString() +
             "; this client needs 0-9-1"
         )
       }
       if not hasWord(mechanisms, "PLAIN") {
+        q.permanent = true
         return Err("rabbitmq: " + endpoint + " does not offer PLAIN authentication (it offers: " + mechanisms + ")")
       }
       q.server = serverDescription(properties)
@@ -1002,25 +1205,31 @@ func handshake(q: in RabbitMqQueue, endpoint: in String): Result[Unit, String] {
   }
 }
 
-/// Connect to the broker, authenticate, open the channel and declare (or
-/// check) the queue. The consumer is started by the first `consume` (or by
-/// `subscribe`), so a connection that only publishes takes no messages.
-pub func connectWith(options: in ConnectOptions): Result[RabbitMqQueue, String] {
-  match validate(options) {
-    case Err(e) -> return Err(e)
-    case Ok(_) -> ()
-  }
-  val endpoint = options.host + ":" + options.port.toString()
-  val sock = match openTransport(options, endpoint) { case Ok(s) -> s; case Err(e) -> return Err(e) }
+// The state of a connection over `sock`, before its handshake.
+func newState(options: in ConnectOptions, sock: in K.Sock, epoch: in Int): RabbitMqQueue {
   val now = K.monotonicMillis()
-  val q = RabbitMqQueue(
+  RabbitMqQueue(
     options = options,
+    lock = K.newLock(),
     sock = sock,
     decoder = Amqp.newDecoder(Amqp.FRAME_MIN_SIZE),
-    lock = K.newLock(),
     server = "",
     lost = "",
+    failed = "",
     closed = false,
+    established = false,
+    permanent = false,
+    epoch = epoch,
+    stale = newMap(),
+    wantConsumer = false,
+    topology = newList(),
+    deferred = "",
+    lostPublishes = 0,
+    failedAttempts = 0,
+    nextAttemptAt = 0i64,
+    recoveries = 0,
+    background = false,
+    attemptSocks = newList(),
     frameMax = Amqp.FRAME_MIN_SIZE,
     heartbeatMs = 0i64,
     lastSent = now,
@@ -1046,12 +1255,48 @@ pub func connectWith(options: in ConnectOptions): Result[RabbitMqQueue, String] 
     pendingDiscard = false,
     pendingChunks = newList()
   )
+}
+
+// `e` without the prefix of a lost connection: a connection that was never
+// handed out was refused, not lost.
+func withoutLostPrefix(e: in String): String {
+  val lostPrefix = "rabbitmq: connection lost: "
+  val plainPrefix = "rabbitmq: "
+  if Str.startsWith(e, lostPrefix) {
+    Str.substring(e, lostPrefix.length)
+  } else if Str.startsWith(e, plainPrefix) {
+    Str.substring(e, plainPrefix.length)
+  } else {
+    e
+  }
+}
+
+/// Connect to the broker, authenticate, open the channel and declare (or
+/// check) the queue. The consumer is started by the first `consume` (or by
+/// `subscribe`), so a connection that only publishes takes no messages.
+///
+/// With a heartbeat or with recovery (both are on by default) the connection
+/// owns a background thread until `close` is called.
+pub func connectWith(options: in ConnectOptions): Result[RabbitMqQueue, String] {
+  match validate(options) {
+    case Err(e) -> return Err(e)
+    case Ok(_) -> ()
+  }
+  val endpoint = options.host + ":" + options.port.toString()
+  val sock = match openTransport(options, endpoint) { case Ok(s) -> s; case Err(e) -> return Err(e) }
+  val q = newState(options, sock, 1)
   match handshake(q, endpoint) {
-    case Ok(_) -> Ok(q)
+    case Ok(_) -> {
+      q.established = true
+      if q.heartbeatMs > 0i64 or options.recovery.enabled {
+        q.background = true
+        val _ = Threads.start({ -> tendLoop(q) })
+      }
+      Ok(q)
+    }
     case Err(e) -> {
       K.sockClose(sock)
       q.closed = true
-      // The connection was never handed out, so it was refused, not lost.
       val lostPrefix = "rabbitmq: connection lost: "
       if Str.startsWith(e, lostPrefix) {
         Err("rabbitmq: cannot open a connection to " + endpoint + ": " + Str.substring(e, lostPrefix.length))
@@ -1060,6 +1305,202 @@ pub func connectWith(options: in ConnectOptions): Result[RabbitMqQueue, String] 
       }
     }
   }
+}
+
+// ─── The background thread: heartbeats and recovery ──────────────────────────
+// What the background thread does for a connection that is up: take in what
+// the broker has sent (its heartbeats count as traffic, and silence for two
+// intervals loses the connection) and send a heartbeat when one is due.
+func tend(q: in RabbitMqQueue): Unit {
+  if q.backlog.count < BACKLOG_READ_AHEAD {
+    match drain(q) {
+      case Ok(_) -> ()
+      case Err(e) -> {
+        if q.lost.length == 0 {
+          q.deferred = e
+        }
+      }
+    }
+  }
+  if q.lost.length == 0 {
+    val _ = beat(q)
+  }
+}
+
+// How long the background thread sleeps before it looks again.
+func tendPauseMs(q: in RabbitMqQueue): Int {
+  if q.lost.length > 0 {
+    val until = q.nextAttemptAt - K.monotonicMillis()
+    return if until < 10i64 { 10 } else if until > 100i64 { 100 } else { until.toInt() }
+  }
+  if q.heartbeatMs == 0i64 {
+    return 250
+  }
+  val eighth = q.heartbeatMs / 8i64
+  if eighth < 50i64 {
+    50
+  } else if eighth > 250i64 {
+    250
+  } else {
+    eighth.toInt()
+  }
+}
+
+// The background thread of a connection. It only ever works under the
+// connection's lock, like an operation of the application, and never while
+// an operation holds it: an operation that waits sends heartbeats itself.
+func tendLoop(q: in RabbitMqQueue): Unit {
+  var pause = 50
+  var running = true
+  while running {
+    K.sleepMs(pause)
+    if K.lockTryEnter(q.lock, pause) {
+      var attempt = false
+      if q.closed or q.failed.length > 0 {
+        running = false
+      } else if q.lost.length == 0 {
+        tend(q)
+      } else if not q.options.recovery.enabled {
+        running = false
+      } else if K.monotonicMillis() >= q.nextAttemptAt {
+        attempt = true
+      }
+      if not running {
+        q.background = false
+      }
+      pause = tendPauseMs(q)
+      K.lockExit(q.lock)
+      if attempt {
+        reconnect(q)
+      }
+    }
+  }
+}
+
+// On a new connection, set up again what the lost one had: the exchanges,
+// queues and bindings in the order they were made, then the consumer.
+func restore(n: in RabbitMqQueue, topology: in slice[Amqp.Method], wantConsumer: in Bool): Result[Unit, String] {
+  for m in topology {
+    match rpc(n, CHANNEL, m, replyNameFor(m), false) {
+      case Err(e) -> return Err(e)
+      case Ok(_) -> ()
+    }
+  }
+  if wantConsumer {
+    return subscribeLocked(n)
+  }
+  Ok(())
+}
+
+// Make `q` use the connection that `n` set up.
+func adopt(q: in RabbitMqQueue, n: in RabbitMqQueue): Unit {
+  q.sock = n.sock
+  q.decoder = n.decoder
+  q.server = n.server
+  q.frameMax = n.frameMax
+  q.heartbeatMs = n.heartbeatMs
+  q.lastSent = n.lastSent
+  q.lastReceived = n.lastReceived
+  q.blocked = n.blocked
+  q.consuming = n.consuming
+  q.publishSeq = n.publishSeq
+  q.unconfirmed = n.unconfirmed
+  q.nacked = n.nacked
+  q.returned = n.returned
+  q.backlog = n.backlog
+  q.inFlight = newMap()
+  q.pendingKind = n.pendingKind
+  q.pendingTag = n.pendingTag
+  q.pendingRedelivered = n.pendingRedelivered
+  q.pendingCode = n.pendingCode
+  q.pendingText = n.pendingText
+  q.pendingHasHeader = n.pendingHasHeader
+  q.pendingProperties = n.pendingProperties
+  q.pendingSize = n.pendingSize
+  q.pendingGot = n.pendingGot
+  q.pendingDiscard = n.pendingDiscard
+  q.pendingChunks = n.pendingChunks
+  q.deferred = ""
+  q.lostPublishes = 0
+  q.failedAttempts = 0
+  q.recoveries = q.recoveries + 1
+  q.lost = ""
+}
+
+// One attempt at a new connection. The handshake and the restoring run on a
+// state of their own, without the lock, so that operations keep failing fast
+// and `close` is not held up; the result is taken over under the lock.
+func reconnect(q: in RabbitMqQueue): Unit {
+  K.lockEnter(q.lock)
+  if q.closed or q.lost.length == 0 or q.failed.length > 0 {
+    K.lockExit(q.lock)
+    return
+  }
+  val options = q.options
+  val topology = q.topology.toArray()
+  val wantConsumer = q.wantConsumer
+  val epoch = q.epoch
+  K.lockExit(q.lock)
+  val endpoint = options.host + ":" + options.port.toString()
+  var failure = ""
+  var permanent = false
+  var code = 0
+  match openTransport(options, endpoint) {
+    case Err(e) -> {
+      failure = withoutLostPrefix(e)
+    }
+    case Ok(sock) -> {
+      K.lockEnter(q.lock)
+      val stop = q.closed
+      if not stop {
+        q.attemptSocks.add(sock)
+      }
+      K.lockExit(q.lock)
+      if stop {
+        K.sockClose(sock)
+        return
+      }
+      val n = newState(options, sock, epoch)
+      val outcome = match handshake(n, endpoint) { case Ok(_) -> restore(n, topology, wantConsumer); case Err(e) -> Err(e) }
+      match outcome {
+        case Ok(_) -> {
+          K.lockEnter(q.lock)
+          q.attemptSocks = newList()
+          if q.closed {
+            K.sockClose(sock)
+          } else {
+            adopt(q, n)
+          }
+          K.lockExit(q.lock)
+          return
+        }
+        case Err(e) -> {
+          K.sockClose(sock)
+          failure = withoutLostPrefix(e)
+          code = n.lastCode
+          permanent = n.permanent or permanentCode(code)
+        }
+      }
+    }
+  }
+  K.lockEnter(q.lock)
+  q.attemptSocks = newList()
+  if not q.closed {
+    q.failedAttempts = q.failedAttempts + 1
+    if code != 0 {
+      q.lastCode = code
+    }
+    val limit = options.recovery.maxAttempts
+    if permanent {
+      q.failed = "reconnecting was given up, the failure is permanent: " + failure
+    } else if limit > 0 and q.failedAttempts >= limit {
+      q.failed = "reconnecting was given up after " + q.failedAttempts.toString() + " failed attempts, the last one: " +
+        failure
+    } else {
+      q.nextAttemptAt = K.monotonicMillis() + backoffMs(options.recovery, q.failedAttempts + 1)
+    }
+  }
+  K.lockExit(q.lock)
 }
 
 /// The options for the broker named by an `amqp://` or `amqps://` URL (see
@@ -1131,6 +1572,8 @@ func tlsFromEnv(base: in ConnectOptions): Result[ConnectOptions, String] {
 /// - `LYRIC_CONFIG_MQ_RABBITMQ_ACKMODE`: `Manual` (default) or `Auto`
 /// - `LYRIC_CONFIG_MQ_RABBITMQ_PREFETCHCOUNT`: the prefetch window
 ///   (default 10)
+/// - `LYRIC_CONFIG_MQ_RABBITMQ_RECOVERY`: `true` (default) or `false`:
+///   whether a lost connection is re-established
 ///
 /// and, for an `amqps://` URL:
 ///
@@ -1167,8 +1610,17 @@ pub func optionsFromEnv(): Result[ConnectOptions, String] {
     case Some(n) -> n
     case None -> return Err("rabbitmq: LYRIC_CONFIG_MQ_RABBITMQ_PREFETCHCOUNT is not a number")
   }
+  val recoveryText = Str.toLower(envOr("RECOVERY", "true"))
+  val recover = if recoveryText == "true" {
+    true
+  } else if recoveryText == "false" {
+    false
+  } else {
+    return Err("rabbitmq: LYRIC_CONFIG_MQ_RABBITMQ_RECOVERY must be true or false")
+  }
   val base = match optionsFromUrl(url, queueName) { case Ok(o) -> o; case Err(e) -> return Err(e) }
-  tlsFromEnv(base.copy(ackMode = mode, prefetchCount = prefetch))
+  val settled = base.copy(ackMode = mode, prefetchCount = prefetch)
+  tlsFromEnv(if recover { settled } else { settled.withoutRecovery() })
 }
 
 /// Connect using the environment; see `optionsFromEnv` for the variables.
@@ -1582,7 +2034,31 @@ func beginPublish(q: in RabbitMqQueue): Result[Unit, String] {
   q.nacked = newList()
   // Notice a channel or connection the broker closed since the last
   // operation before writing to it.
-  drain(q)
+  match drain(q) {
+    case Ok(_) -> Ok(())
+    case Err(e) -> {
+      if q.lost.length > 0 {
+        Err(e + "; " + NOT_ATTEMPTED)
+      } else {
+        Err(e)
+      }
+    }
+  }
+}
+
+// The error of a publish that had been written, or partly written, when the
+// connection was lost: whether the broker has the message cannot be known.
+// The client does not send it again; that is the caller's decision.
+func afterSend(q: in RabbitMqQueue, e: in String, batch: in Bool): String {
+  if q.lost.length == 0 {
+    return e
+  }
+  if batch {
+    e + "; " + OUTCOME_UNKNOWN +
+      ": the broker may have enqueued none, some or all of the messages it had not confirmed, and none was sent again"
+  } else {
+    e + "; " + OUTCOME_UNKNOWN + ": the broker may or may not have enqueued the message, and it was not sent again"
+  }
 }
 
 /// Publish `message` to `exchange` with `routingKey` and the properties in
@@ -1611,11 +2087,11 @@ pub func publishTo(
     case Ok(_) -> ()
   }
   match sendMessage(q, exchange, routingKey, mandatory, message, base) {
-    case Err(e) -> return Err(e)
+    case Err(e) -> return Err(afterSend(q, e, false))
     case Ok(_) -> ()
   }
   match awaitConfirms(q) {
-    case Err(e) -> return Err(e)
+    case Err(e) -> return Err(afterSend(q, e, false))
     case Ok(_) -> ()
   }
   publishOutcome(q)
@@ -1633,18 +2109,18 @@ func publishBatchLocked(q: in RabbitMqQueue, messages: in slice[Mq.Message]): Re
         if q.lost.length == 0 {
           val _ = awaitConfirms(q)
         }
-        return Err(e)
+        return Err(afterSend(q, e, true))
       }
       case Ok(_) -> ()
     }
     // Take confirms as they come, so neither side's buffer fills up.
     match drain(q) {
-      case Err(e) -> return Err(e)
+      case Err(e) -> return Err(afterSend(q, e, true))
       case Ok(_) -> ()
     }
   }
   match awaitConfirms(q) {
-    case Err(e) -> return Err(e)
+    case Err(e) -> return Err(afterSend(q, e, true))
     case Ok(_) -> ()
   }
   publishOutcome(q)
@@ -1714,6 +2190,7 @@ func subscribeLocked(q: in RabbitMqQueue): Result[Unit, String] {
     case Err(e) -> Err(e)
     case Ok(_) -> {
       q.consuming = true
+      q.wantConsumer = true
       Ok(())
     }
   }
@@ -1731,7 +2208,7 @@ pub func subscribe(q: in RabbitMqQueue): Result[Unit, String] {
 
 // The oldest delivery not yet handed to a handler, waiting up to `waitMs`
 // for one to arrive.
-func nextDeliveryLocked(q: in RabbitMqQueue, waitMs: in Int): Result[Option[Delivery], String] {
+func nextDeliveryLocked(q: in RabbitMqQueue, waitMs: in Int): Result[Option[Handed], String] {
   match subscribeLocked(q) {
     case Err(e) -> return Err(e)
     case Ok(_) -> ()
@@ -1753,10 +2230,10 @@ func nextDeliveryLocked(q: in RabbitMqQueue, waitMs: in Int): Result[Option[Deli
   }
   val delivery = q.backlog[0]
   q.backlog.removeAt(0)
-  Ok(Some(value = delivery))
+  Ok(Some(value = Handed(delivery = delivery, epoch = q.epoch)))
 }
 
-func nextDelivery(q: in RabbitMqQueue, waitMs: in Int): Result[Option[Delivery], String] {
+func nextDelivery(q: in RabbitMqQueue, waitMs: in Int): Result[Option[Handed], String] {
   K.lockEnter(q.lock)
   defer {
     K.lockExit(q.lock)
@@ -1849,12 +2326,19 @@ pub func messageOf(delivery: in Delivery): Result[Mq.Message, String] {
 // Turn a delivery into a tracked message. One this client cannot represent
 // is rejected without requeueing (dead-lettered when the queue has a
 // dead-letter exchange) so it does not block the queue, and reported as an
-// `Err`.
-func admit(q: in RabbitMqQueue, delivery: in Delivery): Result[Mq.Message, String] {
+// `Err`. `Ok(None)`: the delivery's channel was closed or its connection lost
+// between its arrival and now. Its tag means nothing on the present channel
+// (or, worse, names another message there), and the broker has requeued the
+// message, so it is dropped here and arrives again.
+func admit(q: in RabbitMqQueue, handed: in Handed): Result[Option[Mq.Message], String] {
   K.lockEnter(q.lock)
   defer {
     K.lockExit(q.lock)
   }
+  if handed.epoch != q.epoch or q.lost.length > 0 {
+    return Ok(None)
+  }
+  val delivery = handed.delivery
   val decoded: Result[Mq.Message, String] = if delivery.oversize {
     Err(
       "its body of " + delivery.declaredSize.toString() + " bytes exceeds maxMessageBytes (" +
@@ -1887,13 +2371,29 @@ func admit(q: in RabbitMqQueue, delivery: in Delivery): Result[Mq.Message, Strin
     waiting.add(delivery.tag)
     q.inFlight[message.id] = waiting
   }
-  Ok(message)
+  // This is the redelivery of whatever was unsettled under this id.
+  if q.stale.containsKey(message.id) {
+    q.stale.remove(message.id)
+  }
+  Ok(Some(value = message))
 }
 
 // The delivery tag of the oldest unsettled delivery of `messageId`, removed
 // from the in-flight set.
 func takeDelivery(q: in RabbitMqQueue, messageId: in String): Result[Long, String] {
   if not q.inFlight.containsKey(messageId) {
+    if q.stale.containsKey(messageId) {
+      val left = q.stale[messageId] - 1
+      if left > 0 {
+        q.stale[messageId] = left
+      } else {
+        q.stale.remove(messageId)
+      }
+      return Err(
+        "rabbitmq: no unsettled delivery has message id '" + messageId + "': " + STALE_DELIVERY +
+          " and cannot be settled any more; the broker has requeued the message and delivers it again"
+      )
+    }
     return Err("rabbitmq: no unsettled delivery has message id '" + messageId + "'")
   }
   val waiting = q.inFlight[messageId]
@@ -1933,6 +2433,14 @@ func settle(q: in RabbitMqQueue, messageId: in String, how: in Int): Result[Unit
   writeMethod(q, CHANNEL, method)
 }
 
+func isRecovering(q: in RabbitMqQueue): Bool {
+  K.lockEnter(q.lock)
+  defer {
+    K.lockExit(q.lock)
+  }
+  recovering(q)
+}
+
 func isAuto(q: in RabbitMqQueue): Bool {
   match q.options.ackMode {
     case Auto -> true
@@ -1970,6 +2478,11 @@ func closeLocked(q: in RabbitMqQueue): Unit {
     return
   }
   q.closed = true
+  // A recovery attempt in progress fails at once without its socket.
+  for s in q.attemptSocks.toArray() {
+    K.sockClose(s)
+  }
+  q.attemptSocks = newList()
   if q.lost.length > 0 {
     return
   }
@@ -2000,10 +2513,13 @@ impl Mq.QueueConsumer for RabbitMqQueue {
   {
     val deadline = K.monotonicMillis() + timeoutMs.toLong()
     var first = true
+    // The error of a connection that is being re-established: the consume
+    // waits for it within its timeout and reports this when the time is up.
+    var disconnected = ""
     while true {
       val remaining = deadline - K.monotonicMillis()
       if not first and remaining <= 0i64 {
-        return Err("timeout")
+        return if disconnected.length > 0 { Err(disconnected) } else { Err("timeout") }
       }
       first = false
       val wait = if remaining <= 0i64 {
@@ -2014,20 +2530,37 @@ impl Mq.QueueConsumer for RabbitMqQueue {
         remaining.toInt()
       }
       match nextDelivery(self, wait) {
-        case Err(e) -> return Err(e)
-        case Ok(None) -> ()
-        case Ok(Some(delivery)) -> {
-          val message = match admit(self, delivery) { case Ok(m) -> m; case Err(e) -> return Err(e) }
-          val outcome = handler(message)
-          if not isAuto(self) {
-            return outcome
+        case Err(e) -> {
+          if not isRecovering(self) {
+            return Err(e)
           }
-          match outcome {
-            case Ok(_) -> return settle(self, message.id, 0)
-            case Err(e) -> {
-              return match settle(self, message.id, 2) {
-                case Ok(_) -> Err(e)
-                case Err(requeueError) -> Err(e + " (and requeueing the message failed: " + requeueError + ")")
+          disconnected = e
+          val left = deadline - K.monotonicMillis()
+          if left > 0i64 {
+            K.sleepMs(if left > RECOVERY_POLL_MS.toLong() { RECOVERY_POLL_MS } else { left.toInt() })
+          }
+        }
+        case Ok(None) -> {
+          disconnected = ""
+        }
+        case Ok(Some(handed)) -> {
+          disconnected = ""
+          match admit(self, handed) {
+            case Err(e) -> return Err(e)
+            case Ok(None) -> ()
+            case Ok(Some(message)) -> {
+              val outcome = handler(message)
+              if not isAuto(self) {
+                return outcome
+              }
+              match outcome {
+                case Ok(_) -> return settle(self, message.id, 0)
+                case Err(e) -> {
+                  return match settle(self, message.id, 2) {
+                    case Ok(_) -> Err(e)
+                    case Err(requeueError) -> Err(e + " (and requeueing the message failed: " + requeueError + ")")
+                  }
+                }
               }
             }
           }
@@ -2073,6 +2606,78 @@ func replyNameFor(request: in Amqp.Method): String {
   }
 }
 
+// Whether the earlier request `made` still stands after `m`: a deletion
+// takes the declaration and the bindings of what it deletes with it, and a
+// declaration or binding replaces an earlier one of the same thing.
+func survives(made: in Amqp.Method, m: in Amqp.Method): Bool {
+  match m {
+    case ExchangeDeclare(name, _, passive, _, _, _, _) -> match made {
+      case ExchangeDeclare(other, _, _, _, _, _, _) -> passive or
+        other !=
+          name
+      case _ -> true
+    }
+    case ExchangeDelete(name, _) -> match made {
+      case ExchangeDeclare(other, _, _, _, _, _, _) -> other != name
+      case QueueBind(_, exchange, _, _) -> exchange != name
+      case _ -> true
+    }
+    case QueueDeclare(name, passive, _, _, _, _) -> match made {
+      case QueueDeclare(other, _, _, _, _, _) -> passive or
+        other != name
+      case _ -> true
+    }
+    case QueueDelete(name, _, _) -> match made {
+      case QueueDeclare(other, _, _, _, _, _) -> other != name
+      case QueueBind(queue, _, _, _) -> queue != name
+      case _ -> true
+    }
+    case QueueBind(queue, exchange, key, arguments) -> match made {
+      case QueueBind(otherQueue, otherExchange, otherKey, otherArguments) -> {
+        not (otherQueue == queue and otherExchange == exchange and otherKey == key and sameTable(otherArguments, arguments))
+      }
+      case _ -> true
+    }
+    case _ -> true
+  }
+}
+
+func sameTable(a: in slice[Amqp.TableEntry], b: in slice[Amqp.TableEntry]): Bool {
+  match Amqp.encodeTable(a) {
+    case Ok(left) -> match Amqp.encodeTable(b) {
+      case Ok(right) -> encodeHex(left) == encodeHex(right)
+      case Err(_) -> false
+    }
+    case Err(_) -> false
+  }
+}
+
+// Whether recovery has to repeat `m`: a declaration that is not a mere check,
+// or a binding.
+func restorable(m: in Amqp.Method): Bool {
+  match m {
+    case ExchangeDeclare(_, _, passive, _, _, _, _) -> not passive
+    case QueueDeclare(_, passive, _, _, _, _) -> not passive
+    case QueueBind(_, _, _, _) -> true
+    case _ -> false
+  }
+}
+
+// Keep the record of what this client has set up on the broker in step with
+// a request the broker accepted, for recovery to repeat.
+func remember(q: in RabbitMqQueue, m: in Amqp.Method): Unit {
+  val kept: List[Amqp.Method] = newList()
+  for made in q.topology.toArray() {
+    if survives(made, m) {
+      kept.add(made)
+    }
+  }
+  if restorable(m) {
+    kept.add(m)
+  }
+  q.topology = kept
+}
+
 /// Send one of the exchange and queue management methods
 /// (`exchange.declare`, `exchange.delete`, `queue.declare`, `queue.bind`,
 /// `queue.purge`, `queue.delete`) on the connection's channel and return the
@@ -2095,14 +2700,20 @@ pub func request(q: in RabbitMqQueue, method: in Amqp.Method): Result[Amqp.Metho
     case Err(e) -> return Err(e)
     case Ok(_) -> ()
   }
-  rpc(q, CHANNEL, method, expected, true)
+  match rpc(q, CHANNEL, method, expected, true) {
+    case Err(e) -> Err(e)
+    case Ok(reply) -> {
+      remember(q, method)
+      Ok(reply)
+    }
+  }
 }
 
 /// Send a heartbeat frame and handle whatever the broker has sent since the
-/// last operation (its heartbeats, deliveries, a close). An application that
-/// negotiated a heartbeat and sits idle between operations calls this at
-/// least once per interval; without a heartbeat it is a cheap liveness probe
-/// for a connection that may have been closed.
+/// last operation (its heartbeats, deliveries, a close): a liveness probe.
+/// With a heartbeat the background thread does this on its own; without one
+/// (`heartbeatSeconds = 0`) this is how an application finds out that an idle
+/// connection has been closed.
 pub func keepAlive(q: in RabbitMqQueue): Result[Unit, String] {
   K.lockEnter(q.lock)
   defer {
@@ -2162,7 +2773,123 @@ pub func blockedReason(q: in RabbitMqQueue): String {
   q.blocked
 }
 
-/// True until `close` is called or the connection is lost.
+/// Where a connection stands.
+pub union ConnectionState {
+  /// Up: operations reach the broker.
+  case Connected
+  /// Lost, and the background thread is re-establishing it; `failedAttempts`
+  /// attempts have failed since the loss.
+  case Reconnecting(failedAttempts: Int)
+  /// Lost for good: recovery is off, the broker's refusal is permanent, or
+  /// `maxAttempts` attempts failed. `reason` says which.
+  case Lost(reason: String)
+  /// `close` was called.
+  case Closed
+}
+
+/// Where the connection stands now.
+pub func connectionState(q: in RabbitMqQueue): ConnectionState {
+  K.lockEnter(q.lock)
+  defer {
+    K.lockExit(q.lock)
+  }
+  if q.closed {
+    Closed
+  } else if q.lost.length == 0 {
+    Connected
+  } else if recovering(q) {
+    Reconnecting(failedAttempts = q.failedAttempts)
+  } else {
+    Lost(reason = withoutLostPrefix(lostText(q)))
+  }
+}
+
+/// How often the connection has been re-established since `connectWith`.
+pub func recoveryCount(q: in RabbitMqQueue): Int {
+  K.lockEnter(q.lock)
+  defer {
+    K.lockExit(q.lock)
+  }
+  q.recoveries
+}
+
+/// Wait at most `timeoutMs` milliseconds for a connection that is being
+/// re-established. `Ok` as soon as it is up (at once when it already is);
+/// `Err` when the time runs out first, or when it is closed or lost for good.
+pub func awaitConnected(q: in RabbitMqQueue, timeoutMs: in Int): Result[Unit, String]
+  requires: timeoutMs >= 0
+{
+  val deadline = K.monotonicMillis() + timeoutMs.toLong()
+  while true {
+    K.lockEnter(q.lock)
+    val state: Result[Unit, String] = if q.closed {
+      Err("rabbitmq: the connection is closed")
+    } else if q.lost.length > 0 {
+      Err(lostText(q))
+    } else {
+      Ok(())
+    }
+    val waiting = recovering(q)
+    K.lockExit(q.lock)
+    match state {
+      case Ok(_) -> return Ok(())
+      case Err(e) -> {
+        val left = deadline - K.monotonicMillis()
+        if not waiting or left <= 0i64 {
+          return Err(e)
+        }
+        K.sleepMs(if left > RECOVERY_POLL_MS.toLong() { RECOVERY_POLL_MS } else { left.toInt() })
+      }
+    }
+  }
+  Err("rabbitmq: the connection is closed")
+}
+
+/// Whether the connection's background thread (heartbeats and recovery) is
+/// running. It ends within a moment of `close`, or of the connection being
+/// lost for good.
+pub func backgroundRunning(q: in RabbitMqQueue): Bool {
+  K.lockEnter(q.lock)
+  defer {
+    K.lockExit(q.lock)
+  }
+  q.background
+}
+
+/// Close the socket under the connection without telling the client, as a
+/// network failure would. The client finds out the way it would then: on its
+/// next read or write, or from the background thread within a moment. For
+/// testing how an application behaves across a reconnect.
+pub func abortTransport(q: in RabbitMqQueue): Unit {
+  K.lockEnter(q.lock)
+  defer {
+    K.lockExit(q.lock)
+  }
+  if not q.closed and q.lost.length == 0 {
+    K.sockClose(q.sock)
+  }
+}
+
+/// True when `error` comes from a connection that is being re-established.
+pub func isReconnecting(error: in String): Bool {
+  Str.contains(error, RECONNECTING)
+}
+
+/// True when `error` says that nothing was written to the broker because the
+/// connection was down: repeating the operation later is safe.
+pub func isNotAttempted(error: in String): Bool {
+  Str.contains(error, NOT_ATTEMPTED)
+}
+
+/// True when `error` is that of a publish the connection was lost under: the
+/// broker may or may not have the message. Publishing it again can duplicate
+/// it; not publishing it again can lose it.
+pub func isOutcomeUnknown(error: in String): Bool {
+  Str.contains(error, OUTCOME_UNKNOWN)
+}
+
+/// True while the connection is up: until `close` is called or the
+/// connection is lost, and again once it has been re-established.
 pub func isOpen(q: in RabbitMqQueue): Bool {
   K.lockEnter(q.lock)
   defer {

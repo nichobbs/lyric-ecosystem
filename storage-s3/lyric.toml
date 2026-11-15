@@ -22,6 +22,7 @@ output_assembly = "Storage.S3.dll"
 [project.tests]
 "Storage.S3.SigV4Tests" = "tests/sigv4_tests.l"
 "Storage.S3.WireTests"  = "tests/wire_tests.l"
+"Storage.S3.ReadmeTests" = "tests/readme_tests.l"
 # The conformance suite and the backend's own behaviour over real HTTP, against
 # an in-process S3 server (tests/fake_s3_tests.l) that verifies every signature.
 "Storage.S3.FakeS3Tests" = "tests/fake_s3_tests.l"
@@ -40,3 +41,6 @@ integration = []   # run tests/integration against the server named by LYRIC_S3_
 "Lyric.Storage" = { workspace = true }
 # AWS Signature Version 4, shared with the other AWS backends in this repository.
 "Lyric.Aws.SigV4" = { workspace = true }
+# Credential providers (environment, shared files, container, IMDS, web
+# identity, the default chain, the refreshing cache) and the retry policy.
+"Lyric.Aws.Credentials" = { workspace = true }
