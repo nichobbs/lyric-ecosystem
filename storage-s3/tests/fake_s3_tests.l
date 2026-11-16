@@ -1407,18 +1407,6 @@ func roundTrip(cfg: in S3Config, key: in String): String {
   }
 }
 
-// `Std.Tls` reads the first certificate of a PEM text on dotnet and the JVM and
-// all of them on native (OpenSSL).
-@cfg(not(target = "native"))
-func wholePemTextIsTrusted(): Bool {
-  false
-}
-
-@cfg(target = "native")
-func wholePemTextIsTrusted(): Bool {
-  true
-}
-
 func tlsScenario(endpoint: in String): String {
   val base = configFor(endpoint, "tls")
   var text = "additive=" + roundTrip(base.withCaCertificate(FIXTURE_CA_PEM), "a")
@@ -1430,8 +1418,7 @@ func tlsScenario(endpoint: in String): String {
   text = text + "\notherExclusive=" + roundTrip(base.withExclusiveCaCertificate(FIXTURE_OTHER_CA_PEM), "f")
   // The refused handshakes did not break the server or reach it.
   text = text + "\nafter=" + roundTrip(base.withCaCertificate(FIXTURE_CA_PEM), "g")
-  // A PEM text with several certificates: the first one is the one trusted
-  // on dotnet and the JVM, every one of them on native.
+  // A PEM text with several certificates: every one of them is trusted.
   text = text + "\nbundleSecond=" + roundTrip(base.withCaCertificate(FIXTURE_OTHER_CA_PEM + FIXTURE_CA_PEM), "h")
   text = text + "\nbundleFirst=" + roundTrip(base.withCaCertificate(FIXTURE_CA_PEM + FIXTURE_OTHER_CA_PEM), "i")
   text + "\n" + stopFakeTls(endpoint)
@@ -1447,22 +1434,11 @@ test "an HTTPS server with a private CA is reachable with withCaCertificate, and
   assertTrue(lines[4].startsWith("otherAdditive=CONNECTION_FAILED "), "a CA that did not sign it: " + lines[4])
   assertTrue(lines[5].startsWith("otherExclusive=CONNECTION_FAILED "), "only a CA that did not sign it: " + lines[5])
   assertEqual(lines[6], "after=ok", "the server still serves after refused handshakes")
-  if wholePemTextIsTrusted() {
-    assertEqual(lines[7], "bundleSecond=ok", "native trusts every certificate of the PEM text")
-  } else {
-    assertTrue(
-      lines[7].startsWith("bundleSecond=CONNECTION_FAILED "),
-      "the CA as the second certificate of the PEM text is not read: " + lines[7]
-    )
-  }
+  assertEqual(lines[7], "bundleSecond=ok", "every certificate of the PEM text is trusted")
   assertEqual(lines[8], "bundleFirst=ok", "the first certificate of the PEM text is trusted")
   // A round trip is two signed requests; nothing but the trusted clients'
   // requests got through.
-  assertEqual(
-    lines[9],
-    if wholePemTextIsTrusted() { "served 12" } else { "served 10" },
-    "only the trusted clients' requests reached the server"
-  )
+  assertEqual(lines[9], "served 12", "only the trusted clients' requests reached the server")
 }
 
 test "a CA certificate that is not a PEM certificate is INVALID_CONFIG before any request" {

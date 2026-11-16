@@ -2,13 +2,13 @@
 
 `Session.SessionStore` (from `Lyric.Session` in lyric-lang) on a Redis server, built on the pure-Lyric
 `Lyric.Redis` client of this repository. Every read-modify-write is one Lua script, so concurrent
-requests on a session lose no update and `set` can never create a session. It runs on `dotnet` and
-`jvm` and is `experimental` (0.1.0).
+requests on a session lose no update and `set` can never create a session. It runs on `dotnet`,
+`jvm` and `native` and is `experimental` (0.1.0).
 
 | | |
 |---|---|
 | Lyric packages | `Session.Redis` (the store), `Session.Redis.Admin` (Redis-only operations) |
-| Targets | `dotnet`, `jvm` |
+| Targets | `dotnet`, `jvm`, `native` (Linux x86-64) |
 | Stability | experimental (0.1.0) |
 | Interface | `Lyric.Session` (`Session.SessionStore`), re-exported with `pub use Session`; conformance suite `Testing.Conformance.Session` from `Lyric.Conformance` |
 | Third-party libraries | none; `Lyric.Redis` (`redis/` in this repository) is a `{ workspace = true }` dependency, and so is `Lyric.Net` (`net/`), which `Lyric.Redis` connects through and whose `Net.Tcp.Testing` the tests use |
@@ -216,6 +216,7 @@ the same name.
 # Hermetic (no Redis needed): session ids, key naming, malformed ids, behaviour with Redis unreachable
 lyric test --manifest session-redis/lyric.toml --target dotnet
 lyric test --manifest session-redis/lyric.toml --target jvm
+lyric test --manifest session-redis/lyric.toml --target native
 
 # Integration: the SessionStore conformance suite (RESP2, RESP3, and over TLS with a client
 # certificate) and backend tests against a real server
@@ -224,7 +225,11 @@ export LYRIC_REDIS_URL=redis://127.0.0.1:16379
 eval "$(scripts/ci/start-redis-tls.sh)"
 lyric test --manifest session-redis/lyric.toml --target dotnet --features integration
 lyric test --manifest session-redis/lyric.toml --target jvm --features integration
+lyric test --manifest session-redis/lyric.toml --target native --features integration
 ```
+
+`bash scripts/ci/test-native.sh [--integration]` runs every package that claims `native`, as the
+`native` CI job does.
 
 Run from the repository root. The integration module is compiled only with `--features integration`
 and fails with a message naming the variable when one is unset:

@@ -235,7 +235,7 @@ prefetch window delivers the next message before the previous one is acknowledge
 | `deduplication` | `Deduplication.ById` | FIFO: `ById`, `Unique` or `ContentBased` (`withDeduplication`) |
 | `deadLetterQueueUrl` | `""` | where `nack(id, false)` copies a message before deleting it (`withDeadLetterQueue`) |
 | `maxBatchBytes` | 262144 | the largest `SendMessageBatch` request |
-| `additionalCaCertificatePem` | `""` | a certificate authority (PEM text, one certificate) trusted in addition to the system trust store (`withCaCertificate(pem)`, `withCaCertificateFile(path)`) |
+| `additionalCaCertificatePem` | `""` | a certificate authority (PEM text, one or more certificates) trusted in addition to the system trust store (`withCaCertificate(pem)`, `withCaCertificateFile(path)`) |
 | `caCertificatePem` | `""` | the only certificate authority the server certificate may chain to; the system trust store is not consulted, and it wins over `additionalCaCertificatePem` (`withExclusiveCaCertificate(pem)`, `withExclusiveCaCertificateFile(path)`) |
 
 `connectWith` and `openClient` make no request; they return `Err` (`INVALID_CONFIG` for
@@ -419,19 +419,12 @@ Waiting and failures:
   transport failure; `publishBatch` treats it as unknown too, because a connection can also break
   after the request was sent. A slow `ReceiveMessage` is never reported as the interface's
   `"timeout"`, which only means the queue had nothing.
-- **Only the first certificate of the PEM text is read on `dotnet` and `jvm`; `native` reads all of
-  them.** `withCaCertificate` and `withExclusiveCaCertificate` take one certificate authority, not
-  a bundle: in a file with several certificates the managed targets ignore the others, and
-  `native` (OpenSSL) trusts every one of them. The difference is the standard library's
-  (`Std.Tls.Certificate.fromPem`); there is no lyric-lang issue for it yet. Pass one certificate,
-  the authority that signed the server certificate (for a self-signed server, its own
-  certificate), and the three targets agree.
 - **An untrusted server certificate is `CONNECTION_FAILED`, and the message differs by target.** On
   the JVM it names the cause (`PKIX path building failed: ... unable to find valid certification path
   to requested target`); on dotnet it is only `The SSL connection could not be established, see inner
   exception`; on native it is OpenSSL's (`TLS handshake failed: ... certificate verify failed`). The
-  code is the same, and so are the CA options: every target accepts the same PEM, and with a PEM of
-  one certificate they behave the same in the hermetic and integration suites.
+  code is the same, and so are the CA options: every target accepts the same PEM, a PEM text with
+  several certificates trusts all of them, and the hermetic and integration suites behave the same.
 - **A CA certificate is for the endpoint and for every queue URL the client is used with**: there is
   one HTTP client per `SqsClient`. On an `http://` (loopback) endpoint the option is validated and
   then has nothing to verify.
@@ -477,8 +470,8 @@ Waiting and failures:
   not delete them.
 - **The clock matters.** SQS refuses a request whose `x-amz-date` is more than 15 minutes off.
 
-Differences between the targets, besides the ones above (text that is not well formed, a PEM text
-with several certificates, the wording of a TLS failure, a credential provider that panics): one,
+Differences between the targets, besides the ones above (text that is not well formed, the wording of
+a TLS failure, a credential provider that panics): one,
 inherited from the compiler. On `jvm` and `native`, `publishBatch` with an empty message id panics
 with `PreconditionViolated` (the interface's `requires: allHaveIds(messages)` is enforced); on
 `dotnet` the inherited clause is not enforced and the call returns `Err("sqs: empty message id")`.
@@ -608,15 +601,11 @@ There is no third-party library (`[nuget]` and `[maven]` are empty). What the su
 
 ## Known gaps
 
-- **`native` differs from the managed targets in four places**, all described under Surprises: a
+- **`native` differs from the managed targets in three places**, all described under Surprises: a
   panic ends the process, whether it comes from a credential provider an application wrote or from
   the interface's `requires:` clause on `publishBatch`; a `String` is UTF-8 bytes, so text that is
   not well formed is a different thing and is treated differently (the one place that reads the
-  characters of a string is `Mq.Sqs.Text`, one package in two files selected by `@cfg`);
-  `withCaCertificate` / `withExclusiveCaCertificate` (and so `AWS_CA_BUNDLE` / `ca_bundle`) trust
-  every certificate of a PEM text with several, where `dotnet` and `jvm` trust the first only (a
-  difference in `Std.Tls`, observed by `storage-s3`'s hermetic suite for the same call;
-  nichobbs/lyric-lang#9146); and the text of a `CONNECTION_FAILED` message is the standard library's
+  characters of a string is `Mq.Sqs.Text`, one package in two files selected by `@cfg`); and the text of a `CONNECTION_FAILED` message is the standard library's
   and OpenSSL's. `native` has been built and run on Linux x86-64 only, and a native program that
   talks HTTPS needs OpenSSL 3 (`libssl.so.3`) at run time. It needs a `lyric-lang` with the fix of
   nichobbs/lyric-lang#9136, which the commit in `.lyric-lang-rev` has.

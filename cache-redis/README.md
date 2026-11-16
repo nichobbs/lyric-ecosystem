@@ -1,12 +1,12 @@
 # Lyric.Cache.Redis
 
 `Cache.CacheStore` (from `Lyric.Cache` in lyric-lang) on a Redis server, built on the pure-Lyric
-`Lyric.Redis` client of this repository. It runs on `dotnet` and `jvm` and is `experimental` (0.1.0).
+`Lyric.Redis` client of this repository. It runs on `dotnet`, `jvm` and `native` and is `experimental` (0.1.0).
 
 | | |
 |---|---|
 | Lyric packages | `Cache.Redis` (the store), `Cache.Redis.Extras` (Redis-only operations) |
-| Targets | `dotnet`, `jvm` |
+| Targets | `dotnet`, `jvm`, `native` (Linux x86-64) |
 | Stability | experimental (0.1.0) |
 | Interface | `Lyric.Cache` (`Cache.CacheStore`), re-exported with `pub use Cache`; conformance suite `Testing.Conformance.Cache` from `Lyric.Conformance` |
 | Third-party libraries | none; `Lyric.Redis` (`redis/` in this repository) is a `{ workspace = true }` dependency, and so is `Lyric.Net` (`net/`), which `Lyric.Redis` connects through and whose `Net.Tcp.Testing` the tests use |
@@ -139,6 +139,12 @@ Keys and values:
 - **An empty string is a value.** `set(k, "", 0)` followed by `get(k)` is `Some("")`.
 - **An empty key or a negative TTL panics** with a contract violation, as the interface's `requires:`
   clauses say; it is not swallowed like a Redis failure.
+- **`native` differs from the managed targets in three ways a user meets.** A panic (a violated
+  `requires:` clause such as an empty key, or a panicking application callback) cannot be caught
+  there: it prints its message and ends the process, where on `dotnet` and `jvm` it unwinds. The text
+  of a TLS or connect failure is OpenSSL's (`certificate verify failed`, ...), not `SslStream`'s or
+  JSSE's; the error kinds are the same. And `native` is built and run on Linux x86-64 only, with
+  OpenSSL 3 (`libssl.so.3`) needed at run time for TLS.
 
 Expiry and eviction:
 
@@ -177,6 +183,7 @@ functions described under Usage.
 # Hermetic (no Redis needed): key naming, option validation, behaviour with Redis unreachable
 lyric test --manifest cache-redis/lyric.toml --target dotnet
 lyric test --manifest cache-redis/lyric.toml --target jvm
+lyric test --manifest cache-redis/lyric.toml --target native
 
 # Integration: the CacheStore conformance suite and backend tests against a real server, and the
 # conformance suite a second time over TLS with a client certificate
@@ -185,7 +192,11 @@ export LYRIC_REDIS_URL=redis://127.0.0.1:16379
 eval "$(scripts/ci/start-redis-tls.sh)"
 lyric test --manifest cache-redis/lyric.toml --target dotnet --features integration
 lyric test --manifest cache-redis/lyric.toml --target jvm --features integration
+lyric test --manifest cache-redis/lyric.toml --target native --features integration
 ```
+
+`bash scripts/ci/test-native.sh [--integration]` runs every package that claims `native`, as the
+`native` CI job does.
 
 Run from the repository root. The integration module is compiled only with `--features integration`
 and fails with a message naming the variable when one is unset:
