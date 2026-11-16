@@ -181,7 +181,7 @@ credentials from the application's `config { }` block or the environment, never 
 | `requestTimeoutMs` | `.withRequestTimeout(ms)` | 30000 | Deadline of each attempt; must be positive |
 | `credentialProvider` | `.withCredentialProvider(provider)` | `None` | An `Aws.Credentials.CredentialProvider` asked for the credentials of every attempt, instead of the three fields above. Wrap a provider that calls a service or reads a file in `Aws.Credentials.cached` |
 | `retry` | `.withRetry(policy)`, `.withoutRetries()` | `Aws.Retry.standardRetry()`: 3 attempts, waits of up to 100 ms and 200 ms | When a failed request is sent again; `maxAttempts` must be at least 1 |
-| `additionalCaCertificatePem` | `.withCaCertificate(pem)`, `.withCaCertificateFile(path)` | `""` | A certificate authority (PEM text, one certificate) trusted in addition to the system trust store |
+| `additionalCaCertificatePem` | `.withCaCertificate(pem)`, `.withCaCertificateFile(path)` | `""` | A certificate authority (PEM text, one or more certificates) trusted in addition to the system trust store |
 | `caCertificatePem` | `.withExclusiveCaCertificate(pem)`, `.withExclusiveCaCertificateFile(path)` | `""` | The only certificate authority the server certificate may chain to; the system trust store is not consulted. Wins over `additionalCaCertificatePem` |
 
 TLS: an `https://` endpoint's certificate is verified against the system trust store and must carry
@@ -258,19 +258,12 @@ Connecting and addressing:
 - **A CA certificate applies to the client's own requests only.** A presigned URL is fetched by
   whoever receives it, with their own trust store. On an `http://` (loopback) endpoint the option is
   validated and then has nothing to verify.
-- **Only the first certificate of the PEM text is read on `dotnet` and `jvm`; `native` reads all of
-  them.** `withCaCertificate` and `withExclusiveCaCertificate` take one certificate authority, not
-  a bundle: in a file with several certificates the managed targets ignore the others, and
-  `native` (OpenSSL) trusts every one of them. The difference is the standard library's
-  (`Std.Tls.Certificate.fromPem`); there is no lyric-lang issue for it yet. Pass one certificate,
-  the authority that signed the server certificate (for a self-signed server, its own
-  certificate), and the three targets agree.
 - **An untrusted server certificate is `CONNECTION_FAILED`, and the message differs by target.** On
   the JVM it names the cause (`PKIX path building failed: ... unable to find valid certification path
   to requested target`); on dotnet it is only `The SSL connection could not be established, see inner
   exception`; on native it is OpenSSL's (`TLS handshake failed: ... certificate verify failed`). The
-  code is the same, and so are the CA options: every target accepts the same PEM, and with a PEM of
-  one certificate they behave the same in the hermetic and integration suites.
+  code is the same, and so are the CA options: every target accepts the same PEM, a PEM text with
+  several certificates trusts all of them, and the hermetic and integration suites behave the same.
 - **Bucket names are validated to today's S3 rules**, so a legacy bucket with uppercase letters or
   underscores cannot be opened.
 
@@ -504,13 +497,10 @@ hand.
 
 ## Known gaps
 
-- **`native` differs from the managed targets in three places**, all described under Surprises: a
+- **`native` differs from the managed targets in two places**, both described under Surprises: a
   panic ends the process, whether it comes from a credential provider an application wrote or from
-  a violated `requires:` clause of the interface; `withCaCertificate` /
-  `withExclusiveCaCertificate` (and so `AWS_CA_BUNDLE` / `ca_bundle`) trust every certificate of a
-  PEM text with several, where `dotnet` and `jvm` trust the first only (a difference in
-  `Std.Tls`, nichobbs/lyric-lang#9146); and the text of a `CONNECTION_FAILED` message is the
-  standard library's and OpenSSL's. `native` has been built and run on Linux x86-64 only, and a
+  a violated `requires:` clause of the interface; and the text of a `CONNECTION_FAILED` message is
+  the standard library's and OpenSSL's. `native` has been built and run on Linux x86-64 only, and a
   native program that talks HTTPS needs OpenSSL 3 (`libssl.so.3`) at run time. It needs a
   `lyric-lang` with the fix of nichobbs/lyric-lang#9136, which the commit in `.lyric-lang-rev` has.
 - Objects are held in memory whole, as the interface's base64 payloads require: no multipart

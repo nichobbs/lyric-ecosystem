@@ -1,13 +1,13 @@
 # Lyric.Cache.Memcached
 
 `Cache.CacheStore` (from `Lyric.Cache` in lyric-lang) on a memcached server, through a client for
-memcached's meta text protocol written in Lyric. It runs on `dotnet` and `jvm` and is `experimental`
+memcached's meta text protocol written in Lyric. It runs on `dotnet`, `jvm` and `native` and is `experimental`
 (0.1.0).
 
 | | |
 |---|---|
 | Lyric packages | `Cache.Memcached` (the store), `Cache.Memcached.Extras` (memcached-only operations), `Cache.Memcached.Client` (the connection), `Cache.Memcached.Meta` (the protocol codec), `Cache.Memcached.Keys` (key and TTL mapping), `Cache.Memcached.Url` |
-| Targets | `dotnet`, `jvm` |
+| Targets | `dotnet`, `jvm`, `native` (Linux x86-64) |
 | Stability | experimental (0.1.0) |
 | Interface | `Lyric.Cache` (`Cache.CacheStore`), re-exported with `pub use Cache`; conformance suite `Testing.Conformance.Cache` from `Lyric.Conformance` |
 | Server | memcached 1.6.10 or later (the first release with the stable meta protocol and base64 keys); tested against 1.6.24 |
@@ -296,9 +296,12 @@ Connection and server:
 - **`Client.flushAll` empties the whole server**: every namespace and every other application's
   entries. It exists for test suites on a disposable server and is not used by the store.
 
-Between targets: none known. The stored keys are identical (the SHA-256 form is lower-case on both),
-so `dotnet` and `jvm` processes share a namespace. The text of a `TlsFailed` or `ConnectFailed` error
-comes from the platform (`SslStream` or JSSE) and differs.
+Between targets: the stored keys are identical (the SHA-256 form is lower-case on every target), so
+`dotnet`, `jvm` and `native` processes share a namespace. The text of a `TlsFailed` or `ConnectFailed`
+error comes from the platform (`SslStream`, JSSE or OpenSSL) and differs. On `native` a panic (an
+empty key or a negative TTL, or a panicking application callback) cannot be caught: it prints its
+message and ends the process, where on `dotnet` and `jvm` it unwinds. `native` is built and run on
+Linux x86-64 only, with OpenSSL 3 (`libssl.so.3`) needed at run time for TLS.
 
 ## Backend-specific module
 
@@ -327,12 +330,17 @@ functions; `Cache.Memcached.Client` adds `ping`, `serverVersion` and `flushAll` 
 # memcached with a clock the tests move
 lyric test --manifest cache-memcached/lyric.toml --target dotnet
 lyric test --manifest cache-memcached/lyric.toml --target jvm
+lyric test --manifest cache-memcached/lyric.toml --target native
 
 # Integration: the conformance suite (plain and over TLS) and backend tests against real servers
 eval "$(scripts/ci/start-memcached.sh)"
 lyric test --manifest cache-memcached/lyric.toml --target dotnet --features integration
 lyric test --manifest cache-memcached/lyric.toml --target jvm --features integration
+lyric test --manifest cache-memcached/lyric.toml --target native --features integration
 ```
+
+`bash scripts/ci/test-native.sh [--integration]` runs every package that claims `native`, as the
+`native` CI job does (it starts memcached with `scripts/ci/start-memcached.sh` first).
 
 Run from the repository root. The integration module is compiled only with `--features integration`
 and fails with a message naming the variable when one is unset:

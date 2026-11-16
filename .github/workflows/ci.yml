@@ -195,8 +195,9 @@ jobs:
 
   # The packages that claim `native` in `[package] targets`, built with the
   # LLVM backend and run as native executables, then the ones with an
-  # integration suite against real services: Redis (plain and TLS), MinIO and
-  # ElasticMQ, started as in the `integration` job.
+  # integration suite against real services: Redis (plain and TLS), memcached
+  # (plain, TLS and authentication), MinIO and ElasticMQ, started as in the
+  # `integration` job.
   native:
     name: native
     runs-on: ubuntu-latest
@@ -258,6 +259,10 @@ jobs:
       - name: Start ElasticMQ
         working-directory: lyric-ecosystem
         run: bash scripts/ci/start-elasticmq.sh
+
+      - name: Start memcached
+        working-directory: lyric-ecosystem
+        run: bash scripts/ci/start-memcached.sh
 
       - name: Test packages on native against the services
         working-directory: lyric-ecosystem

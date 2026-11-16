@@ -39,7 +39,7 @@ That is expected and legitimate. Handle it as follows.
 
 1. **The target-neutral interface stays in `lyric-lang`.** `JobScheduler`, `MessageQueue`,
    `StorageBucket`, `CacheStore` and friends are defined there with a conformance suite in
-   `lyric-testing`. A backend here implements the interface; it does not redefine it.
+   `Lyric.Conformance` (`lyric-conformance/` in `lyric-lang`). A backend here implements the interface; it does not redefine it.
 2. **Name by interface and backend**: `lyric-jobs-quartz`, `lyric-mq-rabbitmq`, `lyric-storage-s3`.
 3. **Declare supported targets in the manifest.** Each backend's `lyric.toml` carries `[package]
    targets = ["jvm"]` (subset of `dotnet`, `jvm`, `native`; lyric-lang#9030, D603), mirrored in the
