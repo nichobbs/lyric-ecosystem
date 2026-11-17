@@ -1,0 +1,41 @@
+[package]
+name        = "Lyric.AwsXRay"
+version     = "0.1.0"
+stability   = "experimental"
+authors     = ["Lyric Contributors"]
+license     = "MIT"
+description = "AWS X-Ray active tracing aspect for Lyric Lambda handlers, over the AWS X-Ray recorder SDKs."
+targets     = ["dotnet", "jvm"]
+
+[features]
+# `local` is the default so that a plain `lyric build`/`lyric test` needs no SDK:
+# subsegments are silently dropped. Select exactly one of `aws` or `jvm`
+# (with `--no-default-features`) for a build that records.
+default = ["local"]
+# .NET production: Amazon.XRay.Recorder.Core (NuGet AWSXRayRecorder.Core).
+aws   = []
+# JVM production: com.amazonaws:aws-xray-recorder-sdk-core.
+jvm   = []
+# Local development: subsegments are silently dropped (no X-Ray daemon needed).
+local = []
+
+[project]
+name            = "Lyric.AwsXRay"
+output          = "single"
+output_assembly = "AwsXRay.dll"
+
+[project.tests]
+"AwsXRay.XRayTests" = "tests/xray_tests.l"
+
+[project.packages]
+# All X-Ray functionality in a single package. The extern boundaries are
+# embedded in xray.l and selected by @cfg(feature = X).
+"AwsXRay" = "src/xray.l"
+
+[nuget]
+# The package ID is "AWSXRayRecorder.Core"; the .NET namespace is
+# "Amazon.XRay.Recorder.Core", which is not a package ID.
+"AWSXRayRecorder.Core" = { version = "2.14.0", features = ["aws"] }
+
+[maven]
+"com.amazonaws:aws-xray-recorder-sdk-core" = { version = "2.15.3", features = ["jvm"] }

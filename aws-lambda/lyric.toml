@@ -1,0 +1,73 @@
+[package]
+name        = "Lyric.Lambda"
+version     = "0.1.0"
+stability   = "experimental"
+authors     = ["Lyric Contributors"]
+license     = "MIT"
+description = "AWS Lambda runtime adapter with typed event sources, authorizers, and AOT support, in pure Lyric (custom runtime loop over Std.Http)."
+targets     = ["dotnet", "jvm"]
+
+[features]
+# Exactly one of these should be active per build; it selects the `serve()`
+# transport.
+# Production: HTTP long-polling custom runtime loop (Lambda.Dispatch) against
+# $AWS_LAMBDA_RUNTIME_API.
+aws   = []
+# Local development: lightweight Std.HttpServer test server (no AWS needed).
+local = []
+# Production on the JVM: the same custom runtime loop, deployed as a
+# provided.al2/provided.al2023 custom runtime.
+jvm   = []
+
+[project]
+name            = "Lyric.Lambda"
+output          = "single"
+output_assembly = "Lambda.dll"
+
+[project.packages]
+# Core types, LambdaApp builder, and serve() entry point.
+"Lambda"               = "src/lambda.l"
+# Non-HTTP event types: SQS, SNS, S3, EventBridge, DynamoDB Streams, Kinesis.
+"Lambda.Events"        = "src/events.l"
+# Authorizer event types and response helpers (TOKEN, REQUEST, HTTP API v2).
+"Lambda.Authorizer"    = "src/authorizer.l"
+# AOT-compatible handler registration via function references.
+"Lambda.Direct"        = "src/direct.l"
+# Pub aspect templates for cross-cutting Lambda handler concerns.
+"Lambda.Aspects"       = "src/lambda_aspects.l"
+# Event-source detection, JSON marshalling, and the aws/local transport
+# loops shared by both Lambda.Kernel.Runtime feature variants.
+"Lambda.Dispatch"      = "src/dispatch.l"
+# Extern boundary — exactly one file is compiled per build (selected by feature):
+#   aws   → thin wrapper over Lambda.Dispatch's HTTP long-polling loop
+#   local → thin wrapper over Lambda.Dispatch's Std.HttpServer test server
+#   jvm   → thin wrapper over the SAME Lambda.Dispatch HTTP long-polling
+#           loop as aws, deployed as a custom runtime (see that file's
+#           header comment for the deployment-model decision)
+"Lambda.Kernel.Runtime" = [
+  "src/_kernel/lambda_kernel_aws.l",
+  "src/_kernel/lambda_kernel_local.l",
+  "src/_kernel/lambda_kernel_jvm.l",
+]
+
+[project.tests]
+"Lambda.LambdaTests" = "tests/lambda_tests.l"
+"Lambda.DispatchTests" = "tests/lambda_dispatch_tests.l"
+"Lambda.AspectWeavingTests" = "tests/lambda_aspect_weaving_tests.l"
+# Gates itself with a file-level `@cfg`, so it is absent (0 tests, exit 0)
+# from builds where its feature is inactive.
+"Lambda.RuntimeLoopTests" = "tests/lambda_runtime_loop_tests.l"
+
+# No [nuget] table: the aws feature previously declared Amazon.Lambda.RuntimeSupport
+# / Amazon.Lambda.Serialization.SystemTextJson for an extern package that was never
+# implemented. Lambda.Dispatch's HTTP long-polling loop needs no NuGet dependency —
+# it is pure Lyric over the already-real Std.Http client.
+
+# No [maven] table either: the jvm feature previously declared
+# com.amazonaws:aws-lambda-java-core / aws-lambda-java-events for the AWS
+# Java *managed*-runtime entry point (a RequestStreamHandler class the
+# platform reflectively instantiates). That design was not chosen (see
+# src/_kernel/lambda_kernel_jvm.l's header comment) — the jvm feature now
+# reuses Lambda.Dispatch's pure-Lyric-over-Std.Http custom-runtime loop,
+# deployed as a provided.al2/provided.al2023 custom runtime, which needs no
+# AWS Lambda Java SDK at all.

@@ -1,0 +1,44 @@
+[package]
+name        = "Lyric.AwsSecrets"
+version     = "0.1.0"
+stability   = "experimental"
+authors     = ["Lyric Contributors"]
+license     = "MIT"
+description = "AWS Secrets Manager and Parameter Store config-block integration for Lyric services, in pure Lyric (AWS JSON 1.1 over Std.Http, signed with SigV4)."
+targets     = ["dotnet", "jvm", "native"]
+
+[project]
+name            = "Lyric.AwsSecrets"
+output          = "single"
+output_assembly = "AwsSecrets.dll"
+
+[project.packages]
+"AwsSecrets"        = "src/secrets.l"
+"AwsSecrets.Client" = "src/client.l"
+"AwsSecrets.Fetch"  = "src/fetch.l"
+
+[project.tests]
+"AwsSecrets.SecretsTests" = "tests/secrets_tests.l"
+"AwsSecrets.AnnotationTests" = "tests/annotation_tests.l"
+"AwsSecrets.ClientTests"  = "tests/client_tests.l"
+"AwsSecrets.ReadmeTests"  = "tests/readme_tests.l"
+# The explicit API and the annotation path over real HTTP, against an in-process
+# Secrets Manager and Parameter Store (tests/fake_aws_tests.l) that verifies
+# every signature.
+"AwsSecrets.FakeAwsTests" = "tests/fake_aws_tests.l"
+# Needs a real endpoint: file-level `@cfg(feature = "emulator")`, so a plain
+# `lyric test` reports the module as gated and stays hermetic.
+"AwsSecrets.IntegrationTests" = "tests/integration/secrets_integration_tests.l"
+
+[features]
+default     = []
+# Run tests/integration against the AWS Emulator (or AWS) named by
+# LYRIC_SECRETS_ENDPOINT. Not called `integration`: the generic integration job
+# has no Secrets Manager, so only scripts/ci/test-aws-emulator.sh selects it.
+emulator    = []
+
+[dependencies]
+# AWS Signature Version 4 and the credential providers and retry policy, shared
+# with the other AWS packages in this repository.
+"Lyric.Aws.SigV4"       = { workspace = true }
+"Lyric.Aws.Credentials" = { workspace = true }

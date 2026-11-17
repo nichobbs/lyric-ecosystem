@@ -40,6 +40,12 @@ jobs:
         working-directory: lyric-ecosystem
         run: bash scripts/ci/test-packages.sh ${{ matrix.target }}
 
+      # aws-lambda's `serve()` transports and aws-xray's recorder SDKs are
+      # selected by features that the plain run does not set.
+      - name: Test the aws-lambda and aws-xray feature variants
+        working-directory: lyric-ecosystem
+        run: bash scripts/ci/test-feature-variants.sh ${{ matrix.target }}
+
   # Suites that need a real service (`--features integration`), against
   # disposable service containers.
   integration:
@@ -189,7 +195,7 @@ jobs:
         working-directory: lyric-ecosystem
         run: bash scripts/ci/start-aws-emulator.sh
 
-      - name: aws-credentials, mq-sqs and storage-s3 against AWS Emulator
+      - name: aws-credentials, aws-secrets, mq-sqs and storage-s3 against AWS Emulator
         working-directory: lyric-ecosystem
         run: bash scripts/ci/test-aws-emulator.sh ${{ matrix.target }}
 

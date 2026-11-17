@@ -14,7 +14,10 @@ interface's conformance suite on every target it claims.
 | `Lyric.Storage.Gcs` | `storage-gcs/` | `Storage.StorageBucket` | Google Cloud Storage | dotnet, jvm | pure Lyric (XML API, GOOG4-HMAC-SHA256 over `Std.Http`); not yet verified with a real key |
 | `Lyric.Storage.AzureBlob` | `storage-azure-blob/` | `Storage.StorageBucket` | Azure Blob Storage | dotnet, jvm | pure Lyric (Shared Key over `Std.Http`) |
 | `Lyric.Aws.SigV4` | `aws-sigv4/` | (shared signing) | AWS Signature V4 | dotnet, jvm, native | pure Lyric |
-| `Lyric.Aws.Credentials` | `aws-credentials/` | (shared credential providers and retry policy) | environment, shared config and credentials files, `credential_process`, container endpoint, IMDSv2, web identity (STS); default chain with a refreshing cache | dotnet, jvm, native | pure Lyric; used by `Lyric.Storage.S3` and `Lyric.Mq.Sqs` |
+| `Lyric.Aws.Credentials` | `aws-credentials/` | (shared credential providers and retry policy) | environment, shared config and credentials files, `credential_process`, container endpoint, IMDSv2, web identity (STS); default chain with a refreshing cache | dotnet, jvm, native | pure Lyric; used by `Lyric.Storage.S3`, `Lyric.Mq.Sqs` and `Lyric.AwsSecrets` |
+| `Lyric.AwsSecrets` | `aws-secrets/` | (none: config-block `@secretsManager`/`@parameterStore` fields and an explicit fetch API) | AWS Secrets Manager and Systems Manager Parameter Store | dotnet, jvm, native (annotation path: dotnet, jvm) | pure Lyric (AWS JSON 1.1 over `Std.Http`, SigV4, `Lyric.Aws.Credentials`) |
+| `Lyric.Lambda` | `aws-lambda/` | (none: typed Lambda handlers and authorizers) | AWS Lambda custom runtime API | dotnet, jvm | pure Lyric (long-polling loop over `Std.Http`) |
+| `Lyric.AwsXRay` | `aws-xray/` | (none: a `Tracing` aspect and subsegment helpers) | AWS X-Ray recorder SDKs | dotnet, jvm | `AWSXRayRecorder.Core` 2.14.0 via NuGet (`aws`), `aws-xray-recorder-sdk-core` 2.15.3 via Maven (`jvm`); `local` (default) drops subsegments |
 | `Lyric.Jobs.Quartz` | `jobs-quartz/` | `Jobs.JobScheduler` | Quartz | jvm | Quartz via Maven |
 | `Lyric.Jobs.QuartzNet` | `jobs-quartznet/` | `Jobs.JobScheduler` | Quartz.NET | dotnet | Quartz.NET via NuGet |
 | `Lyric.Jobs.Hangfire` | `jobs-hangfire/` | `Jobs.JobScheduler` | Hangfire (in-memory and PostgreSQL storage) | dotnet | Hangfire via NuGet |
@@ -56,7 +59,7 @@ and the interface dependencies become registry version ranges.
 Suites that need a real service live in `<package>/tests/integration/` and run with
 `bash scripts/ci/test-packages.sh <target> --integration` once the service is reachable; the
 package README names the environment variables. CI runs them against service containers, and runs
-`aws-credentials`, `mq-sqs` and `storage-s3` against AWS Emulator (`scripts/ci/start-aws-emulator.sh`,
+`aws-credentials`, `aws-secrets`, `mq-sqs` and `storage-s3` against AWS Emulator (`scripts/ci/start-aws-emulator.sh`,
 `scripts/ci/test-aws-emulator.sh <target>`), which verifies their signatures.
 
 Packages that claim `native` run with `bash scripts/ci/test-native.sh` (add `--integration` for the
