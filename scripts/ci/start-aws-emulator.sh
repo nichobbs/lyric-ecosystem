@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Start a disposable AWS Emulator (https://github.com/aws/aws-emulator) for the
-# aws-credentials, mq-sqs and storage-s3 integration suites, on https://127.0.0.1:$port
+# aws-credentials, aws-secrets, mq-sqs and storage-s3 integration suites, on https://127.0.0.1:$port
 # (default 9297).
 #
 # The pinned Debian package is downloaded into $AWS_EMULATOR_PKG_DIR (default
@@ -13,7 +13,7 @@
 #
 # It serves HTTPS with a certificate generated at start, from its own CA. No
 # process-wide trust setting is exported: scripts/ci/test-aws-emulator.sh hands
-# ca.pem to the suites (LYRIC_SQS_CA_FILE, LYRIC_S3_CA_FILE), which trust it
+# ca.pem to the suites (LYRIC_SQS_CA_FILE, LYRIC_S3_CA_FILE, LYRIC_SECRETS_CA_FILE), which trust it
 # through the packages' own CA option. The aws-credentials suite is given the
 # two INI files the emulator writes (its credentials file and its config
 # file) and reads the key, the region, the endpoint and the CA out of them. The PKCS12 trust store is exported for
@@ -24,6 +24,8 @@
 #
 #   LYRIC_SQS_ENDPOINT, LYRIC_S3_ENDPOINT   https://127.0.0.1:9297
 #   LYRIC_SQS_REGION, LYRIC_S3_REGION       us-east-1
+#   LYRIC_SECRETS_ENDPOINT                  https://127.0.0.1:9297 (Secrets Manager and Parameter Store)
+#   LYRIC_SECRETS_REGION                    us-east-1
 #   LYRIC_S3_BUCKET                         lyric-it
 #   AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY
 #   AWS_EMULATOR_CA_FILE                    ca.pem (PEM)
@@ -83,6 +85,8 @@ for _ in $(seq 60); do
       "LYRIC_SQS_REGION=us-east-1"
       "LYRIC_S3_ENDPOINT=https://127.0.0.1:$port"
       "LYRIC_S3_REGION=us-east-1"
+      "LYRIC_SECRETS_ENDPOINT=https://127.0.0.1:$port"
+      "LYRIC_SECRETS_REGION=us-east-1"
       "LYRIC_S3_BUCKET=lyric-it"
       "AWS_ACCESS_KEY_ID=$key_id"
       "AWS_SECRET_ACCESS_KEY=$secret"
