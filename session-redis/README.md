@@ -112,8 +112,8 @@ by `RedisSessionOptions`, built with `options(keyPrefix, ttlSeconds)`:
 An empty prefix or a lifetime outside the range is a contract violation (a panic), not an `Err`.
 
 The package reads no environment variable. In particular it does not read the
-`LYRIC_CONFIG_SESSION_SESSION_*` variables that `Session.sessionConfigFromEnv()` and
-`Session.connectRedis()` use: the store's lifetime is the `ttlSeconds` passed to `options`, and an
+`LYRIC_CONFIG_SESSION_SESSION_*` variables that `Session.sessionConfigFromEnv()` reads (and that
+the removed `Session.connectRedis()` read as well): the store's lifetime is the `ttlSeconds` passed to `options`, and an
 application that also builds a cookie with `Session.cookieHeader` keeps the two lifetimes equal itself.
 `LYRIC_TLS_ALLOW_INSECURE` is read by `Lyric.Redis`, and only for a configuration with
 `withInsecureSkipVerify`.
@@ -162,8 +162,9 @@ Layout:
   `m:created` and `m:accessed` hold the creation and last-write times (epoch milliseconds, from the
   application's clock). Entry keys and values are stored verbatim: an empty key, an empty value and a
   key named `m:created` are all ordinary entries.
-- **This layout is not that of `Session.connectRedis()`** in lyric-lang, which stores a session as one
-  JSON string (see "Relation" below). A deployment uses one or the other for a given prefix.
+- **This layout is not that of the removed `Session.connectRedis()`** of lyric-lang, which stored a
+  session as one JSON string (see "Relation" below). Sessions it wrote under a prefix cannot be read
+  here and a key of another type under the prefix is an error, so use a new prefix or delete the old keys.
 - **A key of another Redis type under the prefix is an error, not a missing session**: `load` is
   `LOAD_FAILED` and `set` is `SET_FAILED`. `destroy` removes it.
 - **Prefixes nest.** `Admin.sessionCount` and `Admin.destroyAll` work by `SCAN MATCH <prefix>*`, so
@@ -203,12 +204,15 @@ against the interface stays portable. All three return `Result[_, SessionError]`
 
 `Session.Redis` itself adds `redisKey(options, sessionId)` and `newSessionId()`.
 
-### Relation to `Session.connectRedis()` in lyric-lang
+### Relation to the removed `Session.connectRedis()` in lyric-lang
 
-`Lyric.Session` still carries an experimental Redis store (`NativeSessionStore`, behind its `dotnet` /
-`jvm` features, on StackExchange.Redis / Lettuce) that stores a session as one JSON string and updates it
-with separate load and save round trips. This package does not use or change it and defines no type of
-the same name.
+`Lyric.Session` had an experimental Redis store (`NativeSessionStore` and `Session.connectRedis()`, on
+StackExchange.Redis and Lettuce) that stored a session as one JSON string and updated it with separate
+load and save round trips. It was removed in lyric-lang (D614) and this package is its replacement:
+`Lyric.Session` is the `SessionStore` interface and the in-process store only. To migrate, build a store
+with `connect(url, options(prefix, ttlSeconds))`, passing the URL, key prefix and lifetime the old
+`LYRIC_CONFIG_SESSION_REDISSESSION_*` and `LYRIC_CONFIG_SESSION_SESSION_TTLSECONDS` variables carried;
+existing sessions are not carried over.
 
 ## Tests
 
