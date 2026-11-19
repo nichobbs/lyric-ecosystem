@@ -37,11 +37,13 @@
 //! against those texts; the read and write timeout tests of `tests/tcp_tests.l`
 //! fail when they change.
 //!
-//! The connect and the TLS client handshake run on a thread of their own,
-//! which the caller waits for with a limit (`Std.Task.runActionWithin`):
-//! `Std.TcpHost` has no connect timeout, and a handshake ended by the socket
-//! timeout carries no text that says so. A connect or handshake that is given
-//! up closes its socket when it ends.
+//! The connect takes its limit from `Std.TcpHost.hostConnect`, which reports an
+//! expired one as `TransportFailed` with a fixed text that
+//! `connectEndedByTimeout` compares against (`sockConnect` turns it into the
+//! text this package documents). The TLS client handshake runs on a thread of
+//! its own, which the caller waits for with a limit (`Std.Task.runActionWithin`):
+//! a handshake ended by the socket timeout carries no text that says so. A
+//! handshake that is given up closes its socket when it ends.
 //!
 //! Closing. `sockClose` from one thread while another is inside a read or a
 //! write shuts the socket down, which ends that call, and the last thread out
@@ -427,14 +429,13 @@ protected type Pending {
   }
 }
 
-func connectInto(pending: in Pending, host: in String, port: in Int): Unit {
-  match TcpHost.hostConnect(host, port) {
-    case Ok(c) -> {
-      if not pending.succeed(c) {
-        TcpHost.hostClose(c)
-      }
-    }
-    case Err(e) -> pending.fail(TcpHost.TcpError.message(e))
+// Whether `Std.TcpHost` ended a connect because the limit given to `hostConnect`
+// passed. It has no error case for that (module header), so this is the text it
+// gives the failure.
+func connectEndedByTimeout(e: in TcpHost.TcpError, limitMs: in Int): Bool {
+  match e {
+    case TcpHost.TransportFailed(m) -> m == "connect timed out after " + limitMs.toString() + " ms"
+    case _ -> false
   }
 }
 
@@ -443,18 +444,15 @@ func connectInto(pending: in Pending, host: in String, port: in Int): Unit {
 pub func sockConnect(host: in String, port: in Int, connectTimeoutMs: in Int): Result[Sock, String]
   requires: connectTimeoutMs >= 0
 {
-  val pending = Pending()
-  if connectTimeoutMs == 0 {
-    connectInto(pending, host, port)
-  } else {
-    val inTime = Task.runActionWithin({ -> connectInto(pending, host, port) }, connectTimeoutMs)
-    if not inTime and pending.abandon() {
-      return Err("connect to " + host + ":" + port.toString() + " timed out after " + connectTimeoutMs.toString() + " ms")
+  match TcpHost.hostConnect(host, port, connectTimeoutMs) {
+    case Ok(c) -> Ok(sockOver(c, false))
+    case Err(e) -> {
+      if connectTimeoutMs > 0 and connectEndedByTimeout(e, connectTimeoutMs) {
+        Err("connect to " + host + ":" + port.toString() + " timed out after " + connectTimeoutMs.toString() + " ms")
+      } else {
+        Err(TcpHost.TcpError.message(e))
+      }
     }
-  }
-  match pending.connection() {
-    case Some(c) -> Ok(sockOver(c, false))
-    case None -> Err(pending.failureText())
   }
 }
 
